@@ -1848,7 +1848,11 @@ pub(crate) fn build_lantern_cranes(
 
     let ground_y = i32::from(spec.foundation_height);
     let [t_u0, t_v0, t_u1, t_v1] = tall_bounds;
-    let crane_y = (roof_base_y - 2).clamp(ground_y + 4, i32::from(height) - 3);
+    let crane_y = crate::gen_common::clamp_i32(
+        roof_base_y - 2,
+        ground_y + 4,
+        (i32::from(height) - 3).max(ground_y + 1),
+    );
     let mid_v = (t_v0 + t_v1) / 2;
 
     for (idx, &(wu, dir_u, pref_v, alt_lantern)) in [

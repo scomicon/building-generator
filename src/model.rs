@@ -3,7 +3,7 @@ use mod_api::PayloadCodec;
 /// Mod version string, falling back when Horizon's prebuilt-api rustc compiles without Cargo env vars.
 pub const MOD_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(ver) => ver,
-    None => "0.4.2",
+    None => "0.4.3",
 };
 
 /// UI and chat feedback language supported by the mod (`En` default, switchable to `Ru`).

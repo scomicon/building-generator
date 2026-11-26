@@ -359,8 +359,8 @@ fn build_footprint(
             }
         }
         2 => {
-            let core_w = (span_u * 2 / 3).clamp(5, span_u);
-            let core_d = (span_v * 2 / 3).clamp(4, span_v);
+            let core_w = crate::gen_common::clamp_i32(span_u * 2 / 3, 5, span_u);
+            let core_d = crate::gen_common::clamp_i32(span_v * 2 / 3, 4, span_v);
             let shift_u = rng.range_i32(0, (span_u - core_w).max(0));
             let shift_v = rng.range_i32(0, (span_v - core_d).max(0));
             let cu0 = min_u + shift_u;

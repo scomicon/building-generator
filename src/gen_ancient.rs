@@ -27,11 +27,11 @@ pub(crate) fn generate_pantheon(
     let h = i32::from(height);
     let cu = grid.w / 2;
     let max_r = ((grid.w - 4) / 2).clamp(4, 12);
-    let drum_cv = ((grid.d - 2) / 2 - 2).clamp(max_r + 1, grid.d - max_r - 2);
+    let drum_cv = crate::gen_common::clamp_i32((grid.d - 2) / 2 - 2, max_r + 1, (grid.d - max_r - 2).max(4));
     let drum_cv = drum_cv.min(grid.d - 5);
-    let r = max_r.min(drum_cv - 1).min(grid.d - 5 - drum_cv).max(4);
-    let drum_top = ((h * 52) / 100).clamp(6, h - 5);
-    let dome_h = (h - 1 - drum_top).clamp(4, r + 2);
+    let r = max_r.min(drum_cv - 1).min(grid.d - 5 - drum_cv).max(3);
+    let drum_top = crate::gen_common::clamp_i32((h * 52) / 100, 6, (h - 5).max(3));
+    let dome_h = crate::gen_common::clamp_i32(h - 1 - drum_top, 4, (r + 2).max(2));
 
     // Rotunda base drum + coffered interior floor & wall niches.
     for v in (drum_cv - r)..=(drum_cv + r) {
@@ -102,7 +102,7 @@ pub(crate) fn generate_pantheon(
     let pv1 = (grid.d - 2).max(pv0 + 3).min(grid.d - 1);
     let phw = (r - 1).clamp(3, 5);
     anchor_plinth(&mut blocks, grid, pal, seed, cu - phw, cu + phw, pv0, pv1, 1, terrain_offsets);
-    let portico_top = (drum_top - 1).clamp(5, drum_top);
+    let portico_top = crate::gen_common::clamp_i32(drum_top - 1, 5, drum_top.max(3));
     for v in (pv0 + 1)..=pv1 {
         for u in (cu - phw)..=(cu + phw) {
             let is_col = (v == pv1 || v == pv0 + 2) && ((u - cu).abs() == phw || (u - cu).abs() == phw - 2 || u == cu);
@@ -182,7 +182,7 @@ pub(crate) fn generate_parthenon(
     let col_u1 = step2_u1;
     let col_v0 = step2_v0;
     let col_v1 = step2_v1;
-    let eave_y = (h - 5).clamp(7, h - 3);
+    let eave_y = crate::gen_common::clamp_i32(h - 5, 7, (h - 3).max(3));
 
     // Outer 4-sided Peripteral Colonnade (`quartz_pillar` spaced cleanly every 2 blocks).
     for v in col_v0..=col_v1 {
@@ -349,9 +349,9 @@ pub(crate) fn generate_mosque_palace(
     let u1 = cu + hw;
     let v0 = cv - hd;
     let v1 = cv + hd;
-    let hall_top = ((h * 45) / 100).clamp(6, h - 6);
+    let hall_top = crate::gen_common::clamp_i32((h * 45) / 100, 6, (h - 6).max(3));
     let dome_r = (hw.min(hd) - 2).clamp(3, 8);
-    let dome_h = (h - 3 - hall_top).clamp(4, dome_r + 2);
+    let dome_h = crate::gen_common::clamp_i32(h - 3 - hall_top, 4, (dome_r + 2).max(2));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
     for y in 2..=hall_top {
@@ -401,7 +401,7 @@ pub(crate) fn generate_mosque_palace(
     }
 
     // 4 Corner Tall Slender Minarets with Encircling Balconies!
-    let min_top = (h - 4).clamp(hall_top + 4, h - 2);
+    let min_top = crate::gen_common::clamp_i32(h - 4, hall_top + 4, (h - 2).max(3));
     for &(mu, mv) in &[(u0, v0), (u1, v0), (u0, v1), (u1, v1)] {
         for y in 2..=min_top {
             for dv in -1..=1 {
@@ -459,8 +459,8 @@ pub(crate) fn generate_ishtar_gate(
     let v0 = grid.d / 2 - hd;
     let v1 = grid.d / 2 + hd;
     let arch_hw = (hw / 3).clamp(2, 3);
-    let arch_h = (h * 55 / 100).clamp(5, h - 4);
-    let top_y = (h - 2).clamp(arch_h + 3, h - 1);
+    let arch_h = crate::gen_common::clamp_i32(h * 55 / 100, 5, (h - 4).max(3));
+    let top_y = crate::gen_common::clamp_i32(h - 2, arch_h + 3, (h - 1).max(4));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
 
@@ -547,11 +547,11 @@ pub(crate) fn generate_angkor_temple(
     // Helper for tapered Lotus-Bud Prang Tower (corner prangs + huge central Meru tower).
     let off = (max_r - 3).clamp(3, 6);
     let towers = [
-        (cu, cv, (h - 2).clamp(11, h - 1), 2),
-        (cu - off, cv - off, (h * 62 / 100).clamp(7, h - 4), 1),
-        (cu + off, cv - off, (h * 62 / 100).clamp(7, h - 4), 1),
-        (cu - off, cv + off, (h * 62 / 100).clamp(7, h - 4), 1),
-        (cu + off, cv + off, (h * 62 / 100).clamp(7, h - 4), 1),
+        (cu, cv, crate::gen_common::clamp_i32(h - 2, 11, (h - 1).max(3)), 2),
+        (cu - off, cv - off, crate::gen_common::clamp_i32(h * 62 / 100, 7, (h - 4).max(2)), 1),
+        (cu + off, cv - off, crate::gen_common::clamp_i32(h * 62 / 100, 7, (h - 4).max(2)), 1),
+        (cu - off, cv + off, crate::gen_common::clamp_i32(h * 62 / 100, 7, (h - 4).max(2)), 1),
+        (cu + off, cv + off, crate::gen_common::clamp_i32(h * 62 / 100, 7, (h - 4).max(2)), 1),
     ];
     let leaf_id = pal.pick(MaterialPalette::SLOT_LEAVES, seed, cu, 4, cv);
 
@@ -703,10 +703,10 @@ pub(crate) fn generate_sphinx(
     let body_u0 = (cu - 4).max(2);
     let body_u1 = (cu + 4).min(grid.w - 3);
     let back_v = 3;
-    let chest_v = (grid.d * 55 / 100).clamp(back_v + 4, grid.d - 6);
-    let paw_v1 = (grid.d - 2).max(chest_v + 3);
-    let back_h = ((h * 45) / 100).clamp(5, h - 6);
-    let head_top = (h - 2).clamp(back_h + 4, h - 1);
+    let chest_v = crate::gen_common::clamp_i32(grid.d * 55 / 100, back_v + 4, (grid.d - 6).max(3));
+    let paw_v1 = (grid.d - 2).max(chest_v + 3).min(grid.d - 1);
+    let back_h = crate::gen_common::clamp_i32((h * 45) / 100, 5, (h - 6).max(3));
+    let head_top = crate::gen_common::clamp_i32(h - 2, back_h + 4, (h - 1).max(4));
 
     anchor_plinth(&mut blocks, grid, pal, seed, body_u0 - 1, body_u1 + 1, back_v - 1, paw_v1, 1, terrain_offsets);
 

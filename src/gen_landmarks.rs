@@ -653,7 +653,7 @@ fn generate_triumphal_arch(
         }
         // Rear Semicircular Colonnade of Corinthian Pillars + Pediment Architrave.
         let col_r = (plaza_r - 1).max(3);
-        let col_top = (h / 2 + 2).clamp(6, ob_top - 2);
+        let col_top = crate::gen_common::clamp_i32(h / 2 + 2, 6, (ob_top - 2).max(3));
         for v in (cv - col_r)..=cv {
             for u in (cu - col_r)..=(cu + col_r) {
                 let dist = (((u - cu) * (u - cu) + (v - cv) * (v - cv)) as f64).sqrt();
@@ -692,15 +692,15 @@ fn generate_triumphal_arch(
     // Modes 0 & 1: Grand Monumental Triumphal Arch (spanning wide along `u`, thick piers along `v`).
     let half_w = ((grid.w - 4) / 2).clamp(4, 14);
     let half_t = (grid.d / 5).clamp(2, 4);
-    let attic_top = (h - 3).clamp(9, h - 2);
+    let attic_top = crate::gen_common::clamp_i32(h - 3, 9, (h - 2).max(3));
     let main_arch_hw = if mode == 0 && half_w >= 8 {
         (half_w / 3).clamp(2, 3)
     } else {
         (half_w / 2).clamp(2, 4)
     };
-    let main_arch_top = (attic_top * 65 / 100).clamp(5, attic_top - 3);
+    let main_arch_top = crate::gen_common::clamp_i32(attic_top * 65 / 100, 5, (attic_top - 3).max(2));
     let side_arch_c = (half_w * 2 / 3).max(main_arch_hw + 3);
-    let side_arch_top = (main_arch_top - 2).clamp(4, main_arch_top);
+    let side_arch_top = crate::gen_common::clamp_i32(main_arch_top - 2, 4, main_arch_top.max(2));
 
     anchor_plinth(
         &mut blocks,
@@ -811,8 +811,8 @@ fn generate_observatory(
     let cu = grid.w / 2;
     let cv = grid.d / 2;
     let radius = ((grid.w.min(grid.d) - 4) / 2).clamp(4, 11);
-    let drum_top = ((h * 56) / 100).clamp(6, (h - 5).max(6));
-    let dome_h = (h - 1 - drum_top).clamp(4, radius + 2);
+    let drum_top = ((h * 56) / 100).clamp(6, (h - 5).max(6)).min(h - 2);
+    let dome_h = crate::gen_common::clamp_i32(h - 1 - drum_top, 4, (radius + 2).max(2));
 
     // Cylindrical stepped stone foundation drum + circular gallery floors.
     for v in (cv - radius - 1)..=(cv + radius + 1) {
@@ -1208,7 +1208,7 @@ fn generate_watermill(
     let u1 = (u0 + hw * 2).min(grid.w - 2);
     let v0 = (cv - hd).max(1);
     let v1 = (v0 + hd * 2).min(grid.d - 2);
-    let eave_y = (h / 2 + 2).clamp(6, h - 4);
+    let eave_y = crate::gen_common::clamp_i32(h / 2 + 2, 6, (h - 4).max(3));
 
     // Stone tailrace water channel along left side `u = u0 - 3 .. u0 - 1`!
     let wheel_u = u0 - 2;
@@ -1409,9 +1409,9 @@ fn generate_cathedral(
     let v_front = grid.d - 3;
     let v_back = 2;
     let transept_v = (v_back + (v_front - v_back) / 3).max(v_back + 4);
-    let nave_wall_h = ((h * 56) / 100).clamp(7, h - 5);
-    let aisle_wall_h = (nave_wall_h * 58 / 100).clamp(4, nave_wall_h - 2);
-    let tower_top = (h - 5).clamp(nave_wall_h + 2, h - 2);
+    let nave_wall_h = crate::gen_common::clamp_i32((h * 56) / 100, 7, (h - 5).max(3));
+    let aisle_wall_h = crate::gen_common::clamp_i32(nave_wall_h * 58 / 100, 4, (nave_wall_h - 2).max(2));
+    let tower_top = crate::gen_common::clamp_i32(h - 5, nave_wall_h + 2, (h - 2).max(3));
 
     // Cruciform + Aisles Footprint mask cleanly anchors the whole cathedral!
     for v in v_back..=v_front {
@@ -1979,8 +1979,8 @@ fn generate_treehouse(
     let h = i32::from(height);
     let cu = grid.w / 2;
     let cv = grid.d / 2;
-    let trunk_top = (h - 4).clamp(9, h - 2);
-    let platform_y = (h / 2).clamp(5, trunk_top - 4);
+    let trunk_top = crate::gen_common::clamp_i32(h - 4, 9, (h - 2).max(3));
+    let platform_y = crate::gen_common::clamp_i32(h / 2, 5, (trunk_top - 4).max(2));
     let leaf_id = pal.pick(MaterialPalette::SLOT_LEAVES, seed, cu, trunk_top, cv);
 
     // Ancient Buttress Roots & 3x3 Living Bark Trunk with spiral ladder inside/outside.

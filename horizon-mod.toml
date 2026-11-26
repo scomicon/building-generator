@@ -1,6 +1,6 @@
 id = "building_generator"
 name = "Building Generator"
-version = "0.4.2"
+version = "0.4.3"
 description = "Bilingual (EN/RU) procedural architecture generator: live translucent 3D blueprint hologram preview, Settlement 2.0 cities & river bridges, Biome Auto-Style, 0-100% Wear/Ruin & Overgrowth, 61 themes, 72 presets, BOM, air-only, undo/redo, and OP security."
 authors = ["Building Generator Contributors"]
 license = "MIT"

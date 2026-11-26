@@ -27,7 +27,7 @@ pub(crate) fn generate_skyscraper(
     let cv = grid.d / 2;
     let base_hw = ((grid.w - 4) / 2).clamp(4, 9);
     let base_hd = ((grid.d - 4) / 2).clamp(4, 9);
-    let roof_y = (h - 5).clamp(11, h - 3);
+    let roof_y = crate::gen_common::clamp_i32(h - 5, 11, (h - 3).max(3));
     let story_h = 4;
 
     anchor_plinth(&mut blocks, grid, pal, seed, cu - base_hw - 1, cu + base_hw + 1, cv - base_hd - 1, cv + base_hd + 1, 1, terrain_offsets);
@@ -113,7 +113,7 @@ pub(crate) fn generate_steampunk_factory(
     let u1 = grid.w - 3;
     let v0 = 2;
     let v1 = grid.d - 3;
-    let wall_top = (h / 2 + 2).clamp(6, h - 5);
+    let wall_top = crate::gen_common::clamp_i32(h / 2 + 2, 6, (h - 5).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
     for y in 2..=wall_top {
@@ -146,7 +146,7 @@ pub(crate) fn generate_steampunk_factory(
     }
 
     // Twin Towering Brick Smokestacks with Campfire Smoke Plumes + Interior Copper Boilers & Furnace!
-    let stack_top = (h - 2).clamp(wall_top + 4, h - 1);
+    let stack_top = crate::gen_common::clamp_i32(h - 2, wall_top + 4, (h - 1).max(3));
     for su in [u0 + 2, (u1 - 2).max(u0 + 4)] {
         for y in 2..=stack_top {
             set_uv(&mut blocks, grid, su, y, v0 + 1, PlannedBlock::simple("minecraft:bricks"));
@@ -180,7 +180,7 @@ pub(crate) fn generate_modern_stadium(
     let cv = grid.d / 2;
     let rx = ((grid.w - 4) / 2).clamp(6, 16) as f64;
     let rz = ((grid.d - 4) / 2).clamp(6, 16) as f64;
-    let mast_top = (h - 2).clamp(10, h - 1);
+    let mast_top = crate::gen_common::clamp_i32(h - 2, 10, (h - 1).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, 1, grid.w - 2, 1, grid.d - 2, 0, terrain_offsets);
 
@@ -349,7 +349,7 @@ pub(crate) fn generate_launchpad_rocket(
 
     // Steel Gantry Service Tower at Left `(u_g = cu - 4)` + Boarding Umbilical Swing Arm!
     let ug = (cu - 4).max(u0 + 2);
-    let rocket_top = (h - 2).clamp(12, h - 1);
+    let rocket_top = crate::gen_common::clamp_i32(h - 2, 12, (h - 1).max(3));
     for y in (pad_y + 1)..=(rocket_top - 2) {
         for dv in -1i32..=1 {
             for du in -1i32..=1 {
@@ -362,7 +362,7 @@ pub(crate) fn generate_launchpad_rocket(
         }
     }
     // High Crew Access Umbilical Arm connecting Gantry Tower directly to Rocket Payload Fairing!
-    let arm_y = (rocket_top * 2 / 3).clamp(pad_y + 4, rocket_top - 3);
+    let arm_y = crate::gen_common::clamp_i32(rocket_top * 2 / 3, pad_y + 4, (rocket_top - 3).max(3));
     for u in ug..=(cu - 1) {
         set_uv(&mut blocks, grid, u, arm_y, cv, PlannedBlock::simple("minecraft:iron_block"));
     }
@@ -464,7 +464,7 @@ pub(crate) fn generate_offshore_rig(
     }
 
     // Tall Steel Lattice Drilling Derrick Tower centered + Crew Cabin Module!
-    let derrick_top = (h - 2).clamp(deck_y + 5, h - 1);
+    let derrick_top = crate::gen_common::clamp_i32(h - 2, deck_y + 5, (h - 1).max(3));
     for y in (deck_y + 1)..=derrick_top {
         let inset: i32 = if y > derrick_top - 3 { 1 } else { 0 };
         for dv in (-1 + inset)..=(1 - inset) {

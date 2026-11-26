@@ -4582,4 +4582,79 @@ mod tests {
             assert!(is_horizon_allowed_hmod_path(rel), "expected valid path {rel}");
         }
     }
+
+    #[test]
+    fn v043_bridges_settlements_and_presets_never_panic_at_tiny_or_narrow_sizes() {
+        // Specifically stress narrow Aqueduct & Pontoon bridges (7..15 along_len) that panicked at max_spans=1.
+        for along in [7u16, 8, 9, 10, 11, 13, 15, 25] {
+            for h in [5u16, 7, 10, 14] {
+                for prompt in ["roman aqueduct bridge", "pontoon dock bridge", "covered wooden bridge"] {
+                    let mut req = sample_request(prompt, 777 + i64::from(along));
+                    req.category = BuildCategory::Bridge;
+                    req.width = 7;
+                    req.depth = along;
+                    req.height = h;
+                    let bp = generate_blueprint(&req, None);
+                    assert!(bp.non_air_count() > 0);
+                }
+            }
+        }
+
+        // Reproduces exact Settlement -> Aqueduct narrow bridge panic plus stresses every category/preset.
+        for &(w, d, h) in &[(7u16, 7u16, 5u16), (9, 13, 8), (19, 9, 8), (11, 25, 10), (36, 36, 12)] {
+            for &cat in &BuildCategory::ALL {
+                for &facing in &[
+                    CardinalFacing::North,
+                    CardinalFacing::South,
+                    CardinalFacing::East,
+                    CardinalFacing::West,
+                ] {
+                    let mut req = sample_request("aqueduct bridge town", 4242);
+                    req.category = cat;
+                    req.facing = facing;
+                    req.width = w;
+                    req.depth = d;
+                    req.height = h;
+                    let bp = generate_blueprint(&req, None);
+                    assert!(bp.non_air_count() > 0);
+                }
+            }
+        }
+
+        // Settlement 2.0 across many seeds with river terrain offsets (triggers all 9 BridgeVariants at narrow spans).
+        let mut terrain = vec![0i32; 40 * 40];
+        for z in 0..40 {
+            for x in 0..40 {
+                terrain[z * 40 + x] = if (16..=24).contains(&x) { -3 } else { 1 };
+            }
+        }
+        let water: Vec<i32> = terrain.iter().map(|&t| if t < 0 { 3 } else { 0 }).collect();
+        for s in 0..24i64 {
+            let mut req = sample_request("medieval fortified walled city with bridge", 9000 + s * 131);
+            req.category = BuildCategory::Settlement;
+            req.width = 40;
+            req.depth = 40;
+            req.height = 18;
+            req.adapt_terrain = true;
+            let bp = crate::generator::generate_blueprint_with_water(&req, Some(&terrain), Some(&water));
+            assert!(bp.non_air_count() > 100);
+        }
+
+        // Sweep all 72 CLI presets at minimum slider dimensions (7x7x5) and small studio sizes (11x11x7).
+        for &(w, d, h) in &[(7u16, 7u16, 5u16), (11, 11, 7)] {
+            for (idx, &(slug, cat, style, _pw, _pd, _ph, prompt)) in CLI_PRESETS.iter().enumerate() {
+                let mut req = sample_request(prompt, 50_000 + idx as i64);
+                req.category = cat;
+                req.style = style;
+                req.width = w;
+                req.depth = d;
+                req.height = h;
+                let bp = generate_blueprint(&req, None);
+                assert!(
+                    bp.non_air_count() > 0,
+                    "preset {slug} failed at {w}x{d}x{h}",
+                );
+            }
+        }
+    }
 }

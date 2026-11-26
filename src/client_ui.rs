@@ -3519,7 +3519,7 @@ fn draw_scrollbar(
     draw.fill(z.track, 0xAA0F_172A);
     if z.total_rows > z.vis_rows && th > 4.0 {
         let max_s = z.total_rows - z.vis_rows;
-        let thumb_h = ((z.vis_rows as f32 / z.total_rows as f32) * th).clamp(10.0, th);
+        let thumb_h = ((z.vis_rows as f32 / z.total_rows as f32) * th).clamp(10.0f32.min(th), th);
         let frac = (z.scroll.min(max_s) as f32) / (max_s as f32);
         let thumb_y = ty + (th - thumb_h) * frac;
         let hovered = point_in_rect(mouse, z.track);

@@ -89,7 +89,7 @@ pub(crate) fn generate_walled_bailey_castle(
     // Towering Central Donjon Keep rising cleanly inside the bailey courtyard!
     let k_hw = ((u1 - u0) / 5).clamp(2, 4);
     let k_hd = ((v1 - v0) / 5).clamp(2, 4);
-    let keep_top = (h - 3).clamp(tow_top + 2, h - 2);
+    let keep_top = crate::gen_common::clamp_i32(h - 3, tow_top + 2, (h - 2).max(3));
     for v in (cv - k_hd)..=(cv + k_hd) {
         for u in (cu - k_hw)..=(cu + k_hw) {
             let shell = u == cu - k_hw || u == cu + k_hw || v == cv - k_hd || v == cv + k_hd;
@@ -138,8 +138,8 @@ pub(crate) fn generate_city_gatehouse(
     let u1 = grid.w - 2;
     let wall_d = 2.min((grid.d - 4) / 3).max(1);
     let gate_hw = 2.min((u1 - u0) / 5).max(1);
-    let wall_h = ((h * 52) / 100).clamp(6, h - 5);
-    let tower_top = (h - 3).clamp(wall_h + 3, h - 2);
+    let wall_h = crate::gen_common::clamp_i32((h * 52) / 100, 6, (h - 5).max(3));
+    let tower_top = crate::gen_common::clamp_i32(h - 3, wall_h + 3, (h - 2).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, (cv - wall_d - 2).max(1), (cv + wall_d + 2).min(grid.d - 2), 1, terrain_offsets);
 
@@ -264,7 +264,7 @@ pub(crate) fn generate_monastery_cloister(
     for &(fu, fv) in &[(cu - 1, cv), (cu + 1, cv), (cu, cv - 1), (cu, cv + 1)] {
         set_uv(&mut blocks, grid, fu, 2, fv, PlannedBlock::with_props("minecraft:water", vec![("level", "0")]));
     }
-    let bell_top = (h - 2).clamp(cloister_top + 3, h - 1);
+    let bell_top = crate::gen_common::clamp_i32(h - 2, cloister_top + 3, (h - 1).max(3));
     for dv in -1i32..=1 {
         for du in -1i32..=1 {
             for y in (cloister_top + 1)..=bell_top {
@@ -493,7 +493,7 @@ pub(crate) fn generate_apothecary(
     let u1 = (grid.w - 3).max(8);
     let v0 = 2;
     let v1 = (grid.d - 3).max(8);
-    let wall_top = (h / 2 + 1).clamp(6, h - 4);
+    let wall_top = crate::gen_common::clamp_i32(h / 2 + 1, 6, (h - 4).max(3));
     let cu = (u0 + u1) / 2;
     let cv = (v0 + v1) / 2;
 
@@ -552,7 +552,7 @@ pub(crate) fn generate_winery_bakery(
     let u1 = (grid.w - 4).max(7);
     let v0 = 2;
     let v1 = (grid.d - 3).max(7);
-    let wall_top = (h / 2 + 1).clamp(5, h - 4);
+    let wall_top = crate::gen_common::clamp_i32(h / 2 + 1, 5, (h - 4).max(3));
     let cv = (v0 + v1) / 2;
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);

@@ -440,7 +440,8 @@ pub(crate) fn build_roof_and_dormers(
                     let norm_sq = (nx * nx + nz * nz).min(1.0);
                     let curve = (1.0 - norm_sq).max(0.0).sqrt();
                     let raw_ry = roof_base_y + (curve * f64::from(dome_h)).round() as i32;
-                    let ry = raw_ry.clamp(roof_base_y, i32::from(height) - 1);
+                    let max_y = i32::from(height) - 1;
+                    let ry = crate::gen_common::clamp_i32(raw_ry, roof_base_y.min(max_y), max_y);
                     dome_y[grid.idx(u, v)] = Some((ry, norm_sq));
                     max_placed_roof_y = max_placed_roof_y.max(ry);
                 }
@@ -1817,7 +1818,8 @@ fn attach_windmill_sails(
 ) {
     let [b_u0, _b_v0, b_u1, _b_v1] = bounds;
     let hu = (b_u0 + b_u1) / 2;
-    let hub_y = (roof_base_y - 2).clamp(4, i32::from(height) - 2);
+    let hub_hi = (i32::from(height) - 2).max(2);
+    let hub_y = crate::gen_common::clamp_i32(roof_base_y - 2, 4, hub_hi);
     // Find front wall surface at hub u.
     let front_v = (0..grid.d)
         .rev()

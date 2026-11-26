@@ -490,7 +490,8 @@ pub fn generate_settlement(
                 );
             } else {
                 if wd > 0 || road_y > surf_y {
-                    for fill_y in (surf_y - wd).clamp(-10, road_y - 1)..road_y {
+                    let lo_y = (surf_y - wd).clamp(-10, (road_y - 1).max(-10));
+                    for fill_y in lo_y..road_y {
                         blocks.insert(
                             [lx, fill_y, lz],
                             PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fill_y, lz)),

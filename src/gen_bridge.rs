@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::gen_common::{
-    GeneratedBlueprint, LocalGrid, PlannedBlock, is_lantern, make_beam_block_at,
+    GeneratedBlueprint, LocalGrid, PlannedBlock, clamp_i32, is_lantern, make_beam_block_at,
     make_frame_block_at, make_leaves, make_pillar_block_at, make_slab, make_stair,
     prune_map_unsupported, resolve_connections_and_shapes, terrain_rel_at,
 };
@@ -261,9 +261,12 @@ fn compute_arch_spans(
         BridgeVariant::CoveredTimber => {
             if usable >= 18 && rng.next_f64() < 0.55 { 2 } else { 1 }
         }
-        BridgeVariant::Aqueduct => (usable / 7).clamp(2, max_spans),
+        BridgeVariant::Aqueduct => (usable / 7).clamp(1, max_spans),
         BridgeVariant::Suspension => if usable >= 21 { 3 } else { 1 },
-        BridgeVariant::PontoonPier => (usable / 5).clamp(2, 7),
+        BridgeVariant::PontoonPier => {
+            let min_p = if usable >= 10 { 2 } else { 1 };
+            (usable / 5).clamp(min_p, 7)
+        }
         BridgeVariant::MasonryArch | BridgeVariant::GothicRibbedArch | BridgeVariant::FortifiedGate => {
             let min_sp = if usable >= 22 { 2 } else { 1 };
             let hi_sp = max_spans.min(5);
@@ -332,7 +335,7 @@ fn compute_deck_profile(
     let bank_hi = end_y_a.max(end_y_b);
 
     let base_high = match variant {
-        BridgeVariant::PontoonPier => (bank_hi + 1).clamp(bank_hi, (bank_hi + 2).min(max_deck_ceiling)),
+        BridgeVariant::PontoonPier => (bank_hi + 1).min(max_deck_ceiling).max(bank_hi.min(max_deck_ceiling)),
         BridgeVariant::Aqueduct => {
             (bank_hi + ((ax.height * 22) / 100).clamp(2, 5)).min(max_deck_ceiling)
         }
@@ -1398,7 +1401,7 @@ pub(crate) fn generate_bridge(
             }
 
             if is_cutwater_center && cutwater_prow && variant != BridgeVariant::PontoonPier {
-                let pier_top = (dy - 1).min(terr + 4).clamp(-5, dy - 1);
+                let pier_top = clamp_i32((dy - 1).min(terr + 4), -5, (dy - 1).max(-5));
                 if pier_top >= -4 {
                     for side in [-1, 1] {
                         for dist in 1..=2 {

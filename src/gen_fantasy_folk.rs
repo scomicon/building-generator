@@ -26,8 +26,8 @@ pub(crate) fn generate_mage_tower(
     let cu = grid.w / 2;
     let cv = grid.d / 2;
     let base_r = 3.min((grid.w.min(grid.d) - 4) / 2).max(2);
-    let waist_top = ((h * 45) / 100).clamp(5, h - 7);
-    let top_chamber = (h - 5).clamp(waist_top + 4, h - 4);
+    let waist_top = crate::gen_common::clamp_i32((h * 45) / 100, 5, (h - 7).max(2));
+    let top_chamber = crate::gen_common::clamp_i32(h - 5, waist_top + 4, (h - 4).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, cu - base_r - 1, cu + base_r + 1, cv - base_r - 1, cv + base_r + 1, 1, terrain_offsets);
 
@@ -109,7 +109,7 @@ pub(crate) fn generate_hobbit_hole(
     let cu = grid.w / 2;
     let cv = grid.d / 2;
     let hill_r = ((grid.w.min(grid.d) - 4) / 2).clamp(4, 10);
-    let hill_h = (hill_r + 2).min(h - 2).clamp(6, 9);
+    let hill_h = (hill_r + 2).min((h - 2).max(2)).clamp(2, 9);
     let leaf_id = pal.pick(MaterialPalette::SLOT_LEAVES, seed, cu, hill_h, cv);
 
     anchor_plinth(&mut blocks, grid, pal, seed, cu - hill_r, cu + hill_r, cv - hill_r, cv + hill_r, 0, terrain_offsets);
@@ -177,10 +177,10 @@ pub(crate) fn generate_mushroom_house(
     let pal = &req.palette;
     let h = i32::from(height);
     let cv = grid.d / 2;
-    let u_a = (grid.w / 3).clamp(3, grid.w - 7);
+    let u_a = crate::gen_common::clamp_i32(grid.w / 3, 3, (grid.w - 7).max(2));
     let u_b = (grid.w * 2 / 3).max(u_a + 5).min(grid.w - 4);
-    let top_a = (h - 4).clamp(9, h - 3);
-    let top_b = (h - 6).clamp(7, top_a - 1);
+    let top_a = crate::gen_common::clamp_i32(h - 4, 9, (h - 3).max(2));
+    let top_b = crate::gen_common::clamp_i32(h - 6, 7, (top_a - 1).max(2));
 
     anchor_plinth(&mut blocks, grid, pal, seed, 1, grid.w - 2, 1, grid.d - 2, 0, terrain_offsets);
 
@@ -268,7 +268,7 @@ pub(crate) fn generate_mausoleum_crypt(
     let u1 = cu + hw;
     let v0 = cv - hd;
     let v1 = cv + hd;
-    let hall_top = (h / 2).clamp(5, h - 4);
+    let hall_top = crate::gen_common::clamp_i32(h / 2, 5, (h - 4).max(2));
 
     // Underground Vaulted Catacombs Chamber (`y = -5 ..= 0`)!
     for v in v0..=v1 {
@@ -334,7 +334,7 @@ pub(crate) fn generate_dwarven_hall(
     let u1 = grid.w - 2;
     let v0 = 1;
     let v1 = grid.d - 2;
-    let top_y = (h - 2).clamp(10, h - 1);
+    let top_y = crate::gen_common::clamp_i32(h - 2, 10, (h - 1).max(3));
     let portal_hw = ((u1 - u0) / 4).clamp(2, 4);
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
@@ -598,7 +598,7 @@ pub(crate) fn generate_alpine_chalet(
     let u1 = (grid.w - 4).max(7);
     let v0 = 3;
     let v1 = (grid.d - 4).max(7);
-    let wall_top = (h * 60 / 100).clamp(8, h - 4);
+    let wall_top = crate::gen_common::clamp_i32(h * 60 / 100, 8, (h - 4).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
 
@@ -664,7 +664,7 @@ pub(crate) fn generate_desert_kasbah(
     let u1 = grid.w - 2;
     let v0 = 1;
     let v1 = grid.d - 2;
-    let ring_top = (h * 52 / 100).clamp(6, h - 5);
+    let ring_top = crate::gen_common::clamp_i32(h * 52 / 100, 6, (h - 5).max(2));
     let leaf_id = pal.pick(MaterialPalette::SLOT_LEAVES, seed, cu, 4, cv);
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
@@ -686,7 +686,7 @@ pub(crate) fn generate_desert_kasbah(
     }
 
     // Twin Windcatcher (Badgir) Cooling Towers with open vented louvers on opposite corners!
-    let badgir_top = (h - 2).clamp(ring_top + 4, h - 1);
+    let badgir_top = crate::gen_common::clamp_i32(h - 2, ring_top + 4, (h - 1).max(3));
     for &(bu, bv) in &[(u0 + 1, v0 + 1), (u1 - 1, v1 - 1)] {
         for dv in -1i32..=1 {
             for du in -1i32..=1 {

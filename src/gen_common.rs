@@ -647,3 +647,9 @@ pub(crate) fn resolve_connections_and_shapes(blocks: &mut BTreeMap<[i32; 3], Pla
         }
     }
 }
+
+/// Clamps `v` into `[lo, hi]` safely without panicking if computed bounds invert (`lo > hi`).
+#[inline]
+pub(crate) fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
+    if lo >= hi { hi } else { v.clamp(lo, hi) }
+}

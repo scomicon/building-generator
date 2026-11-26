@@ -29,8 +29,8 @@ pub(crate) fn generate_town_hall(
     let u1 = grid.w - 3;
     let v0 = 2;
     let v1 = (grid.d - 4).max(v0 + 6);
-    let wall_top = ((h * 55) / 100).clamp(8, h - 6);
-    let tower_top = (h - 2).clamp(wall_top + 4, h - 1);
+    let wall_top = crate::gen_common::clamp_i32((h * 55) / 100, 8, (h - 6).max(3));
+    let tower_top = crate::gen_common::clamp_i32(h - 2, wall_top + 4, (h - 1).max(4));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0 - 1, u1 + 1, v0 - 1, v1 + 2, 2, terrain_offsets);
     // Broad Ceremonial Entry Stairs at front `v1 + 1 .. v1 + 2`.
@@ -112,7 +112,7 @@ pub(crate) fn generate_opera_house(
     let u1 = grid.w - 2;
     let v0 = 1;
     let v1 = grid.d - 2;
-    let wall_top = (h - 4).clamp(8, h - 3);
+    let wall_top = crate::gen_common::clamp_i32(h - 4, 8, (h - 3).max(3));
     let stage_v = v0 + (v1 - v0) / 3;
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
@@ -192,7 +192,7 @@ pub(crate) fn generate_museum(
     let u1 = grid.w - 2;
     let v0 = 1;
     let v1 = grid.d - 2;
-    let wall_top = ((h * 58) / 100).clamp(7, h - 5);
+    let wall_top = crate::gen_common::clamp_i32((h * 58) / 100, 7, (h - 5).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
     for y in 2..=wall_top {
@@ -258,7 +258,7 @@ pub(crate) fn generate_bank_vault(
     let u1 = grid.w - 3;
     let v0 = 2;
     let v1 = grid.d - 3;
-    let wall_top = (h - 4).clamp(7, h - 3);
+    let wall_top = crate::gen_common::clamp_i32(h - 4, 7, (h - 3).max(3));
     let vault_v = v0 + (v1 - v0) / 3;
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
@@ -334,7 +334,7 @@ pub(crate) fn generate_academy(
     let u1 = grid.w - 3;
     let v0 = 2;
     let v1 = grid.d - 3;
-    let wall_top = (h - 5).clamp(8, h - 4);
+    let wall_top = crate::gen_common::clamp_i32(h - 5, 8, (h - 4).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 1, terrain_offsets);
     for y in 2..=wall_top {
@@ -456,7 +456,10 @@ pub(crate) fn generate_sailing_ship(
 
     // Twin Tall Masts (`main` & `fore`) + Cross Yardarms + Billowing White Canvas Sails!
     let v_mid = (v_stern + v_bow) / 2;
-    let masts = [(v_mid, (h - 2).clamp(deck_y + 7, h - 1)), (v_bow - (v_bow - v_mid) / 2, (h - 4).clamp(deck_y + 6, h - 3))];
+    let masts = [
+        (v_mid, crate::gen_common::clamp_i32(h - 2, deck_y + 7, (h - 1).max(3))),
+        (v_bow - (v_bow - v_mid) / 2, crate::gen_common::clamp_i32(h - 4, deck_y + 6, (h - 3).max(3))),
+    ];
     for (mv, m_top) in masts {
         for y in deck_y..=m_top {
             set_uv(&mut blocks, grid, cu, y, mv, PlannedBlock::simple("minecraft:spruce_log"));
@@ -499,7 +502,7 @@ pub(crate) fn generate_shipyard_dock(
     let u1 = grid.w - 2;
     let v0 = 1;
     let v1 = grid.d - 2;
-    let quay_v = (grid.d * 48 / 100).clamp(6, v1 - 5);
+    let quay_v = crate::gen_common::clamp_i32(grid.d * 48 / 100, 6, (v1 - 5).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, quay_v, 1, terrain_offsets);
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, quay_v + 1, v1, 0, terrain_offsets);
@@ -657,8 +660,8 @@ pub(crate) fn generate_airship_dock(
     let h = i32::from(height);
     let cu = grid.w / 2;
     let tower_v = grid.d - 5;
-    let deck_y = ((h * 55) / 100).clamp(7, h - 7);
-    let tower_top = (h - 2).clamp(deck_y + 4, h - 1);
+    let deck_y = crate::gen_common::clamp_i32((h * 55) / 100, 7, (h - 7).max(3));
+    let tower_top = crate::gen_common::clamp_i32(h - 2, deck_y + 4, (h - 1).max(4));
 
     anchor_plinth(&mut blocks, grid, pal, seed, cu - 3, cu + 3, tower_v - 3, tower_v + 3, 1, terrain_offsets);
 
@@ -682,7 +685,7 @@ pub(crate) fn generate_airship_dock(
     }
 
     // Mooring Sky-Gangway connecting Tower to Dirigible Gondola!
-    let ship_cv = (grid.d / 3).clamp(4, tower_v - 5);
+    let ship_cv = crate::gen_common::clamp_i32(grid.d / 3, 4, (tower_v - 5).max(2));
     for v in ship_cv..=(tower_v - 2) {
         for u in (cu - 1)..=(cu + 1) {
             set_uv(&mut blocks, grid, u, deck_y, v, PlannedBlock::simple("minecraft:spruce_planks"));
@@ -760,7 +763,7 @@ pub(crate) fn generate_dam_barrage(
     let u1 = grid.w - 2;
     let v0 = 1;
     let v1 = grid.d - 2;
-    let crest_y = ((h * 72) / 100).clamp(6, h - 3);
+    let crest_y = crate::gen_common::clamp_i32((h * 72) / 100, 6, (h - 3).max(3));
     let dam_v = (v0 + v1) / 2;
 
     anchor_plinth(&mut blocks, grid, pal, seed, u0, u1, v0, v1, 0, terrain_offsets);
@@ -823,8 +826,8 @@ pub(crate) fn generate_circus_tent(
     let cu = grid.w / 2;
     let cv = grid.d / 2;
     let rad = ((grid.w.min(grid.d) - 4) / 2).clamp(5, 13);
-    let eave_y = 5.min(h - 5);
-    let peak_y = (h - 2).clamp(eave_y + 4, h - 1);
+    let eave_y = 5.min(h - 5).max(2);
+    let peak_y = crate::gen_common::clamp_i32(h - 2, eave_y + 4, (h - 1).max(3));
 
     anchor_plinth(&mut blocks, grid, pal, seed, cu - rad, cu + rad, cv - rad, cv + rad, 1, terrain_offsets);
 
