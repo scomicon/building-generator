@@ -1,0 +1,9 @@
+/target
+/.horizon
+/Cargo.lock
+*.hmod
+/HOW_TO_INSTALL.txt
+/REPORT.txt
+.DS_Store
+Thumbs.db
+desktop.ini

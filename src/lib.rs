@@ -1,0 +1,3701 @@
+//! Building Generator: procedural noise-driven building generator mod for Horizon (Minecraft 26.3).
+pub mod client_ui;
+mod gen_ancient;
+mod gen_bridge;
+mod gen_civic_transport;
+mod gen_common;
+mod gen_fantasy_folk;
+mod gen_fortress;
+mod gen_landmarks;
+mod gen_modern_industrial;
+mod gen_exterior;
+mod gen_interior;
+mod gen_roof;
+mod gen_settlement;
+pub mod generator;
+pub mod model;
+pub mod network;
+pub mod noise;
+pub mod parser;
+pub mod persist;
+pub mod server_builder;
+
+use mod_api::{
+    self, ClientHost, ClientTickPreEvent, Flow, Hooks, InputKeyEvent, MouseButtonPreEvent,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RenderGuiPostEvent, RunModCommandEvent,
+    ScheduledTaskEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent,
+    ScreenMouseDraggedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent, ServerHost,
+    SubmitCustomGeometryEvent, TabCompleteEvent,
+};
+
+#[derive(Default)]
+pub struct BuildingGeneratorMod;
+
+#[mod_api::horizon_mod]
+impl Hooks for BuildingGeneratorMod {
+    fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
+        network::register_channels(r);
+    }
+
+    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+        server_builder::register_commands(event);
+    }
+
+    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+        server_builder::handle_command(host, event)
+    }
+
+    fn tab_complete(&self, _host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
+        server_builder::tab_complete(event);
+    }
+
+    fn scheduled_task(&self, host: &mut dyn ServerHost, event: &mut ScheduledTaskEvent<'_>) {
+        server_builder::process_scheduled_task(host, event);
+    }
+
+    fn input_key(&self, host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
+        client_ui::on_input_key(host, event);
+    }
+
+    fn mouse_button_pre(&self, host: &mut dyn ClientHost, event: &mut MouseButtonPreEvent) -> Flow {
+        client_ui::on_mouse_button_pre(host, event)
+    }
+
+    fn client_tick_pre(&self, host: &mut dyn ClientHost, event: &mut ClientTickPreEvent) {
+        client_ui::on_client_tick_pre(host, event);
+    }
+
+    fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
+        client_ui::on_screen_render_post(host, event);
+    }
+
+    fn screen_mouse_button_pressed_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseButtonPressedPreEvent<'_>,
+    ) -> Flow {
+        client_ui::on_screen_mouse_pressed(host, event)
+    }
+
+    fn screen_mouse_button_released_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseButtonReleasedPreEvent<'_>,
+    ) -> Flow {
+        client_ui::on_screen_mouse_released(host, event)
+    }
+
+    fn screen_mouse_dragged_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseDraggedPreEvent<'_>,
+    ) -> Flow {
+        client_ui::on_screen_mouse_dragged(host, event)
+    }
+
+    fn screen_mouse_scrolled_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenMouseScrolledPreEvent<'_>,
+    ) -> Flow {
+        client_ui::on_screen_mouse_scrolled(host, event)
+    }
+
+    fn screen_key_pressed_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenKeyPressedPreEvent<'_>,
+    ) -> Flow {
+        client_ui::on_screen_key_pressed(host, event)
+    }
+
+    fn screen_char_typed_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenCharTypedPreEvent<'_>,
+    ) -> Flow {
+        client_ui::on_screen_char_typed(host, event)
+    }
+
+    fn render_gui_post(&self, host: &dyn ClientHost, event: &mut RenderGuiPostEvent<'_>) {
+        client_ui::on_render_gui_post(host, event);
+    }
+
+    fn submit_custom_geometry(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut SubmitCustomGeometryEvent<'_>,
+    ) {
+        client_ui::on_submit_custom_geometry(host, event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Mutex, OnceLock};
+
+    use mod_api::__private::game::{BackendMutRefOf, BackendRefOf};
+    use mod_api::prelude::*;
+    use mod_api::testing::{FakeHost, with_mods};
+    use mod_api::{
+        Backend, BackendMut, BackendMutRef, BackendRef, BlockEdit, BlockKey, BlockMetadata,
+        BlockState, BlockStateError, BlockStateRecord, ClientHost, CommandArgument,
+        CommandArgumentValue, CommandInvocation, CommandSource, Flow, Heightmap, Host, Hooks,
+        LevelRef, ModEntry, PermissionLevel, Registrar, RegistrationContext, RunModCommandEvent,
+        ServerHost, StateConstraint, decode_payload, encode_payload,
+    };
+
+    use crate::generator::generate_blueprint;
+    use crate::model::{
+        BuildCategory, BuildRequest, BuildStyle, CardinalFacing, MaterialPalette, NoiseLevel,
+        RerollRequest, RoofStyle,
+    };
+    use crate::noise::NoiseField;
+    use crate::parser::{StructureTheme, infer_palette_from_text, parse_description};
+    use crate::server_builder::{
+        CLI_PRESETS, blueprint_to_phased_runs, execute_build, execute_reroll, execute_undo,
+        find_cli_preset, handle_command,
+    };
+    use crate::BuildingGeneratorMod;
+
+    fn sample_request(desc: &str, seed: i64) -> BuildRequest {
+        BuildRequest {
+            dimension: "minecraft:overworld".into(),
+            origin_x: 10,
+            origin_y: 64,
+            origin_z: 20,
+            width: 13,
+            depth: 11,
+            height: 12,
+            category: BuildCategory::House,
+            style: BuildStyle::Auto,
+            facing: CardinalFacing::South,
+            noise_level: NoiseLevel::Balanced,
+            seed,
+            description: desc.into(),
+            adapt_terrain: true,
+            palette: MaterialPalette::preset(0),
+        }
+    }
+
+    #[test]
+    fn noise_is_deterministic_and_bounded() {
+        let a = NoiseField::new(999);
+        let b = NoiseField::new(999);
+        let c = NoiseField::new(1000);
+        let mut diff_count = 0;
+        for x in -10..10 {
+            for z in -10..10 {
+                let va = a.fbm_2d(x as f64 * 0.23, z as f64 * 0.23, 3);
+                let vb = b.fbm_2d(x as f64 * 0.23, z as f64 * 0.23, 3);
+                let vc = c.fbm_2d(x as f64 * 0.23, z as f64 * 0.23, 3);
+                assert!((0.0..=1.0).contains(&va));
+                assert_eq!(va.to_bits(), vb.to_bits());
+                if (va - vc).abs() > 1e-6 {
+                    diff_count += 1;
+                }
+            }
+        }
+        assert!(diff_count > 100);
+    }
+
+    #[test]
+    fn parser_extracts_ru_and_en_architectural_features() {
+        let s1 = parse_description(
+            BuildCategory::House,
+            BuildStyle::Auto,
+            "уютный двухэтажный дом с крыльцом, балконом, камином и высокой крышей",
+            15,
+            13,
+            14,
+            NoiseLevel::Balanced,
+            42,
+        );
+        assert_eq!(s1.category, BuildCategory::House);
+        assert_eq!(s1.floors, 2);
+        assert!(s1.porch);
+        assert!(s1.balcony);
+        assert!(s1.chimney);
+
+        let s2 = parse_description(
+            BuildCategory::House,
+            BuildStyle::Auto,
+            "modern 2 story house with flat roof and panoramic windows",
+            15,
+            13,
+            14,
+            NoiseLevel::Calm,
+            42,
+        );
+        assert_eq!(s2.roof_style, RoofStyle::Flat);
+        assert!(s2.symmetric_modern);
+        assert!(s2.wide_windows);
+
+        let pal =
+            infer_palette_from_text("мрачный готический дом из глубокого сланца с синим огнем");
+        assert!(pal.foundation.contains("deepslate"));
+        assert_eq!(pal.light, "minecraft:soul_lantern");
+    }
+
+    #[test]
+    fn generator_produces_valid_walkable_house_across_all_facings() {
+        for facing in [
+            CardinalFacing::North,
+            CardinalFacing::East,
+            CardinalFacing::South,
+            CardinalFacing::West,
+        ] {
+            let mut req = sample_request("двухэтажный дом с крыльцом и балконом", 12345);
+            req.facing = facing;
+            let bp = generate_blueprint(&req, None);
+            assert!(bp.non_air_count() > 150, "expected solid house blocks");
+            let door = bp.door_pos.expect("house must always place an entrance door");
+            let lower = bp.blocks.get(&door).expect("lower door block");
+            let upper = bp
+                .blocks
+                .get(&[door[0], door[1] + 1, door[2]])
+                .expect("upper door block");
+            assert_eq!(lower.block_id, req.palette.door);
+            assert_eq!(upper.block_id, req.palette.door);
+            assert!(lower.props.contains(&("half", "lower")));
+            assert!(upper.props.contains(&("half", "upper")));
+            assert!(lower.props.contains(&("facing", facing.as_mc())));
+
+            // All placed local XZ coordinates must stay inside [0..W, 0..D].
+            for &[lx, _ly, lz] in bp.blocks.keys() {
+                assert!((0..i32::from(bp.width)).contains(&lx));
+                assert!((0..i32::from(bp.depth)).contains(&lz));
+            }
+        }
+    }
+
+    #[test]
+    fn generator_produces_distinct_shapes_for_different_seeds_and_categories() {
+        let mut seen_blocks = std::collections::HashSet::new();
+        let mut seen_footprints = std::collections::HashSet::new();
+        for seed in [101i64, 202, 303, 404, 505, 606] {
+            let r = sample_request("уютный дом", seed);
+            let bp = generate_blueprint(&r, None);
+            let fp: Vec<[i32; 2]> = bp
+                .blocks
+                .iter()
+                .filter(|(_, b)| b.block_id != "minecraft:air")
+                .map(|(&[lx, _, lz], _)| [lx, lz])
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            seen_footprints.insert(fp);
+            let sig: Vec<([i32; 3], String)> = bp
+                .blocks
+                .iter()
+                .map(|(&pos, b)| (pos, b.block_id.clone()))
+                .collect();
+            seen_blocks.insert(sig);
+        }
+        assert!(
+            seen_blocks.len() >= 5,
+            "expected varied buildings across 6 seeds, got {} unique",
+            seen_blocks.len()
+        );
+        assert!(
+            seen_footprints.len() >= 3,
+            "expected distinct 2D footprints on default 13x11 house, got {}",
+            seen_footprints.len()
+        );
+
+        for cat in BuildCategory::ALL {
+            let mut r = sample_request("красивая постройка", 777);
+            r.category = cat;
+            let bp = generate_blueprint(&r, None);
+            assert!(bp.non_air_count() > 60, "category {:?} too empty", cat);
+        }
+
+        let intact =
+            generate_blueprint(&sample_request("каменный дом с высокой крышей", 55), None);
+        let ruined =
+            generate_blueprint(&sample_request("заброшенные руины каменного дома", 55), None);
+        assert!(ruined.non_air_count() < intact.non_air_count());
+    }
+
+    #[test]
+    fn payload_codec_roundtrip_preserves_request_and_response() {
+        let req = sample_request("дом из кирпича и березы", 8888);
+        let bytes = encode_payload(&req, 65_536).expect("encode BuildRequest");
+        let decoded: BuildRequest = decode_payload(&bytes).expect("decode BuildRequest");
+        assert_eq!(req, decoded);
+
+        let resp = crate::model::BuildResponse {
+            ok: true,
+            blocks_changed: 412,
+            message: "Готово!".into(),
+        };
+        let rbytes = encode_payload(&resp, 8192).expect("encode BuildResponse");
+        let rdecoded: crate::model::BuildResponse = decode_payload(&rbytes).expect("decode");
+        assert_eq!(resp, rdecoded);
+    }
+
+    const TEST_BLOCK_IDS: &[&str] = &[
+        "minecraft:air",
+        "minecraft:grass_block",
+        "minecraft:dirt",
+        "minecraft:dirt_path",
+        "minecraft:stone",
+        "minecraft:cobblestone",
+        "minecraft:cobblestone_wall",
+        "minecraft:stone_bricks",
+        "minecraft:stone_brick_wall",
+        "minecraft:stone_brick_stairs",
+        "minecraft:stone_brick_slab",
+        "minecraft:mossy_stone_bricks",
+        "minecraft:mossy_stone_brick_wall",
+        "minecraft:cracked_stone_bricks",
+        "minecraft:deepslate_bricks",
+        "minecraft:deepslate_brick_wall",
+        "minecraft:deepslate_brick_stairs",
+        "minecraft:deepslate_brick_slab",
+        "minecraft:polished_deepslate",
+        "minecraft:polished_deepslate_wall",
+        "minecraft:cobbled_deepslate",
+        "minecraft:polished_blackstone_bricks",
+        "minecraft:polished_blackstone_brick_wall",
+        "minecraft:polished_blackstone_brick_stairs",
+        "minecraft:polished_blackstone_brick_slab",
+        "minecraft:tuff_bricks",
+        "minecraft:tuff_brick_wall",
+        "minecraft:tuff_brick_stairs",
+        "minecraft:tuff_brick_slab",
+        "minecraft:bricks",
+        "minecraft:brick_wall",
+        "minecraft:brick_stairs",
+        "minecraft:brick_slab",
+        "minecraft:sandstone",
+        "minecraft:sandstone_wall",
+        "minecraft:sandstone_stairs",
+        "minecraft:sandstone_slab",
+        "minecraft:cut_sandstone",
+        "minecraft:smooth_sandstone",
+        "minecraft:terracotta",
+        "minecraft:white_terracotta",
+        "minecraft:white_concrete",
+        "minecraft:light_gray_concrete",
+        "minecraft:gray_concrete",
+        "minecraft:black_concrete",
+        "minecraft:quartz_block",
+        "minecraft:smooth_quartz",
+        "minecraft:smooth_quartz_stairs",
+        "minecraft:smooth_quartz_slab",
+        "minecraft:cut_copper",
+        "minecraft:cut_copper_stairs",
+        "minecraft:cut_copper_slab",
+        "minecraft:oxidized_copper",
+        "minecraft:oxidized_cut_copper_stairs",
+        "minecraft:oxidized_cut_copper_slab",
+        "minecraft:copper_bulb",
+        "minecraft:copper_grate",
+        "minecraft:calcite",
+        "minecraft:tuff",
+        "minecraft:moss_block",
+        "minecraft:prismarine_bricks",
+        "minecraft:dark_prismarine",
+        "minecraft:oak_planks",
+        "minecraft:spruce_planks",
+        "minecraft:dark_oak_planks",
+        "minecraft:birch_planks",
+        "minecraft:cherry_planks",
+        "minecraft:pale_oak_planks",
+        "minecraft:bamboo_planks",
+        "minecraft:bamboo_mosaic",
+        "minecraft:acacia_planks",
+        "minecraft:crimson_planks",
+        "minecraft:warped_planks",
+        "minecraft:oak_log",
+        "minecraft:stripped_oak_log",
+        "minecraft:stripped_oak_wood",
+        "minecraft:spruce_log",
+        "minecraft:stripped_spruce_log",
+        "minecraft:dark_oak_log",
+        "minecraft:stripped_dark_oak_log",
+        "minecraft:birch_log",
+        "minecraft:cherry_log",
+        "minecraft:stripped_cherry_log",
+        "minecraft:pale_oak_log",
+        "minecraft:stripped_pale_oak_log",
+        "minecraft:bamboo_block",
+        "minecraft:stripped_bamboo_block",
+        "minecraft:oak_stairs",
+        "minecraft:oak_slab",
+        "minecraft:spruce_stairs",
+        "minecraft:spruce_slab",
+        "minecraft:dark_oak_stairs",
+        "minecraft:dark_oak_slab",
+        "minecraft:birch_stairs",
+        "minecraft:birch_slab",
+        "minecraft:cherry_stairs",
+        "minecraft:cherry_slab",
+        "minecraft:pale_oak_stairs",
+        "minecraft:pale_oak_slab",
+        "minecraft:bamboo_stairs",
+        "minecraft:bamboo_slab",
+        "minecraft:oak_door",
+        "minecraft:spruce_door",
+        "minecraft:dark_oak_door",
+        "minecraft:birch_door",
+        "minecraft:cherry_door",
+        "minecraft:pale_oak_door",
+        "minecraft:bamboo_door",
+        "minecraft:acacia_door",
+        "minecraft:iron_door",
+        "minecraft:copper_door",
+        "minecraft:oak_trapdoor",
+        "minecraft:spruce_trapdoor",
+        "minecraft:dark_oak_trapdoor",
+        "minecraft:birch_trapdoor",
+        "minecraft:cherry_trapdoor",
+        "minecraft:pale_oak_trapdoor",
+        "minecraft:bamboo_trapdoor",
+        "minecraft:acacia_trapdoor",
+        "minecraft:copper_trapdoor",
+        "minecraft:iron_trapdoor",
+        "minecraft:oak_fence",
+        "minecraft:spruce_fence",
+        "minecraft:dark_oak_fence",
+        "minecraft:birch_fence",
+        "minecraft:cherry_fence",
+        "minecraft:pale_oak_fence",
+        "minecraft:bamboo_fence",
+        "minecraft:nether_brick_fence",
+        "minecraft:oak_leaves",
+        "minecraft:spruce_leaves",
+        "minecraft:birch_leaves",
+        "minecraft:cherry_leaves",
+        "minecraft:azalea_leaves",
+        "minecraft:flowering_azalea_leaves",
+        "minecraft:pale_oak_leaves",
+        "minecraft:glass",
+        "minecraft:glass_pane",
+        "minecraft:white_stained_glass_pane",
+        "minecraft:gray_stained_glass_pane",
+        "minecraft:black_stained_glass_pane",
+        "minecraft:magenta_stained_glass_pane",
+        "minecraft:purple_stained_glass_pane",
+        "minecraft:blue_stained_glass_pane",
+        "minecraft:iron_bars",
+        "minecraft:lantern",
+        "minecraft:soul_lantern",
+        "minecraft:copper_lantern",
+        "minecraft:torch",
+        "minecraft:sea_lantern",
+        "minecraft:glowstone",
+        "minecraft:end_rod",
+        "minecraft:shroomlight",
+        "minecraft:ochre_froglight",
+        "minecraft:iron_chain",
+        "minecraft:campfire",
+        "minecraft:soul_campfire",
+        "minecraft:potted_oak_sapling",
+        "minecraft:potted_fern",
+        "minecraft:potted_cherry_sapling",
+        "minecraft:potted_red_tulip",
+        "minecraft:flower_pot",
+        "minecraft:red_bed",
+        "minecraft:white_bed",
+        "minecraft:blue_bed",
+        "minecraft:red_carpet",
+        "minecraft:white_carpet",
+        "minecraft:moss_carpet",
+        "minecraft:crafting_table",
+        "minecraft:furnace",
+        "minecraft:smoker",
+        "minecraft:blast_furnace",
+        "minecraft:anvil",
+        "minecraft:cauldron",
+        "minecraft:water_cauldron",
+        "minecraft:barrel",
+        "minecraft:chest",
+        "minecraft:bookshelf",
+        "minecraft:lectern",
+        "minecraft:enchanting_table",
+        "minecraft:decorated_pot",
+        "minecraft:hay_block",
+        "minecraft:cobblestone_slab",
+        "minecraft:cobblestone_stairs",
+        "minecraft:mossy_cobblestone",
+        "minecraft:redstone_lamp",
+        "minecraft:ladder",
+        "minecraft:white_wool",
+        "minecraft:red_wool",
+        "minecraft:snow_block",
+        "minecraft:packed_ice",
+        "minecraft:chiseled_bookshelf",
+        "minecraft:composter",
+        "minecraft:lightning_rod",
+        "minecraft:potted_azalea_bush",
+        "minecraft:bell",
+        "minecraft:magma_block",
+        "minecraft:water",
+        "minecraft:oak_pressure_plate",
+        "minecraft:farmland",
+        "minecraft:wheat",
+        "minecraft:candle",
+        "minecraft:wall_torch",
+        "minecraft:soul_wall_torch",
+        "minecraft:oak_fence_gate",
+        "minecraft:spruce_fence_gate",
+        "minecraft:dark_oak_fence_gate",
+        "minecraft:birch_fence_gate",
+        "minecraft:cherry_fence_gate",
+        "minecraft:pale_oak_fence_gate",
+        "minecraft:acacia_fence_gate",
+        "minecraft:bamboo_fence_gate",
+        "minecraft:diorite",
+        "minecraft:orange_wool",
+        "minecraft:blue_wool",
+        "minecraft:orange_carpet",
+        "minecraft:azalea",
+        "minecraft:flowering_azalea",
+        "minecraft:bamboo",
+        "minecraft:potted_bamboo",
+        "minecraft:potted_flowering_azalea_bush",
+        "minecraft:spore_blossom",
+        "minecraft:fern",
+        "minecraft:cobbled_deepslate_stairs",
+        "minecraft:cracked_deepslate_tiles",
+        "minecraft:spruce_shelf",
+        "minecraft:oak_shelf",
+        "minecraft:lily_pad",
+        "minecraft:sugar_cane",
+        "minecraft:gravel",
+        "minecraft:vine",
+        "minecraft:pink_petals",
+        "minecraft:wildflowers",
+        "minecraft:leaf_litter",
+        "minecraft:short_grass",
+        "minecraft:lime_carpet",
+        "minecraft:brewing_stand",
+        "minecraft:grindstone",
+        "minecraft:smithing_table",
+        "minecraft:oak_hanging_sign",
+        "minecraft:spruce_hanging_sign",
+        "minecraft:dark_oak_hanging_sign",
+        "minecraft:cherry_hanging_sign",
+        "minecraft:cherry_log",
+        "minecraft:jungle_planks",
+        "minecraft:jungle_log",
+        "minecraft:stripped_jungle_log",
+        "minecraft:jungle_door",
+        "minecraft:jungle_trapdoor",
+        "minecraft:jungle_fence",
+        "minecraft:jungle_fence_gate",
+        "minecraft:jungle_leaves",
+        "minecraft:jungle_stairs",
+        "minecraft:jungle_slab",
+        "minecraft:mangrove_planks",
+        "minecraft:mangrove_log",
+        "minecraft:stripped_mangrove_log",
+        "minecraft:mangrove_door",
+        "minecraft:mangrove_trapdoor",
+        "minecraft:mangrove_fence",
+        "minecraft:mangrove_fence_gate",
+        "minecraft:mangrove_leaves",
+        "minecraft:mangrove_stairs",
+        "minecraft:mangrove_slab",
+        "minecraft:acacia_log",
+        "minecraft:stripped_acacia_log",
+        "minecraft:acacia_fence",
+        "minecraft:acacia_leaves",
+        "minecraft:acacia_stairs",
+        "minecraft:acacia_slab",
+        "minecraft:crimson_stem",
+        "minecraft:crimson_door",
+        "minecraft:crimson_trapdoor",
+        "minecraft:crimson_fence",
+        "minecraft:crimson_fence_gate",
+        "minecraft:crimson_stairs",
+        "minecraft:crimson_slab",
+        "minecraft:warped_stem",
+        "minecraft:warped_door",
+        "minecraft:warped_trapdoor",
+        "minecraft:warped_fence",
+        "minecraft:warped_fence_gate",
+        "minecraft:warped_stairs",
+        "minecraft:warped_slab",
+        "minecraft:dark_oak_leaves",
+        "minecraft:mud_bricks",
+        "minecraft:mud_brick_stairs",
+        "minecraft:mud_brick_slab",
+        "minecraft:mud_brick_wall",
+        "minecraft:resin_bricks",
+        "minecraft:resin_brick_stairs",
+        "minecraft:resin_brick_slab",
+        "minecraft:resin_brick_wall",
+        "minecraft:chiseled_tuff_bricks",
+        "minecraft:polished_tuff",
+        "minecraft:red_nether_bricks",
+        "minecraft:red_nether_brick_stairs",
+        "minecraft:red_nether_brick_slab",
+        "minecraft:red_nether_brick_wall",
+        "minecraft:nether_bricks",
+        "minecraft:nether_brick_stairs",
+        "minecraft:nether_brick_slab",
+        "minecraft:nether_brick_wall",
+        "minecraft:purpur_block",
+        "minecraft:purpur_pillar",
+        "minecraft:purpur_stairs",
+        "minecraft:purpur_slab",
+        "minecraft:end_stone_bricks",
+        "minecraft:end_stone_brick_stairs",
+        "minecraft:end_stone_brick_slab",
+        "minecraft:end_stone_brick_wall",
+        "minecraft:amethyst_block",
+        "minecraft:quartz_bricks",
+        "minecraft:quartz_pillar",
+        "minecraft:polished_basalt",
+        "minecraft:polished_andesite",
+        "minecraft:polished_diorite",
+        "minecraft:polished_granite",
+        "minecraft:andesite_wall",
+        "minecraft:diorite_wall",
+        "minecraft:granite_wall",
+        "minecraft:mossy_cobblestone_wall",
+        "minecraft:red_sandstone",
+        "minecraft:cut_red_sandstone",
+        "minecraft:red_sandstone_stairs",
+        "minecraft:red_sandstone_slab",
+        "minecraft:red_sandstone_wall",
+        "minecraft:dark_prismarine_stairs",
+        "minecraft:dark_prismarine_slab",
+        "minecraft:prismarine_wall",
+        "minecraft:exposed_cut_copper",
+        "minecraft:exposed_cut_copper_stairs",
+        "minecraft:exposed_cut_copper_slab",
+        "minecraft:weathered_cut_copper",
+        "minecraft:weathered_cut_copper_stairs",
+        "minecraft:weathered_cut_copper_slab",
+        "minecraft:oxidized_cut_copper",
+        "minecraft:copper_block",
+        "minecraft:tinted_glass",
+        "minecraft:light_blue_stained_glass_pane",
+        "minecraft:cyan_stained_glass_pane",
+        "minecraft:pink_stained_glass_pane",
+        "minecraft:red_stained_glass_pane",
+        "minecraft:orange_stained_glass_pane",
+        "minecraft:yellow_stained_glass_pane",
+        "minecraft:lime_stained_glass_pane",
+        "minecraft:green_stained_glass_pane",
+        "minecraft:brown_stained_glass_pane",
+        "minecraft:verdant_froglight",
+        "minecraft:pearlescent_froglight",
+        "minecraft:blackstone",
+        "minecraft:cartography_table",
+        "minecraft:loom",
+        "minecraft:stonecutter",
+        "minecraft:lava_cauldron",
+        "minecraft:cake",
+        "minecraft:sea_pickle",
+        "minecraft:jukebox",
+        "minecraft:ender_chest",
+        "minecraft:beacon",
+        "minecraft:light_blue_bed",
+        "minecraft:green_bed",
+        "minecraft:purple_bed",
+        "minecraft:yellow_bed",
+        "minecraft:dark_oak_shelf",
+        "minecraft:cherry_shelf",
+        "minecraft:birch_shelf",
+        "minecraft:pale_oak_shelf",
+        "minecraft:sand",
+    ];
+
+    static REGISTERED_KEYS: OnceLock<Mutex<HashMap<String, BlockKey>>> = OnceLock::new();
+
+    struct TestRegistryMod;
+    #[mod_api::__subscriptions]
+    impl Hooks for TestRegistryMod {
+        fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
+            let map = REGISTERED_KEYS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = map.lock().unwrap();
+            for &id in TEST_BLOCK_IDS {
+                guard.insert(id.to_owned(), r.block_key(id));
+            }
+        }
+    }
+
+    /// Test double combining `FakeHost` world/player state with in-memory `WorldEditServerHost` & `BlockMetadata`.
+    struct TestWorldHost {
+        fake: FakeHost,
+        key_to_id: HashMap<BlockKey, String>,
+        id_to_key: HashMap<String, BlockKey>,
+        world_blocks: BTreeMap<[i32; 3], BlockState>,
+        air_key: BlockKey,
+        sent_payloads: Vec<(String, Vec<u8>)>,
+    }
+
+    impl TestWorldHost {
+        fn new(keys: HashMap<String, BlockKey>) -> Self {
+            let mut key_to_id = HashMap::new();
+            for (id, &k) in &keys {
+                key_to_id.insert(k, id.clone());
+            }
+            let air_key = keys["minecraft:air"];
+            let grass_key = keys["minecraft:grass_block"];
+            let mut host = Self {
+                fake: FakeHost::new(),
+                key_to_id,
+                id_to_key: keys,
+                world_blocks: BTreeMap::new(),
+                air_key,
+                sent_payloads: Vec::new(),
+            };
+            let grass = BlockStateRecord::new(grass_key, 0).into();
+            for x in 0..40 {
+                for z in 0..40 {
+                    host.world_blocks.insert([x, 63, z], grass);
+                }
+            }
+            host
+        }
+    }
+
+    impl BlockMetadata for TestWorldHost {
+        fn name(&self, block: BlockKey) -> Result<&str, BlockStateError> {
+            self.key_to_id
+                .get(&block)
+                .map(String::as_str)
+                .ok_or(BlockStateError::Unavailable)
+        }
+        fn property(
+            &self,
+            _: BlockStateRecord,
+            _: &str,
+        ) -> Result<Option<&str>, BlockStateError> {
+            Ok(None)
+        }
+        fn with(
+            &self,
+            state: BlockStateRecord,
+            _: &str,
+            _: &str,
+        ) -> Result<BlockStateRecord, BlockStateError> {
+            Ok(state)
+        }
+        fn of(
+            &self,
+            block: BlockKey,
+            _: &[StateConstraint],
+        ) -> Result<BlockStateRecord, BlockStateError> {
+            if self.key_to_id.contains_key(&block) {
+                Ok(BlockStateRecord::new(block, 0))
+            } else {
+                Err(BlockStateError::Unavailable)
+            }
+        }
+    }
+
+    impl Host for TestWorldHost {
+        fn backend(&self) -> Option<BackendRef<'_>> {
+            Some(<BackendRef<'_> as BackendRefOf>::of(self))
+        }
+    }
+    mod_api::impl_host_areas!(TestWorldHost, except(entities, keys, payload_tokens, players));
+
+    impl PayloadTokensHost for TestWorldHost {
+        fn check_payload_token(
+            &self,
+            _: &mod_api::PayloadToken,
+        ) -> Result<(), mod_api::PayloadSendError> {
+            Ok(())
+        }
+    }
+
+    impl KeysHost for TestWorldHost {
+        fn block_key(&self, id: &str) -> Option<BlockKey> {
+            self.id_to_key.get(id).copied()
+        }
+    }
+    impl EntitiesHost for TestWorldHost {
+        fn level(&self, dimension: &str) -> Option<LevelRef> {
+            self.fake.level(dimension)
+        }
+    }
+    impl PlayersHost for TestWorldHost {
+        fn player(&self, uuid: u128) -> Option<mod_api::PlayerRef> {
+            self.fake.player(uuid)
+        }
+    }
+
+    impl ServerHost for TestWorldHost {
+        fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {
+            Some(<BackendMutRef<'_> as BackendMutRefOf>::of(self))
+        }
+    }
+    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services));
+
+    impl ServicesServerHost for TestWorldHost {
+        fn commands(&mut self) -> &mut dyn mod_api::Commands {
+            &mut self.fake.commands
+        }
+        fn messages(&self) -> &dyn mod_api::Messages {
+            &self.fake.messages
+        }
+        fn players(&self) -> &dyn mod_api::Players {
+            &self.fake.players
+        }
+    }
+
+    impl WorldEditServerHost for TestWorldHost {
+        fn edit_blocks(&mut self, dimension: &str, edit: &BlockEdit) -> Result<u64, String> {
+            if dimension != "minecraft:overworld" {
+                return Err("unknown dimension".into());
+            }
+            let mut changed = 0u64;
+            for run in &edit.runs {
+                let state = edit.palette[run.block as usize];
+                for dy in 0..(run.height as i32) {
+                    let pos = [run.x, run.y + dy, run.z];
+                    if state.block() == self.air_key {
+                        if self.world_blocks.remove(&pos).is_some() {
+                            changed += 1;
+                        }
+                    } else {
+                        self.world_blocks.insert(pos, state);
+                        changed += 1;
+                    }
+                }
+            }
+            Ok(changed)
+        }
+
+        fn surface_heights(
+            &self,
+            _dimension: &str,
+            columns: &[(i32, i32)],
+            _heightmap: Heightmap,
+        ) -> Result<Vec<Option<i32>>, String> {
+            Ok(columns
+                .iter()
+                .map(|&(x, z)| {
+                    self.world_blocks
+                        .keys()
+                        .filter(|p| p[0] == x && p[2] == z)
+                        .map(|p| p[1] + 1)
+                        .max()
+                        .or(Some(64))
+                })
+                .collect())
+        }
+    }
+
+    impl ClientHost for TestWorldHost {}
+    mod_api::impl_client_host_areas!(TestWorldHost);
+
+    impl Backend for TestWorldHost {}
+    mod_api::impl_backend_areas!(TestWorldHost, except(block_states, entities, levels, players));
+
+    impl PlayersClientBackend for TestWorldHost {}
+
+    impl EntitiesBackend for TestWorldHost {
+        fn entity_position(&self, _entity: mod_api::EntityRef) -> Option<[f64; 3]> {
+            Some([10.0, 64.0, 10.0])
+        }
+        fn entity_rotation(&self, _entity: mod_api::EntityRef) -> Option<[f32; 2]> {
+            Some([0.0, 0.0])
+        }
+    }
+
+    impl BlockStatesBackend for TestWorldHost {
+        fn block_metadata_name(&self, block: BlockKey) -> Result<&str, BlockStateError> {
+            BlockMetadata::name(self, block)
+        }
+        fn block_metadata_of(
+            &self,
+            block: BlockKey,
+            properties: &[StateConstraint],
+        ) -> Result<BlockStateRecord, BlockStateError> {
+            BlockMetadata::of(self, block, properties)
+        }
+    }
+    impl LevelsBackend for TestWorldHost {
+        fn level_block_state(&self, _level: LevelRef, pos: [i32; 3]) -> Option<BlockState> {
+            Some(
+                self.world_blocks
+                    .get(&pos)
+                    .copied()
+                    .unwrap_or_else(|| BlockStateRecord::new(self.air_key, 0).into()),
+            )
+        }
+    }
+    impl PlayersBackend for TestWorldHost {
+        fn player_dimension(&self, player: mod_api::PlayerRef) -> Option<mod_api::Identifier> {
+            self.fake
+                .players
+                .get(player.uuid())
+                .and_then(|_| mod_api::Identifier::parse("minecraft:overworld").ok())
+        }
+    }
+
+    impl BackendMut for TestWorldHost {}
+    mod_api::impl_backend_mut_areas!(TestWorldHost, except(payloads));
+
+    impl PayloadsBackendMut for TestWorldHost {
+        fn player_send_payload(
+            &mut self,
+            _: mod_api::PlayerRef,
+            id: &mod_api::PayloadId,
+            bytes: mod_api::PayloadBytes,
+        ) -> Result<mod_api::PayloadAccepted, mod_api::PayloadSendError> {
+            self.sent_payloads.push((id.0.clone(), bytes.0));
+            Ok(mod_api::PayloadAccepted::Queued)
+        }
+    }
+
+    #[test]
+    fn server_execute_build_undo_and_command_work_end_to_end() {
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(77, 100);
+            let player = host.player(77).unwrap();
+
+            let before_snapshot = host.world_blocks.clone();
+            let req = sample_request("уютный двухэтажный дом с крыльцом и камином", 4242);
+            let resp = execute_build(&mut host, Some(player), req);
+            assert!(resp.ok, "build failed: {}", resp.message);
+            assert!(resp.blocks_changed > 100);
+            assert_ne!(host.world_blocks, before_snapshot);
+
+            let undo_resp = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(undo_resp.ok, "undo failed: {}", undo_resp.message);
+            assert_eq!(host.world_blocks, before_snapshot);
+
+            // Also test `/buildgen generate` and `/buildgen undo` command dispatch!
+            let level_dim = host.level("minecraft:overworld").unwrap().dimension();
+            let cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "generate".into()],
+                vec![CommandArgument::new(
+                    "description".into(),
+                    CommandArgumentValue::String("уютный дом с крыльцом".into()),
+                )],
+                level_dim,
+                [15.0, 64.0, 15.0],
+            );
+            let mut ev = RunModCommandEvent {
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                command: &cmd,
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut ev), Flow::Cancel);
+            assert_ne!(host.world_blocks, before_snapshot);
+
+            let undo_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "undo".into()],
+                vec![],
+                level_dim,
+                [15.0, 64.0, 15.0],
+            );
+            let mut undo_ev = RunModCommandEvent {
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                command: &undo_cmd,
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut undo_ev), Flow::Cancel);
+            assert_eq!(host.world_blocks, before_snapshot);
+
+            let preset_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "preset".into()],
+                vec![CommandArgument::new(
+                    "preset".into(),
+                    CommandArgumentValue::String("observatory".into()),
+                )],
+                level_dim,
+                [15.0, 64.0, 15.0],
+            );
+            let mut preset_ev = RunModCommandEvent {
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                command: &preset_cmd,
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut preset_ev), Flow::Cancel);
+            assert_ne!(host.world_blocks, before_snapshot);
+
+            let mut undo_ev2 = RunModCommandEvent {
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                command: &undo_cmd,
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut undo_ev2), Flow::Cancel);
+            assert_eq!(host.world_blocks, before_snapshot);
+        });
+    }
+
+    #[test]
+    fn terrain_adaptation_builds_foundation_skirt_on_slopes() {
+        let mut req = sample_request("каменный дом", 777);
+        req.adapt_terrain = true;
+        // Simulate a sloped hillside dipping 4 blocks below origin_y on one side.
+        let mut offsets = vec![0i32; usize::from(req.width) * usize::from(req.depth)];
+        for lz in 0..usize::from(req.depth) {
+            for lx in 0..usize::from(req.width) {
+                offsets[lz * usize::from(req.width) + lx] = if lx > 6 { -4 } else { 0 };
+            }
+        }
+        let bp = generate_blueprint(&req, Some(&offsets));
+        let has_skirt = bp.blocks.keys().any(|&[lx, ly, _lz]| lx > 6 && ly < 0 && ly >= -4);
+        assert!(has_skirt, "expected foundation skirt extending down on sloping terrain");
+    }
+
+    #[test]
+    fn command_registration_and_tab_complete_cover_all_subcommands() {
+        let mut cmds = Vec::new();
+        let mut reg_ev = mod_api::RegisterCommandsEvent { commands: &mut cmds };
+        crate::server_builder::register_commands(&mut reg_ev);
+        let usages: Vec<&str> = cmds.iter().map(|c| c.usage.as_str()).collect();
+        assert!(usages.contains(&"buildgen"));
+        assert!(usages.contains(&"buildgen undo"));
+        assert!(usages.contains(&"buildgen lang <lang:text>"));
+        assert!(usages.iter().any(|u| u.starts_with("buildgen generate")));
+        assert!(usages.iter().any(|u| u.starts_with("buildgen size")));
+
+        let mut suggestions = Vec::new();
+        let mut tab_ev = mod_api::TabCompleteEvent {
+            player: 1,
+            name: "buildgen",
+            command: "buildgen ",
+            range: [9, 9],
+            suggestions: &mut suggestions,
+        };
+        crate::server_builder::tab_complete(&mut tab_ev);
+        assert!(suggestions.iter().any(|s| s.text == "generate"));
+        assert!(suggestions.iter().any(|s| s.text == "lang"));
+        assert!(suggestions.iter().any(|s| s.text == "undo"));
+
+        let mut lang_suggestions = Vec::new();
+        let mut tab_lang = mod_api::TabCompleteEvent {
+            player: 1,
+            name: "buildgen",
+            command: "buildgen lang ",
+            range: [14, 14],
+            suggestions: &mut lang_suggestions,
+        };
+        crate::server_builder::tab_complete(&mut tab_lang);
+        assert!(lang_suggestions.iter().any(|s| s.text == "en"));
+        assert!(lang_suggestions.iter().any(|s| s.text == "ru"));
+    }
+
+    #[test]
+    fn all_styles_and_categories_produce_detailed_architecture() {
+        let styles = [
+            BuildStyle::Auto,
+            BuildStyle::Medieval,
+            BuildStyle::Cottage,
+            BuildStyle::Japanese,
+            BuildStyle::Gothic,
+            BuildStyle::Nordic,
+            BuildStyle::Modern,
+            BuildStyle::Desert,
+            BuildStyle::Steampunk,
+            BuildStyle::Classical,
+        ];
+        for style in styles {
+            let mut req = sample_request("двухэтажный дом с камином, садом и балконом", 9001);
+            req.width = 17;
+            req.depth = 15;
+            req.height = 16;
+            req.style = style;
+            req.palette = MaterialPalette::preset_for_style(style);
+            let bp = generate_blueprint(&req, None);
+            assert!(
+                bp.non_air_count() > 200,
+                "style {:?} produced too few blocks: {}",
+                style,
+                bp.non_air_count()
+            );
+            assert!(
+                !bp.blocks
+                    .values()
+                    .any(|p| p.block_id == "minecraft:chain"),
+                "style {:?} emitted legacy minecraft:chain instead of minecraft:iron_chain",
+                style
+            );
+            for p in bp.blocks.values() {
+                if p.block_id.ends_with("_leaves") {
+                    assert!(
+                        p.props.iter().any(|(k, v)| *k == "persistent" && *v == "true"),
+                        "leaf {} missing persistent=true in style {:?}",
+                        p.block_id,
+                        style
+                    );
+                }
+            }
+        }
+
+        for cat in [
+            BuildCategory::House,
+            BuildCategory::Tower,
+            BuildCategory::Barn,
+            BuildCategory::Pavilion,
+            BuildCategory::Castle,
+            BuildCategory::Forge,
+            BuildCategory::Temple,
+            BuildCategory::Bridge,
+        ] {
+            let mut req = sample_request("детализированная постройка с освещением", 4422);
+            req.width = 19;
+            req.depth = 17;
+            req.height = 16;
+            req.category = cat;
+            let bp = generate_blueprint(&req, None);
+            assert!(
+                bp.non_air_count() > 140,
+                "category {:?} too empty: {}",
+                cat,
+                bp.non_air_count()
+            );
+        }
+
+        // Verify Japanese + Castle + Forge thematic richness & interior furnishings.
+        let mut jap_req = sample_request("японский дом с пагодой и садом сакуры", 31415);
+        jap_req.width = 19;
+        jap_req.depth = 17;
+        jap_req.height = 18;
+        jap_req.style = BuildStyle::Japanese;
+        jap_req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let jap_bp = generate_blueprint(&jap_req, None);
+        assert!(
+            jap_bp
+                .blocks
+                .values()
+                .any(|p| p.block_id == "minecraft:cherry_leaves"),
+            "Japanese pagoda should place cherry leaves"
+        );
+
+        let mut forge_req = sample_request("кузница в стиле стимпанк с наковальней", 27182);
+        forge_req.width = 17;
+        forge_req.depth = 15;
+        forge_req.height = 14;
+        forge_req.category = BuildCategory::Forge;
+        forge_req.style = BuildStyle::Steampunk;
+        forge_req.palette = MaterialPalette::preset_for_style(BuildStyle::Steampunk);
+        let forge_bp = generate_blueprint(&forge_req, None);
+        assert!(
+            forge_bp
+                .blocks
+                .values()
+                .any(|p| matches!(p.block_id.as_str(), "minecraft:anvil" | "minecraft:blast_furnace")),
+            "Forge should contain smithing blocks (anvil / blast_furnace)"
+        );
+    }
+
+    #[test]
+    fn specialized_themes_basements_wells_and_slope_steps_work() {
+        // 1. Windmill (blades), Lighthouse (beacon), Greenhouse (glass vault), Tavern, Library.
+        let mut windmill_req = sample_request("деревянная мельница с лопастями", 1111);
+        windmill_req.width = 15;
+        windmill_req.depth = 15;
+        windmill_req.height = 18;
+        let windmill = generate_blueprint(&windmill_req, None);
+        assert_eq!(windmill.spec.theme, StructureTheme::Windmill);
+        assert!(
+            windmill.blocks.values().any(|p| p.block_id == "minecraft:white_wool"),
+            "Windmill must place white_wool sail blades"
+        );
+
+        let mut lighthouse_req = sample_request("высокий каменный маяк", 2222);
+        lighthouse_req.width = 13;
+        lighthouse_req.depth = 13;
+        lighthouse_req.height = 22;
+        lighthouse_req.palette = infer_palette_from_text(&lighthouse_req.description);
+        let lighthouse = generate_blueprint(&lighthouse_req, None);
+        assert_eq!(lighthouse.spec.theme, StructureTheme::Lighthouse);
+        assert!(lighthouse.blocks.values().any(|p| p.block_id == "minecraft:sea_lantern"));
+        assert!(lighthouse.blocks.values().any(|p| p.block_id == "minecraft:lightning_rod"));
+
+        let mut gh_req = sample_request("стеклянная теплица оранжерея с зеленью", 3333);
+        gh_req.width = 15;
+        gh_req.depth = 13;
+        gh_req.height = 12;
+        gh_req.palette = infer_palette_from_text(&gh_req.description);
+        let gh = generate_blueprint(&gh_req, None);
+        assert_eq!(gh.spec.theme, StructureTheme::Greenhouse);
+        assert!(gh.blocks.values().any(|p| p.block_id == "minecraft:glass"));
+        assert!(gh.blocks.values().any(|p| p.block_id == "minecraft:moss_block"));
+
+        let mut lib_req = sample_request("большая библиотека архив", 4444);
+        lib_req.width = 15;
+        lib_req.depth = 13;
+        lib_req.height = 12;
+        let lib_bp = generate_blueprint(&lib_req, None);
+        assert_eq!(lib_bp.spec.theme, StructureTheme::Library);
+        assert!(
+            lib_bp
+                .blocks
+                .values()
+                .any(|p| matches!(p.block_id.as_str(), "minecraft:bookshelf" | "minecraft:chiseled_bookshelf"))
+        );
+
+        // 2. Basement + Large plot Courtyard Well + Slope steps!
+        let mut cellar_req = sample_request("уютный двухэтажный дом с подвалом и колодцем во дворе", 5555);
+        cellar_req.width = 21;
+        cellar_req.depth = 19;
+        cellar_req.height = 16;
+        let cellar_bp = generate_blueprint(&cellar_req, None);
+        assert!(cellar_bp.spec.basement);
+        assert!(cellar_bp.spec.courtyard_well);
+        assert!(
+            cellar_bp.blocks.iter().any(|(&[_, ly, _], b)| ly <= -2 && b.block_id == "minecraft:air"),
+            "Basement must carve hollow underground room at ly <= -2"
+        );
+        assert!(
+            cellar_bp.blocks.values().any(|b| b.block_id == "minecraft:water_cauldron"),
+            "Large estate with courtyard_well should include water_cauldron"
+        );
+
+        // 3. Adaptive stairs descending down front hillside slope!
+        let mut hill_req = sample_request("дом с крыльцом", 6666);
+        hill_req.width = 15;
+        hill_req.depth = 15;
+        hill_req.height = 14;
+        let offsets = vec![-4i32; usize::from(hill_req.width) * usize::from(hill_req.depth)];
+        let hill_bp = generate_blueprint(&hill_req, Some(&offsets));
+        assert!(
+            hill_bp.blocks.iter().any(|(&[_, ly, _], b)| ly < 0 && b.block_id.ends_with("_stairs")),
+            "Porch stairs must extend below y=0 onto dipping terrain slope"
+        );
+    }
+
+    #[test]
+    fn two_phase_placement_and_reroll_work_end_to_end() {
+        let rr = RerollRequest {
+            dimension: "minecraft:overworld".into(),
+        };
+        let rbytes = encode_payload(&rr, 1024).expect("encode RerollRequest");
+        let decoded: RerollRequest = decode_payload(&rbytes).expect("decode RerollRequest");
+        assert_eq!(rr, decoded);
+
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(88, 100);
+            let player = host.player(88).unwrap();
+
+            let req = sample_request("двухэтажный дом с крыльцом, камином и подвалом", 123456);
+            let bp = generate_blueprint(&req, None);
+            let (palette, phase1, phase2) =
+                blueprint_to_phased_runs(&host, &bp).expect("phased runs");
+            assert!(!palette.is_empty());
+            assert!(!phase1.is_empty());
+            assert!(!phase2.is_empty(), "expected Phase 2 dependent props (door/bed/lantern/pot)");
+
+            let before = host.world_blocks.clone();
+            let b1 = execute_build(&mut host, Some(player), req);
+            assert!(b1.ok, "initial build failed: {}", b1.message);
+            assert!(
+                b1.message.contains("[undo: 1/5]") || b1.message.contains("[отмен: 1/5]"),
+                "Build message should expose undo stack depth: {}",
+                b1.message
+            );
+            let after_first = host.world_blocks.clone();
+            assert_ne!(after_first, before);
+
+            // Reroll restores prior ground and places a fresh distinct seed variation!
+            let reroll_resp = execute_reroll(&mut host, Some(player), "minecraft:overworld");
+            assert!(reroll_resp.ok, "reroll failed: {}", reroll_resp.message);
+            assert!(
+                reroll_resp.message.contains("[undo: 1/5]") || reroll_resp.message.contains("[отмен: 1/5]"),
+                "Reroll should keep stack at 1/5: {}",
+                reroll_resp.message
+            );
+            let after_reroll = host.world_blocks.clone();
+            assert_ne!(after_reroll, before);
+            assert_ne!(after_reroll, after_first, "reroll must produce a fresh seed variant");
+
+            let undo_resp = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(undo_resp.ok, "undo after reroll failed: {}", undo_resp.message);
+            assert!(
+                undo_resp.message.contains("[undo: 0/5]") || undo_resp.message.contains("[отмен: 0/5]"),
+                "Undo message should report 0/5 remaining: {}",
+                undo_resp.message
+            );
+            assert_eq!(host.world_blocks, before);
+
+            // Also verify all 12 CLI presets resolve all blocks cleanly through TestWorldHost!
+            for (idx, &(slug, cat, style, w, d, h, desc)) in CLI_PRESETS.iter().enumerate() {
+                let pal = MaterialPalette::preset_for_style(style);
+                let preq = BuildRequest {
+                    dimension: "minecraft:overworld".into(),
+                    origin_x: 0,
+                    origin_y: 64,
+                    origin_z: 0,
+                    width: w,
+                    depth: d,
+                    height: h,
+                    category: cat,
+                    style,
+                    facing: CardinalFacing::South,
+                    noise_level: NoiseLevel::Balanced,
+                    seed: 1000 + idx as i64,
+                    description: desc.into(),
+                    adapt_terrain: true,
+                    palette: pal,
+                };
+                let pbp = generate_blueprint(&preq, None);
+                let res = blueprint_to_phased_runs(&host, &pbp);
+                assert!(
+                    res.is_ok(),
+                    "Preset '{slug}' emitted unknown/unregistered block IDs: {:?}",
+                    res.err()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn connected_states_mitered_stairs_temple_bell_castle_pool_and_pagoda_work() {
+        // 1. Connected panes/fences/walls & mitered outer/inner hip roof stair shapes!
+        let mut hip_req = sample_request("средневековый дом с шатровой крышей и камином", 7777);
+        hip_req.width = 17;
+        hip_req.depth = 15;
+        hip_req.height = 16;
+        hip_req.style = BuildStyle::Medieval;
+        let hip_bp = generate_blueprint(&hip_req, None);
+
+        let has_outer_miter = hip_bp.blocks.values().any(|b| {
+            b.block_id.ends_with("_stairs")
+                && b.props
+                    .iter()
+                    .any(|(k, v)| *k == "shape" && v.starts_with("outer_"))
+        });
+        assert!(has_outer_miter, "Hip roof must emit mitered outer_left/outer_right corner stairs");
+
+        for b in hip_bp.blocks.values() {
+            if b.block_id.ends_with("glass_pane") || b.block_id.ends_with("_fence") {
+                assert!(
+                    b.props.iter().any(|(k, _)| *k == "north")
+                        && b.props.iter().any(|(k, _)| *k == "east"),
+                    "{} must compute directional connection properties",
+                    b.block_id
+                );
+            }
+            if b.block_id.ends_with("_wall") {
+                assert!(
+                    b.props.iter().any(|(k, _)| *k == "up")
+                        && b.props.iter().any(|(k, _)| *k == "north"),
+                    "wall {} must compute north/up properties",
+                    b.block_id
+                );
+            }
+        }
+        assert!(
+            hip_bp.blocks.values().any(|b| {
+                b.block_id == "minecraft:campfire"
+                    && b.props.iter().any(|(k, v)| *k == "signal_fire" && *v == "true")
+            }),
+            "Chimney cap should enable signal_fire=true smoke plume"
+        );
+
+        // 2. Temple bell steeple + nave pews!
+        let mut temple_req = sample_request("нордический каменный собор храм", 8888);
+        temple_req.width = 19;
+        temple_req.depth = 17;
+        temple_req.height = 18;
+        temple_req.category = BuildCategory::Temple;
+        let temple_bp = generate_blueprint(&temple_req, None);
+        assert!(
+            temple_bp.blocks.values().any(|b| b.block_id == "minecraft:bell"),
+            "Temple must include a hanging bell steeple"
+        );
+
+        // 3. Castle portcullis & Forge molten magma!
+        let mut castle_req = sample_request("готический замок цитадель", 9999);
+        castle_req.width = 21;
+        castle_req.depth = 19;
+        castle_req.height = 18;
+        castle_req.category = BuildCategory::Castle;
+        let castle_bp = generate_blueprint(&castle_req, None);
+        assert!(
+            castle_bp.blocks.values().any(|b| b.block_id == "minecraft:iron_bars"),
+            "Castle must include iron_bars portcullis / bars"
+        );
+
+        let mut forge_req = sample_request("кузница", 4242);
+        forge_req.width = 17;
+        forge_req.depth = 15;
+        forge_req.height = 14;
+        forge_req.category = BuildCategory::Forge;
+        let forge_bp = generate_blueprint(&forge_req, None);
+        assert!(
+            forge_bp.blocks.values().any(|b| b.block_id == "minecraft:magma_block"),
+            "Forge must include magma_block hearth glow"
+        );
+
+        // 4. Modern courtyard reflecting pool!
+        let mut mod_req = sample_request("современный дом с двором и колодцем", 1212);
+        mod_req.width = 21;
+        mod_req.depth = 19;
+        mod_req.height = 14;
+        mod_req.style = BuildStyle::Modern;
+        let mod_bp = generate_blueprint(&mod_req, None);
+        assert!(
+            mod_bp.blocks.values().any(|b| b.block_id == "minecraft:water"),
+            "Large Modern estate should feature water reflecting pool"
+        );
+
+        // 5. Japanese multi-tier pagoda!
+        let mut pag_req = sample_request("высокая японская пагода", 3434);
+        pag_req.width = 13;
+        pag_req.depth = 13;
+        pag_req.height = 20;
+        pag_req.category = BuildCategory::Tower;
+        pag_req.style = BuildStyle::Japanese;
+        pag_req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let pag_bp = generate_blueprint(&pag_req, None);
+        assert!(
+            pag_bp.blocks.values().filter(|b| b.block_id.ends_with("_slab")).count() > 25,
+            "Multi-tier Japanese Pagoda should place multiple upturned eave slab skirts"
+        );
+    }
+
+    #[test]
+    fn dome_and_mansard_roofs_build_distinct_crowned_architectures() {
+        let mut dome_req = sample_request("обсерватория с куполом", 5151);
+        dome_req.width = 15;
+        dome_req.depth = 15;
+        dome_req.height = 20;
+        dome_req.category = BuildCategory::Tower;
+        let dome_bp = generate_blueprint(&dome_req, None);
+        assert_eq!(dome_bp.spec.roof_style, RoofStyle::Dome);
+        let dome_max_y = dome_bp
+            .blocks
+            .iter()
+            .filter(|(_, b)| b.block_id != "minecraft:air")
+            .map(|(p, _)| p[1])
+            .max()
+            .unwrap_or(0);
+        assert!(dome_max_y >= 11, "Dome should curve cleanly above base roof level");
+
+        let mut mans_req = sample_request("французский двухэтажный особняк с мансардной крышей", 6161);
+        mans_req.width = 17;
+        mans_req.depth = 15;
+        mans_req.height = 16;
+        let mans_bp = generate_blueprint(&mans_req, None);
+        assert_eq!(mans_bp.spec.roof_style, RoofStyle::Mansard);
+        assert!(
+            mans_bp.blocks.values().any(|b| {
+                b.block_id.ends_with("_stairs")
+                    && b.props
+                        .iter()
+                        .any(|(k, v)| *k == "shape" && (*v == "outer_left" || *v == "outer_right"))
+            }),
+            "Mansard apron stairs should miter corners cleanly"
+        );
+    }
+
+    #[test]
+    fn terrain_smoothing_terraces_hills_and_ramps_slopes() {
+        let mut req = sample_request("уютный дом", 7272);
+        req.width = 19;
+        req.depth = 17;
+        req.height = 12;
+        req.adapt_terrain = true;
+        // Steep hill (+4) on rear/left (z < 4) and deep slope (-4) on right margin (x >= 16).
+        let mut offsets = vec![0i32; usize::from(req.width) * usize::from(req.depth)];
+        for z in 0..usize::from(req.depth) {
+            for x in 0..usize::from(req.width) {
+                offsets[z * usize::from(req.width) + x] = if z < 4 {
+                    4
+                } else if x >= 16 {
+                    -4
+                } else {
+                    0
+                };
+            }
+        }
+        let bp = generate_blueprint(&req, Some(&offsets));
+        assert!(
+            bp.blocks.iter().any(|(&[_x, y, _z], b)| y < 0 && b.block_id == "minecraft:grass_block"),
+            "Downhill perimeter margin should smoothly ramp grass blocks down"
+        );
+        assert!(
+            bp.blocks.iter().any(|(&[_x, y, z], b)| z < 4 && y >= 1 && b.block_id == "minecraft:grass_block"),
+            "Uphill hillside perimeter should terrace stepped grass blocks"
+        );
+    }
+
+    #[test]
+    fn multi_floor_interiors_and_courtyard_ensembles_place_details() {
+        let mut manor_req = sample_request("большой трехэтажный готический замок с высокими потолками", 8383);
+        manor_req.width = 23;
+        manor_req.depth = 21;
+        manor_req.height = 24;
+        manor_req.category = BuildCategory::House;
+        manor_req.style = BuildStyle::Gothic;
+        let manor_bp = generate_blueprint(&manor_req, None);
+        assert!(
+            manor_bp.blocks.values().any(|b| b.block_id == "minecraft:candle"),
+            "Upper stories should include lit candles"
+        );
+        assert!(
+            manor_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id == "minecraft:soul_wall_torch" || b.block_id == "minecraft:wall_torch"),
+            "Interior perimeter solid walls should host wall sconces"
+        );
+
+        let mut jp_req = sample_request("японский дом пагода с садом сакуры и двором", 9494);
+        jp_req.width = 21;
+        jp_req.depth = 19;
+        jp_req.height = 18;
+        jp_req.style = BuildStyle::Japanese;
+        jp_req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let jp_bp = generate_blueprint(&jp_req, None);
+        assert!(
+            jp_bp.blocks.values().any(|b| b.block_id == "minecraft:crimson_planks"),
+            "Spacious Japanese estate should erect a Crimson Torii entrance gate"
+        );
+        assert!(
+            jp_bp.blocks.values().any(|b| b.block_id.ends_with("_fence_gate")),
+            "Spacious courtyard should include matching front fence gate"
+        );
+
+        let mut farm_req = sample_request("деревянная ветряная мельница с амбаром", 1357);
+        farm_req.width = 21;
+        farm_req.depth = 19;
+        farm_req.height = 18;
+        farm_req.category = BuildCategory::Barn;
+        let farm_bp = generate_blueprint(&farm_req, None);
+        assert!(
+            farm_bp.blocks.values().any(|b| b.block_id == "minecraft:farmland")
+                && farm_bp.blocks.values().any(|b| b.block_id == "minecraft:wheat"),
+            "Barn/Windmill estates should generate irrigated farmland + wheat crop plots"
+        );
+    }
+
+    #[test]
+    fn cli_presets_resolve_cleanly_by_slug_and_russian_keywords() {
+        assert_eq!(find_cli_preset("teahouse").map(|p| p.0), Some("teahouse"));
+        assert_eq!(find_cli_preset("чайн").map(|p| p.0), Some("teahouse"));
+        assert_eq!(find_cli_preset("observatory").map(|p| p.0), Some("observatory"));
+        assert_eq!(find_cli_preset("купол").map(|p| p.0), Some("observatory"));
+        assert_eq!(find_cli_preset("мансард").map(|p| p.0), Some("mansard"));
+        assert_eq!(find_cli_preset("pagoda").map(|p| p.0), Some("pagoda"));
+        assert_eq!(find_cli_preset("colosseum").map(|p| p.0), Some("colosseum"));
+        assert_eq!(find_cli_preset("колиз").map(|p| p.0), Some("colosseum"));
+        assert_eq!(find_cli_preset("village").map(|p| p.0), Some("village"));
+        assert_eq!(find_cli_preset("квартал").map(|p| p.0), Some("village"));
+        assert!(find_cli_preset("nonexistent_preset_xyz").is_none());
+        assert_eq!(CLI_PRESETS.len(), 72);
+    }
+
+    #[test]
+    fn layered_master_house_generates_cranes_awning_stepped_wing_and_planters() {
+        let mut req = sample_request(
+            "японский двухэтажный чайный дом с террасой, лавкой, полосатым навесом и фонарями",
+            4040,
+        );
+        req.width = 21;
+        req.depth = 19;
+        req.height = 18;
+        req.style = BuildStyle::Japanese;
+        req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let bp = generate_blueprint(&req, None);
+        assert!(bp.spec.stepped_wing, "Large multi-story tea house should use stepped wing massing");
+        assert!(bp.spec.market_awning, "Shop/tea house should enable striped cloth awning");
+
+        let has_wool_awning = bp
+            .blocks
+            .values()
+            .any(|b| b.block_id == "minecraft:orange_wool" || b.block_id == "minecraft:red_wool")
+            && bp.blocks.values().any(|b| b.block_id == "minecraft:white_wool");
+        assert!(has_wool_awning, "Tea house must emit striped wool street awning");
+
+        let has_planter_flora = bp
+            .blocks
+            .values()
+            .any(|b| matches!(b.block_id.as_str(), "minecraft:flowering_azalea" | "minecraft:azalea" | "minecraft:bamboo"));
+        assert!(has_planter_flora, "Yard and terraces should contain lush azalea/bamboo greenery");
+
+        let has_hanging_lantern = bp.blocks.values().any(|b| {
+            matches!(b.block_id.as_str(), "minecraft:lantern" | "minecraft:copper_lantern" | "minecraft:soul_lantern")
+                && b.props.iter().any(|(k, v)| *k == "hanging" && *v == "true")
+        });
+        assert!(has_hanging_lantern, "Outrigger cranes and awnings must hang lanterns");
+    }
+
+    #[test]
+    fn koi_pond_tatami_shelves_petals_vines_and_kegs_enrich_estates() {
+        let mut jp_req = sample_request(
+            "японский двухэтажный чайный дом с террасой, садом сакуры и лавкой",
+            2525,
+        );
+        jp_req.width = 23;
+        jp_req.depth = 21;
+        jp_req.height = 18;
+        jp_req.style = BuildStyle::Japanese;
+        jp_req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let jp_bp = generate_blueprint(&jp_req, None);
+        assert!(
+            jp_bp.blocks.values().any(|b| b.block_id == "minecraft:stone_brick_slab"),
+            "Dark slate Japanese roofs should carry pale contrasting stone_brick_slab ridge crest"
+        );
+        assert!(
+            jp_bp.blocks.values().any(|b| b.block_id == "minecraft:lime_carpet"),
+            "Japanese houses must lay woven lime/moss tatami mats indoors"
+        );
+        assert!(
+            jp_bp.blocks.values().any(|b| b.block_id == "minecraft:water")
+                && jp_bp.blocks.values().any(|b| b.block_id == "minecraft:lily_pad"),
+            "Spacious Japanese estate yards should generate a zen pond with lily pads"
+        );
+
+        let mut cot_req = sample_request(
+            "уютный двухэтажный коттедж с плющом, цветами, балконом и двором",
+            6767,
+        );
+        cot_req.width = 21;
+        cot_req.depth = 19;
+        cot_req.height = 16;
+        cot_req.style = BuildStyle::Cottage;
+        cot_req.palette = MaterialPalette::preset_for_style(BuildStyle::Cottage);
+        let cot_bp = generate_blueprint(&cot_req, None);
+        assert!(
+            cot_bp.blocks.values().any(|b| b.block_id == "minecraft:vine"),
+            "Overgrown cottage facades should drape climbing wall vines"
+        );
+        assert!(
+            cot_bp.blocks.values().any(|b| {
+                matches!(b.block_id.as_str(), "minecraft:wildflowers" | "minecraft:short_grass" | "minecraft:fern")
+            }),
+            "Cottage garden lawns should scatter wildflowers/short_grass tufts"
+        );
+
+        let mut tav_req = sample_request("уютная средневековая таверна с камином и бочками", 3131);
+        tav_req.width = 19;
+        tav_req.depth = 17;
+        tav_req.height = 16;
+        let tav_bp = generate_blueprint(&tav_req, None);
+        assert!(
+            tav_bp.blocks.values().filter(|b| b.block_id == "minecraft:barrel").count() >= 4,
+            "Tavern interior should stack wine barrels and bar counter kegs"
+        );
+    }
+
+    #[test]
+    fn custom_trees_bay_windows_signs_downspouts_basements_and_negative_rules_work() {
+        let mut manor_req = sample_request(
+            "средневековый двухэтажный дом с подвалом, балконом и садом",
+            1919,
+        );
+        manor_req.width = 23;
+        manor_req.depth = 21;
+        manor_req.height = 18;
+        manor_req.style = BuildStyle::Medieval;
+        manor_req.palette = MaterialPalette::preset_for_style(BuildStyle::Medieval);
+        let manor_bp = generate_blueprint(&manor_req, None);
+
+        assert!(
+            manor_bp.blocks.values().any(|b| b.block_id == "minecraft:oak_log"),
+            "Spacious overgrown/garden estate must grow custom procedural yard trees"
+        );
+        assert!(
+            manor_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id == "minecraft:water_cauldron"),
+            "Exterior walls should collect rainwater from downspouts into water_cauldron"
+        );
+        assert!(
+            manor_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id.ends_with("_hanging_sign")),
+            "Houses with shop/garden facade details should hang swinging signage"
+        );
+        assert!(
+            manor_bp
+                .blocks
+                .iter()
+                .any(|(&[_x, y, _z], b)| y <= -2 && b.block_id == "minecraft:cobblestone_stairs"),
+            "Large homes with basement should carve walkable stone cellar stairs"
+        );
+        assert!(
+            manor_bp.blocks.iter().any(|(&[_x, y, _z], b)| {
+                y == -3
+                    && matches!(
+                        b.block_id.as_str(),
+                        "minecraft:barrel"
+                            | "minecraft:brewing_stand"
+                            | "minecraft:smithing_table"
+                            | "minecraft:grindstone"
+                    )
+            }),
+            "Basement at y=-3 should be furnished with cellar/alchemy/armory fittings"
+        );
+
+        let neg_spec = parse_description(
+            BuildCategory::House,
+            BuildStyle::Medieval,
+            "дом без подвала, без балкона, без крыльца, без навеса, без сада",
+            15,
+            13,
+            14,
+            NoiseLevel::Balanced,
+            1234,
+        );
+        assert!(!neg_spec.basement);
+        assert!(!neg_spec.balcony);
+        assert!(!neg_spec.porch);
+        assert!(!neg_spec.market_awning);
+        assert!(!neg_spec.courtyard_garden);
+    }
+
+    #[test]
+    fn doorways_and_staircases_have_full_player_clearance_across_styles() {
+        let mut modern_req = sample_request("современный дом с крыльцом и фонарями", 2838086);
+        modern_req.style = BuildStyle::Modern;
+        modern_req.palette = MaterialPalette::preset_for_style(BuildStyle::Modern);
+
+        let mut steam_req = sample_request("стимпанк дом с террасой, крыльцом и фонарями", 8244012);
+        steam_req.width = 19;
+        steam_req.depth = 18;
+        steam_req.height = 16;
+        steam_req.style = BuildStyle::Steampunk;
+        steam_req.palette = MaterialPalette::preset_for_style(BuildStyle::Steampunk);
+
+        let mut cellar_req = sample_request("средневековый двухэтажный дом с подвалом и крыльцом", 554433);
+        cellar_req.width = 19;
+        cellar_req.depth = 17;
+        cellar_req.height = 16;
+        cellar_req.style = BuildStyle::Medieval;
+        cellar_req.palette = MaterialPalette::preset_for_style(BuildStyle::Medieval);
+
+        let mut tower_req = sample_request("высокая каменная башня со спиральной лестницей", 9012);
+        tower_req.category = BuildCategory::Tower;
+        tower_req.width = 11;
+        tower_req.depth = 11;
+        tower_req.height = 20;
+
+        for req in [&modern_req, &steam_req, &cellar_req, &tower_req] {
+            let bp = generate_blueprint(req, None);
+            if let Some([dx, dy, dz]) = bp.door_pos {
+                let (fx, fz) = match req.facing {
+                    CardinalFacing::South => (0, 1),
+                    CardinalFacing::North => (0, -1),
+                    CardinalFacing::East => (1, 0),
+                    CardinalFacing::West => (-1, 0),
+                };
+                for dist in 1..=2 {
+                    for head_off in 0..=1 {
+                        let p = [dx + fx * dist, dy + head_off, dz + fz * dist];
+                        let blk_id = bp.blocks.get(&p).map_or("minecraft:air", |b| b.block_id.as_str());
+                        assert_eq!(
+                            blk_id, "minecraft:air",
+                            "Doorway corridor at dist={dist}, head_off={head_off} blocked by {blk_id} for {:?}",
+                            req.style
+                        );
+                    }
+                }
+            }
+
+            // Every interior basement cobblestone_stairs step must have >= 2 blocks of air above it.
+            for (&[x, y, z], blk) in &bp.blocks {
+                if blk.block_id == "minecraft:cobblestone_stairs" && y <= 1 {
+                    for cy in 1..=2 {
+                        let up_id = bp
+                            .blocks
+                            .get(&[x, y + cy, z])
+                            .map_or("minecraft:air", |b| b.block_id.as_str());
+                        assert_eq!(
+                            up_id, "minecraft:air",
+                            "Basement staircase step at [{x}, {y}, {z}] blocked at +{cy} by {up_id}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Steampunk corner details must not leave bare dangling iron_chain wall segments outside walls.
+        let steam_bp = generate_blueprint(&steam_req, None);
+        assert!(
+            !steam_bp
+                .blocks
+                .iter()
+                .any(|(&[_x, y, _z], b)| y <= 4 && b.block_id == "minecraft:iron_chain"),
+            "Ground floor outside walls should not dangle loose iron_chain Steampunk pipes"
+        );
+    }
+
+    #[test]
+    fn rich_text_palette_inference_and_expanded_materials_work() {
+        use crate::parser::{infer_palette_with_style, infer_style_from_text};
+
+        let birch_copper = infer_palette_with_style(
+            BuildStyle::Auto,
+            "уютный дом из березы с медной крышей и голубыми окнами",
+        );
+        assert_eq!(birch_copper.wall, "minecraft:birch_planks");
+        assert_eq!(birch_copper.roof_block, "minecraft:cut_copper");
+        assert_eq!(birch_copper.window, "minecraft:light_blue_stained_glass_pane");
+
+        let brick_sand = infer_palette_with_style(
+            BuildStyle::Auto,
+            "дом с кирпичной крышей, стенами из красного песчаника и синим огнем",
+        );
+        assert_eq!(brick_sand.roof_block, "minecraft:bricks");
+        assert_eq!(brick_sand.wall, "minecraft:red_sandstone");
+        assert_eq!(brick_sand.light, "minecraft:soul_lantern");
+
+        let pale_ox = infer_palette_with_style(
+            BuildStyle::Auto,
+            "бледный дуб с окисленной медной крышей и тонированным стеклом",
+        );
+        assert_eq!(pale_ox.wall, "minecraft:pale_oak_planks");
+        assert_eq!(pale_ox.roof_block, "minecraft:oxidized_cut_copper");
+        assert_eq!(pale_ox.window, "minecraft:tinted_glass");
+
+        assert_eq!(
+            infer_style_from_text(BuildStyle::Steampunk, "японский чайный дом", 42),
+            BuildStyle::Steampunk
+        );
+
+        assert!(MaterialPalette::PRESET_COUNT >= 16);
+        assert!(MaterialPalette::WALL_CHOICES.len() >= 30);
+        assert!(MaterialPalette::ROOF_CHOICES.len() >= 30);
+        for idx in 0..MaterialPalette::PRESET_COUNT {
+            let p = MaterialPalette::preset(idx);
+            assert!(p.wall.starts_with("minecraft:"));
+            assert!(p.fence_gate_for_fence().starts_with("minecraft:"));
+        }
+    }
+
+    #[test]
+    fn phase1_composite_turrets_arcades_half_hip_rose_windows_and_dome_rotunda_work() {
+        let mut cath_req = sample_request(
+            "готический собор с башнями, розеткой-витражом, аркбутанами и колоколом",
+            7171,
+        );
+        cath_req.category = BuildCategory::Temple;
+        cath_req.style = BuildStyle::Gothic;
+        cath_req.width = 21;
+        cath_req.depth = 19;
+        cath_req.height = 20;
+        cath_req.palette = MaterialPalette::preset_for_style(BuildStyle::Gothic);
+        let cath_bp = generate_blueprint(&cath_req, None);
+        assert!(cath_bp.spec.rose_window);
+        assert!(cath_bp.spec.arcade_gallery);
+        assert!(
+            cath_bp.blocks.values().any(|b| b.block_id == "minecraft:bell"),
+            "Cathedral should build bell steeple"
+        );
+        assert!(
+            cath_bp
+                .blocks
+                .values()
+                .filter(|b| b.block_id == cath_req.palette.window)
+                .count()
+                >= 8,
+            "Cathedral gable rose window and side bays should emit stained glass windows"
+        );
+
+        let mut mansion_req = sample_request(
+            "средневековый двухэтажный дом с полувальмовой крышей, аркадой и угловой башней",
+            8282,
+        );
+        mansion_req.width = 21;
+        mansion_req.depth = 17;
+        mansion_req.height = 18;
+        mansion_req.style = BuildStyle::Medieval;
+        mansion_req.palette = MaterialPalette::preset_for_style(BuildStyle::Medieval);
+        let mansion_bp = generate_blueprint(&mansion_req, None);
+        assert!(mansion_bp.spec.half_hip);
+        assert!(mansion_bp.spec.arcade_gallery);
+        assert!(
+            mansion_bp.blocks.values().any(|b| b.block_id == "minecraft:ladder"),
+            "Octagonal corner turret should include interior climbing ladder"
+        );
+
+        let mut dome_req = sample_request("обсерватория с куполом", 9393);
+        dome_req.width = 15;
+        dome_req.depth = 15;
+        dome_req.height = 20;
+        let dome_bp = generate_blueprint(&dome_req, None);
+        assert_eq!(dome_bp.spec.roof_style, RoofStyle::Dome);
+        assert!(
+            dome_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id == "minecraft:lightning_rod"),
+            "Open cupola rotunda atop dome should finish with spire lightning_rod"
+        );
+    }
+
+    #[test]
+    fn phase2_multi_room_floorplan_doors_and_rich_furniture_work() {
+        let mut house_req = sample_request(
+            "большой средневековый двухэтажный дом с кухней, столовой и спальней",
+            4141,
+        );
+        house_req.width = 17;
+        house_req.depth = 15;
+        house_req.height = 14;
+        house_req.style = BuildStyle::Medieval;
+        house_req.palette = MaterialPalette::preset_for_style(BuildStyle::Medieval);
+        let house_bp = generate_blueprint(&house_req, None);
+        assert!(house_bp.spec.room_partitions);
+        let open_doors = house_bp
+            .blocks
+            .values()
+            .filter(|b| {
+                (b.block_id == house_req.palette.door || b.block_id == house_req.palette.interior_door)
+                    && b.props.iter().any(|&(k, v)| k == "half" && v == "lower")
+                    && b.props.iter().any(|&(k, v)| k == "open" && v == "true")
+            })
+            .count();
+        assert!(
+            open_doors >= 2,
+            "Spacious multi-story partitioned house should have open interior doors, got {open_doors}"
+        );
+        for needed in [
+            "minecraft:cake",
+            "minecraft:sea_pickle",
+            "minecraft:candle",
+            "minecraft:jukebox",
+            "minecraft:smoker",
+            "minecraft:crafting_table",
+            "minecraft:water_cauldron",
+            "minecraft:cartography_table",
+            "minecraft:loom",
+            "minecraft:red_bed",
+        ] {
+            assert!(
+                house_bp.blocks.values().any(|b| b.block_id == needed),
+                "Phase 2 spacious house should contain {needed}"
+            );
+        }
+        assert!(
+            house_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id.ends_with("_shelf")),
+            "House kitchen/bedroom should mount a wooden shelf cupboard or headboard shelf"
+        );
+
+        let mut nordic_req = sample_request("скандинавский уютный двухэтажный дом", 7474);
+        nordic_req.width = 15;
+        nordic_req.depth = 13;
+        nordic_req.height = 13;
+        nordic_req.style = BuildStyle::Nordic;
+        nordic_req.palette = MaterialPalette::preset_for_style(BuildStyle::Nordic);
+        let nordic_bp = generate_blueprint(&nordic_req, None);
+        assert!(
+            nordic_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id == "minecraft:light_blue_bed"),
+            "Nordic house should furnish upper floor with light_blue_bed"
+        );
+
+        let mut forge_req = sample_request("большая каменная кузница с горном и наковальней", 5252);
+        forge_req.width = 15;
+        forge_req.depth = 13;
+        forge_req.height = 10;
+        let forge_bp = generate_blueprint(&forge_req, None);
+        for needed in [
+            "minecraft:lava_cauldron",
+            "minecraft:stonecutter",
+            "minecraft:blast_furnace",
+            "minecraft:anvil",
+        ] {
+            assert!(
+                forge_bp.blocks.values().any(|b| b.block_id == needed),
+                "Phase 2 Forge workshop should contain {needed}"
+            );
+        }
+
+        let mut temple_req = sample_request("высокий готический храм с алтарем", 6363);
+        temple_req.width = 15;
+        temple_req.depth = 15;
+        temple_req.height = 16;
+        temple_req.style = BuildStyle::Gothic;
+        temple_req.palette = MaterialPalette::preset_for_style(BuildStyle::Gothic);
+        let temple_bp = generate_blueprint(&temple_req, None);
+        assert!(
+            temple_bp.blocks.values().any(|b| b.block_id == "minecraft:beacon"),
+            "Grand temple sanctuary should feature a beacon altar"
+        );
+
+        let mut tavern_req = sample_request("средневековая таверна с барной стойкой", 8585);
+        tavern_req.width = 17;
+        tavern_req.depth = 15;
+        tavern_req.height = 13;
+        tavern_req.style = BuildStyle::Medieval;
+        tavern_req.palette = MaterialPalette::preset_for_style(BuildStyle::Medieval);
+        let tavern_bp = generate_blueprint(&tavern_req, None);
+        for needed in ["minecraft:sea_pickle", "minecraft:cake", "minecraft:barrel"] {
+            assert!(
+                tavern_bp.blocks.values().any(|b| b.block_id == needed),
+                "Phase 2 Tavern bar counter should include {needed}"
+            );
+        }
+    }
+
+    #[test]
+    fn colosseum_classical_architecture_and_no_floating_blocks_work() {
+        let desc = "античный колизей";
+        let seed = 819_489i64;
+        let pal = crate::parser::infer_palette_with_style_and_seed(BuildStyle::Auto, desc, seed as u64);
+        assert_eq!(pal.wall, "minecraft:smooth_sandstone");
+        assert_eq!(pal.frame, "minecraft:quartz_pillar");
+
+        let mut req = sample_request(desc, seed);
+        req.width = 25;
+        req.depth = 25;
+        req.height = 16;
+        req.style = BuildStyle::Auto;
+        req.palette = pal;
+        let col_bp = generate_blueprint(&req, None);
+        assert_eq!(col_bp.spec.theme, StructureTheme::Colosseum);
+        assert_eq!(col_bp.spec.style, BuildStyle::Classical);
+        assert_eq!(col_bp.spec.roof_style, RoofStyle::Flat);
+        assert!(!col_bp.spec.chimney);
+        assert!(!col_bp.spec.shutters);
+        for needed in [
+            "minecraft:sand",
+            "minecraft:quartz_pillar",
+            "minecraft:sandstone_stairs",
+            "minecraft:sandstone_wall",
+            "minecraft:red_wool",
+            "minecraft:white_wool",
+        ] {
+            assert!(
+                col_bp.blocks.values().any(|b| b.block_id == needed),
+                "Classical Colosseum should contain {needed}"
+            );
+        }
+
+        let mut parthenon_req = sample_request("античный греческий храм парфенон с колоннадой", 303);
+        parthenon_req.width = 19;
+        parthenon_req.depth = 17;
+        parthenon_req.height = 14;
+        parthenon_req.palette = crate::parser::infer_palette_with_style_and_seed(
+            BuildStyle::Auto,
+            &parthenon_req.description,
+            303,
+        );
+        let parthenon_bp = generate_blueprint(&parthenon_req, None);
+        assert_eq!(parthenon_bp.spec.category, BuildCategory::Temple);
+        assert_eq!(parthenon_bp.spec.style, BuildStyle::Classical);
+        assert!(parthenon_bp.spec.arcade_gallery);
+
+        let mut pantheon_req = sample_request("римский пантеон с куполом", 404);
+        pantheon_req.width = 19;
+        pantheon_req.depth = 19;
+        pantheon_req.height = 18;
+        pantheon_req.palette = crate::parser::infer_palette_with_style_and_seed(
+            BuildStyle::Auto,
+            &pantheon_req.description,
+            404,
+        );
+        let pantheon_bp = generate_blueprint(&pantheon_req, None);
+        assert_eq!(pantheon_bp.spec.category, BuildCategory::Temple);
+        assert_eq!(pantheon_bp.spec.roof_style, RoofStyle::Dome);
+
+        // Verify structural no-floating-block invariant across Modern, Steampunk (2F tall), Gothic Cathedral, Ruins, and Colosseum.
+        let mut modern_req = sample_request("современный дом модерн", 819_489);
+        modern_req.width = 19;
+        modern_req.depth = 17;
+        modern_req.height = 14;
+        modern_req.style = BuildStyle::Modern;
+        modern_req.palette = MaterialPalette::preset_for_style(BuildStyle::Modern);
+
+        let mut steam_req = sample_request("стимпанк особняк 2 этажа с башней", 2_838_086);
+        steam_req.width = 19;
+        steam_req.depth = 17;
+        steam_req.height = 16;
+        steam_req.style = BuildStyle::Steampunk;
+        steam_req.palette = MaterialPalette::preset_for_style(BuildStyle::Steampunk);
+
+        let mut ruin_req = sample_request("разрушенный готический замок руины", 5555);
+        ruin_req.width = 21;
+        ruin_req.depth = 19;
+        ruin_req.height = 18;
+        ruin_req.style = BuildStyle::Gothic;
+        ruin_req.palette = MaterialPalette::preset_for_style(BuildStyle::Gothic);
+
+        for bp in [
+            col_bp,
+            parthenon_bp,
+            generate_blueprint(&modern_req, None),
+            generate_blueprint(&steam_req, None),
+            generate_blueprint(&ruin_req, None),
+        ] {
+            for (&[x, y, z], blk) in &bp.blocks {
+                let id = blk.block_id.as_str();
+                if id == "minecraft:air" || y <= 0 {
+                    continue;
+                }
+                let is_non_air = |p: [i32; 3]| match bp.blocks.get(&p) {
+                    Some(b) => b.block_id != "minecraft:air",
+                    None => p[1] <= 0,
+                };
+                let has_neighbor = [
+                    [x - 1, y, z],
+                    [x + 1, y, z],
+                    [x, y - 1, z],
+                    [x, y + 1, z],
+                    [x, y, z - 1],
+                    [x, y, z + 1],
+                ]
+                .into_iter()
+                .any(is_non_air);
+                assert!(
+                    has_neighbor,
+                    "Orphan floating block {id} at [{x}, {y}, {z}] in {:?}",
+                    bp.spec.style
+                );
+                if id == "minecraft:iron_chain"
+                    || (id.ends_with("lantern")
+                        && id != "minecraft:sea_lantern"
+                        && blk.props.iter().any(|&(k, v)| k == "hanging" && v == "true"))
+                {
+                    assert!(
+                        is_non_air([x, y + 1, z]),
+                        "Hanging {id} at [{x}, {y}, {z}] has air above!"
+                    );
+                }
+                if id == "minecraft:copper_bulb" || id.ends_with("_bed") || id.ends_with("_carpet") {
+                    assert!(
+                        is_non_air([x, y - 1, z]),
+                        "{id} at [{x}, {y}, {z}] has air below!"
+                    );
+                }
+                if id.ends_with("_wall") {
+                    let supported = is_non_air([x, y - 1, z])
+                        || (is_non_air([x - 1, y, z]) && is_non_air([x + 1, y, z]))
+                        || (is_non_air([x, y, z - 1]) && is_non_air([x, y, z + 1]));
+                    assert!(supported, "Wall {id} at [{x}, {y}, {z}] is dangling over air!");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase3_living_yards_outdoor_workshops_cypress_and_terraces_work() {
+        let mut forge_req = sample_request("кузница с большим двором и садом", 9090);
+        forge_req.category = BuildCategory::Forge;
+        forge_req.width = 19;
+        forge_req.depth = 17;
+        forge_req.height = 12;
+        let forge_bp = generate_blueprint(&forge_req, None);
+        assert!(
+            forge_bp.blocks.values().any(|b| b.block_id == "minecraft:dark_oak_log")
+                && forge_bp.blocks.values().any(|b| b.block_id == "minecraft:grindstone"),
+            "Spacious Forge should furnish outdoor smithing yard (logs + grindstone)"
+        );
+
+        let mut barn_req = sample_request("деревянный амбар с сеном и колодцем", 9191);
+        barn_req.category = BuildCategory::Barn;
+        barn_req.width = 19;
+        barn_req.depth = 17;
+        barn_req.height = 12;
+        let barn_bp = generate_blueprint(&barn_req, None);
+        assert!(
+            barn_bp
+                .blocks
+                .iter()
+                .any(|(&[_, y, _], b)| y == 2 && b.block_id == "minecraft:hay_block"),
+            "Barn farmstead should stack hay_block bales up to y=2"
+        );
+
+        let mut classical_req = sample_request("античный храм вилла с кипарисами и садом", 9292);
+        classical_req.width = 21;
+        classical_req.depth = 19;
+        classical_req.height = 14;
+        classical_req.palette = crate::parser::infer_palette_with_style_and_seed(
+            BuildStyle::Auto,
+            &classical_req.description,
+            9292,
+        );
+        let classical_bp = generate_blueprint(&classical_req, None);
+        assert_eq!(classical_bp.spec.style, BuildStyle::Classical);
+        assert!(
+            classical_bp.blocks.values().any(|b| b.block_id == "minecraft:campfire"),
+            "Classical courtyard entrance should flank ceremonial campfire braziers"
+        );
+        assert!(
+            classical_bp.blocks.values().any(|b| b.block_id == "minecraft:spruce_leaves"),
+            "Classical courtyard should plant slender cypress trees"
+        );
+
+        let mut villa_req = sample_request(
+            "современная вилла модерн с бассейном, колодцем и садом",
+            9393,
+        );
+        villa_req.width = 21;
+        villa_req.depth = 19;
+        villa_req.height = 14;
+        villa_req.style = BuildStyle::Modern;
+        villa_req.palette = MaterialPalette::preset_for_style(BuildStyle::Modern);
+        let villa_bp = generate_blueprint(&villa_req, None);
+        assert!(
+            villa_bp.blocks.values().any(|b| b.block_id == "minecraft:birch_log"),
+            "Modern courtyard should plant ornamental birch/azalea centerpiece tree"
+        );
+        assert!(
+            villa_bp.blocks.values().any(|b| b.block_id == "minecraft:potted_azalea_bush"),
+            "Modern pool deck should place poolside potted_azalea_bush"
+        );
+
+        let mut tavern_req = sample_request("большая таверна с двором и бочками", 9494);
+        tavern_req.width = 19;
+        tavern_req.depth = 17;
+        tavern_req.height = 14;
+        let tavern_bp = generate_blueprint(&tavern_req, None);
+        assert!(
+            tavern_bp.blocks.values().any(|b| b.block_id == "minecraft:sea_pickle")
+                && tavern_bp.blocks.values().any(|b| b.block_id == "minecraft:cake"),
+            "Tavern beer garden should furnish mugs & cake outdoors/indoors"
+        );
+    }
+
+    #[test]
+    fn phase4_stairs_and_ladders_have_unobstructed_access_backing_and_support() {
+        let mut issues = Vec::new();
+        let prompts: &[(&str, BuildCategory, BuildStyle, u16, u16, u16)] = &[
+            ("античная библиотека вилла классика", BuildCategory::House, BuildStyle::Classical, 15, 13, 14),
+            ("классический дом с террасой и библиотекой", BuildCategory::House, BuildStyle::Classical, 17, 15, 16),
+            ("большой античный храм с этажами", BuildCategory::Temple, BuildStyle::Classical, 17, 15, 16),
+            ("готический особняк замок с башнями и подвалом", BuildCategory::House, BuildStyle::Gothic, 19, 17, 16),
+            ("замок с угловыми башнями и лестницами", BuildCategory::Castle, BuildStyle::Medieval, 19, 17, 16),
+            ("сторожевая башня со спиральной лестницей", BuildCategory::Tower, BuildStyle::Medieval, 11, 11, 18),
+            ("уютный компактный дом с подвалом", BuildCategory::House, BuildStyle::Cottage, 11, 11, 12),
+            ("стимпанк дом кузница", BuildCategory::Forge, BuildStyle::Steampunk, 15, 13, 14),
+            ("японский двухэтажный чайный дом", BuildCategory::House, BuildStyle::Japanese, 15, 13, 14),
+            ("современная вилла модерн", BuildCategory::House, BuildStyle::Modern, 17, 15, 14),
+        ];
+
+        let dir_vec = |facing: &str| -> [i32; 3] {
+            match facing {
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "east" => [1, 0, 0],
+                "west" => [-1, 0, 0],
+                _ => [0, 0, 1],
+            }
+        };
+        let prop = |b: &crate::gen_common::PlannedBlock, k: &str| -> Option<&'static str> {
+            b.props.iter().find(|&&(pk, _)| pk == k).map(|&(_, pv)| pv)
+        };
+        let is_passable = |b: Option<&crate::gen_common::PlannedBlock>| -> bool {
+            match b {
+                None => true,
+                Some(blk) => matches!(
+                    blk.block_id.as_str(),
+                    "minecraft:air" | "minecraft:ladder" | "minecraft:torch" | "minecraft:wall_torch" | "minecraft:soul_wall_torch"
+                ) || blk.block_id.ends_with("_carpet") || blk.block_id.ends_with("_trapdoor"),
+            }
+        };
+
+        for (idx, &(desc, cat, style, w, d, h)) in prompts.iter().enumerate() {
+            for seed in [101i64, 4242, 7777, 1699156, 8244012] {
+                let mut req = sample_request(desc, seed + idx as i64);
+                req.category = cat;
+                req.style = style;
+                req.width = w;
+                req.depth = d;
+                req.height = h;
+                req.palette = MaterialPalette::preset_for_style(style);
+                let bp = generate_blueprint(&req, None);
+
+                // 1) Inspect every ladder column!
+                let mut ladder_cols: std::collections::BTreeMap<(i32, i32), Vec<(i32, &'static str)>> =
+                    std::collections::BTreeMap::new();
+                for (&[x, y, z], blk) in &bp.blocks {
+                    if blk.block_id == "minecraft:ladder" {
+                        let facing = prop(blk, "facing").unwrap_or("south");
+                        ladder_cols.entry((x, z)).or_default().push((y, facing));
+                        let dv = dir_vec(facing);
+                        let back = [x - dv[0], y, z - dv[2]];
+                        let back_ok = bp.blocks.get(&back).is_some_and(|bb| {
+                            bb.block_id != "minecraft:air"
+                                && !bb.block_id.contains("glass")
+                                && !bb.block_id.ends_with("_door")
+                                && !bb.block_id.ends_with("_stairs")
+                                && !bb.block_id.ends_with("_slab")
+                        });
+                        if !back_ok {
+                            issues.push(format!(
+                                "{desc} seed={seed}: ladder at [{x},{y},{z}] facing={facing} lacks solid wall behind it ({back:?})"
+                            ));
+                        }
+                    }
+                }
+                for ((lx, lz), mut ys) in ladder_cols {
+                    ys.sort_by_key(|&(y, _)| y);
+                    let (bot_y, face) = ys[0];
+                    let &(top_y, _) = ys.last().unwrap();
+                    let dv = dir_vec(face);
+                    // Front entry at bottom must be passable at bottom & chest height!
+                    for ey in [bot_y, bot_y + 1] {
+                        let front = [lx + dv[0], ey, lz + dv[2]];
+                        if !is_passable(bp.blocks.get(&front)) {
+                            let hit = bp.blocks.get(&front).map_or("none", |b| b.block_id.as_str());
+                            issues.push(format!(
+                                "{desc} seed={seed}: ladder [{lx},{bot_y}..={top_y},{lz}] facing={face} blocked in front {front:?} by {hit}"
+                            ));
+                        }
+                    }
+                    // Top of ladder must allow player exit & headroom!
+                    let ground_y = i32::from(bp.spec.foundation_height);
+                    let is_basement_hatch = bot_y < 0
+                        && top_y == ground_y - 1
+                        && bp
+                            .blocks
+                            .get(&[lx, ground_y, lz])
+                            .is_some_and(|b| b.block_id.ends_with("_trapdoor"));
+                    let can_exit = if is_basement_hatch {
+                        let hatch_head = [lx, ground_y + 1, lz];
+                        let hatch_head2 = [lx, ground_y + 2, lz];
+                        let step_out = [lx + dv[0], ground_y + 1, lz + dv[2]];
+                        let step_head = [lx + dv[0], ground_y + 2, lz + dv[2]];
+                        let step_floor = [lx + dv[0], ground_y, lz + dv[2]];
+                        is_passable(bp.blocks.get(&hatch_head))
+                            && is_passable(bp.blocks.get(&hatch_head2))
+                            && is_passable(bp.blocks.get(&step_out))
+                            && is_passable(bp.blocks.get(&step_head))
+                            && bp.blocks.get(&step_floor).is_some_and(|b| b.block_id != "minecraft:air")
+                    } else {
+                        let above_top = [lx, top_y + 1, lz];
+                        let above_top2 = [lx, top_y + 2, lz];
+                        let front_top = [lx + dv[0], top_y + 1, lz + dv[2]];
+                        let back_top = [lx - dv[0], top_y + 1, lz - dv[2]];
+                        let side_l = [lx - dv[2], top_y + 1, lz + dv[0]];
+                        let side_r = [lx + dv[2], top_y + 1, lz - dv[0]];
+                        is_passable(bp.blocks.get(&above_top))
+                            && is_passable(bp.blocks.get(&above_top2))
+                            && [front_top, back_top, side_l, side_r].iter().any(|exit_p| {
+                                let floor_p = [exit_p[0], exit_p[1] - 1, exit_p[2]];
+                                let head_p = [exit_p[0], exit_p[1] + 1, exit_p[2]];
+                                is_passable(bp.blocks.get(exit_p))
+                                    && is_passable(bp.blocks.get(&head_p))
+                                    && bp.blocks.get(&floor_p).is_some_and(|b| b.block_id != "minecraft:air")
+                            })
+                    };
+                    if !can_exit {
+                        issues.push(format!(
+                            "{desc} seed={seed}: ladder [{lx},{bot_y}..={top_y},{lz}] facing={face} sealed/unexitable at top!"
+                        ));
+                    }
+                }
+
+                // 2) Check interior staircase steps above floor level for dangling/ungrounded steps!
+                for (&[x, y, z], blk) in &bp.blocks {
+                    if !blk.block_id.ends_with("_stairs") {
+                        continue;
+                    }
+                    let half = prop(blk, "half").unwrap_or("bottom");
+                    let min_in = 3;
+                    let max_x = bp.width as i32 - 3;
+                    let max_z = bp.depth as i32 - 3;
+                    let roof_base = i32::from(bp.spec.foundation_height)
+                        + i32::from(bp.spec.floors) * i32::from(bp.spec.floor_height);
+                    if x >= min_in
+                        && x < max_x
+                        && z >= min_in
+                        && z < max_z
+                        && y > i32::from(bp.spec.foundation_height) + 1
+                        && y < roof_base
+                    {
+                        if half == "top" {
+                            // Top stairs (stringers, porch brackets, window lintels) must touch a neighboring support!
+                            let has_any_support = [
+                                [x - 1, y, z],
+                                [x + 1, y, z],
+                                [x, y, z - 1],
+                                [x, y, z + 1],
+                                [x, y + 1, z],
+                            ]
+                            .into_iter()
+                            .any(|np| bp.blocks.get(&np).is_some_and(|b| b.block_id != "minecraft:air"));
+                            if !has_any_support {
+                                issues.push(format!(
+                                    "TOP_DETACHED {desc} seed={seed}: dangling top stair {} at [{x},{y},{z}]",
+                                    blk.block_id
+                                ));
+                            }
+                            continue;
+                        }
+                        let has_below = bp.blocks.get(&[x, y - 1, z]).is_some_and(|b| b.block_id != "minecraft:air");
+                        let has_lower_step = [
+                            [x - 1, y - 1, z],
+                            [x + 1, y - 1, z],
+                            [x, y - 1, z - 1],
+                            [x, y - 1, z + 1],
+                        ]
+                        .into_iter()
+                        .any(|np| bp.blocks.get(&np).is_some_and(|b| b.block_id != "minecraft:air"));
+                        let has_same_y_wall = [
+                            [x - 1, y, z],
+                            [x + 1, y, z],
+                            [x, y, z - 1],
+                            [x, y, z + 1],
+                        ]
+                        .into_iter()
+                        .any(|np| {
+                            bp.blocks
+                                .get(&np)
+                                .is_some_and(|b| b.block_id != "minecraft:air" && !b.block_id.ends_with("_stairs"))
+                        });
+                        if !has_below && !has_lower_step && !has_same_y_wall {
+                            issues.push(format!(
+                                "ORPHAN_STAIR {desc} seed={seed}: orphan/floating interior stair {} at [{x},{y},{z}]",
+                                blk.block_id
+                            ));
+                        }
+                        let under_is_opp_top_stringer = bp.blocks.get(&[x, y - 1, z]).is_some_and(|b| {
+                            b.block_id.ends_with("_stairs")
+                                && prop(b, "half") == Some("top")
+                                && prop(b, "facing") != prop(blk, "facing")
+                        });
+                        let next_step_has_top_stringer = [
+                            [x - 1, y + 1, z],
+                            [x + 1, y + 1, z],
+                            [x, y + 1, z - 1],
+                            [x, y + 1, z + 1],
+                        ]
+                        .into_iter()
+                        .any(|np| {
+                            bp.blocks.get(&np).is_some_and(|b| b.block_id.ends_with("_stairs"))
+                                && bp.blocks.get(&[np[0], y, np[2]]).is_some_and(|ub| {
+                                    ub.block_id.ends_with("_stairs")
+                                        && prop(ub, "half") == Some("top")
+                                        && prop(ub, "facing") != prop(blk, "facing")
+                                })
+                        });
+                        let is_tower_spiral = bp.spec.category == BuildCategory::Tower
+                            && [
+                                [x - 1, y - 1, z],
+                                [x + 1, y - 1, z],
+                                [x, y - 1, z - 1],
+                                [x, y - 1, z + 1],
+                            ]
+                            .into_iter()
+                            .any(|np| bp.blocks.get(&np).is_some_and(|b| b.block_id.ends_with("_stairs")));
+                        let is_flight_step = under_is_opp_top_stringer
+                            || (has_below && next_step_has_top_stringer)
+                            || is_tower_spiral;
+                        if is_flight_step {
+                            for cy in [y + 1, y + 2] {
+                                if let Some(hb) = bp.blocks.get(&[x, cy, z])
+                                    && hb.block_id != "minecraft:air"
+                                    && !hb.block_id.ends_with("_stairs")
+                                {
+                                    issues.push(format!(
+                                        "STAIR_HEADROOM {desc} seed={seed}: stair at [{x},{y},{z}] has blocked headroom at y={cy} ({})",
+                                        hb.block_id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut by_tag: std::collections::BTreeMap<&str, Vec<&String>> = std::collections::BTreeMap::new();
+        for msg in &issues {
+            let tag = msg.split_whitespace().next().unwrap_or("OTHER");
+            by_tag.entry(tag).or_default().push(msg);
+        }
+        let summary: Vec<String> = by_tag
+            .iter()
+            .map(|(k, v)| {
+                let sample: Vec<&str> = v.iter().take(12).map(|s| s.as_str()).collect();
+                format!("=== {k} ({}) ===\n{}", v.len(), sample.join("\n"))
+            })
+            .collect();
+        assert!(
+            issues.is_empty(),
+            "Found {} stair/ladder issues:\n{}",
+            issues.len(),
+            summary.join("\n\n")
+        );
+    }
+
+    #[test]
+    fn phase5_porticos_modern_penthouse_pagoda_finials_and_bridges_work() {
+        // 1. Classical Temple Portico uses quartz columns (not wooden fences) and stepped portico depth.
+        let mut temple_req = sample_request("большой античный храм с крыльцом", 5050);
+        temple_req.category = BuildCategory::Temple;
+        temple_req.style = BuildStyle::Classical;
+        temple_req.width = 19;
+        temple_req.depth = 17;
+        temple_req.height = 16;
+        temple_req.palette = MaterialPalette::preset_for_style(BuildStyle::Classical);
+        let temple_bp = generate_blueprint(&temple_req, None);
+        assert!(
+            temple_bp.blocks.values().any(|b| b.block_id == "minecraft:quartz_pillar"),
+            "Classical portico temple should place quartz_pillar columns"
+        );
+
+        // 2. Modern spacious flat roof gets glass_pane balustrade + rooftop azalea lounge.
+        let mut modern_req = sample_request("современная вилла модерн с плоской крышей", 5151);
+        modern_req.category = BuildCategory::House;
+        modern_req.style = BuildStyle::Modern;
+        modern_req.width = 19;
+        modern_req.depth = 17;
+        modern_req.height = 14;
+        modern_req.palette = MaterialPalette::preset_for_style(BuildStyle::Modern);
+        let modern_bp = generate_blueprint(&modern_req, None);
+        assert!(
+            modern_bp.blocks.values().any(|b| b.block_id == "minecraft:glass_pane"),
+            "Modern flat-roof villa should frame rooftop balustrade with glass_pane"
+        );
+        assert!(
+            modern_bp.blocks.values().any(|b| b.block_id == "minecraft:potted_azalea_bush"),
+            "Modern spacious rooftop should include rooftop potted_azalea_bush lounge"
+        );
+
+        // 3. Japanese Pagoda crowns roof summit with metal sorin finial (iron_bars + lightning_rod).
+        let mut pagoda_req = sample_request("японская пагода с садом", 5252);
+        pagoda_req.category = BuildCategory::House;
+        pagoda_req.style = BuildStyle::Japanese;
+        pagoda_req.width = 15;
+        pagoda_req.depth = 15;
+        pagoda_req.height = 18;
+        pagoda_req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let pagoda_bp = generate_blueprint(&pagoda_req, None);
+        assert!(
+            pagoda_bp.blocks.values().any(|b| b.block_id == "minecraft:lightning_rod")
+                && pagoda_bp.blocks.values().any(|b| b.block_id == "minecraft:iron_bars"),
+            "Japanese Pagoda should feature sorin iron_bars + lightning_rod spire finial"
+        );
+
+        // 4. Lighthouse lantern includes warm ochre_froglight + sea_lantern core.
+        let mut light_req = sample_request("высокий маяк", 5353);
+        light_req.category = BuildCategory::Tower;
+        light_req.width = 11;
+        light_req.depth = 11;
+        light_req.height = 22;
+        let light_bp = generate_blueprint(&light_req, None);
+        assert!(
+            light_bp.blocks.values().any(|b| b.block_id == "minecraft:ochre_froglight")
+                && light_bp.blocks.values().any(|b| b.block_id == "minecraft:sea_lantern"),
+            "Lighthouse chamber should layer ochre_froglight and sea_lantern"
+        );
+
+        // 5. Covered Japanese Bridge builds covered timber canopy & smooth slab crest ramps.
+        let mut bridge_req = sample_request("японский крытый мост через реку с крыльцом", 5454);
+        bridge_req.category = BuildCategory::Bridge;
+        bridge_req.style = BuildStyle::Japanese;
+        bridge_req.width = 9;
+        bridge_req.depth = 19;
+        bridge_req.height = 14;
+        bridge_req.palette = MaterialPalette::preset_for_style(BuildStyle::Japanese);
+        let bridge_bp = generate_blueprint(&bridge_req, None);
+        assert!(
+            bridge_bp.blocks.values().any(|b| b.block_id.ends_with("_slab") && b.props.iter().any(|&(k, v)| k == "type" && v == "bottom")),
+            "Covered arched bridge should place walkable bottom slab ramps & roof canopy"
+        );
+    }
+
+    #[test]
+    fn phase6_gui_persistence_stilts_gradients_and_settlements_work() {
+        use crate::persist::{
+            MatFilter, SavedPreset, apply_block_to_slot, decode_share_code, encode_share_code,
+            filtered_slot_choices, parse_favorites, serialize_favorites,
+        };
+
+        // 1. Persistence, Share-Codes & Bilingual Material Filter 2.0.
+        let preset = SavedPreset {
+            name: "Римский квартал".into(),
+            width: 56,
+            depth: 52,
+            height: 24,
+            category: BuildCategory::Settlement,
+            style: BuildStyle::Classical,
+            roof_raw: 1,
+            toggles: [1, 2, 0, 1, 1],
+            noise_level: NoiseLevel::Wild,
+            adapt_terrain: true,
+            description: "квартал античный с колоннами и садом".into(),
+            seed: 987_654_321,
+            palette_manual: true,
+            palette: MaterialPalette::preset_for_style(BuildStyle::Classical),
+        };
+        let code = encode_share_code(&preset);
+        assert!(code.starts_with("BG2:"), "Share code must use BG2 prefix");
+        let decoded = decode_share_code(&code, Some(&preset.name)).expect("valid share code roundtrip");
+        assert_eq!(decoded, preset);
+        assert!(decode_share_code("BG2:CORRUPTED_DATA", None).is_err());
+
+        let fav_text = serialize_favorites(&[preset.clone()]);
+        let parsed_favs = parse_favorites(&fav_text);
+        assert_eq!(parsed_favs, vec![preset]);
+
+        let copper_roofs = filtered_slot_choices(4, MatFilter::Special, "медь");
+        assert!(
+            copper_roofs.iter().any(|id| id == "minecraft:cut_copper"),
+            "RU query 'медь' should find copper roof choices: {copper_roofs:?}"
+        );
+        let mut sync_pal = MaterialPalette::preset(0);
+        apply_block_to_slot(&mut sync_pal, 1, "minecraft:cherry_planks", true);
+        assert_eq!(sync_pal.door, "minecraft:cherry_door");
+        assert_eq!(sync_pal.fence, "minecraft:cherry_fence");
+
+        // 2. Water Stilts & Pier Adaptation.
+        let mut stilt_req = sample_request("рыбацкий коттедж с крыльцом", 6161);
+        stilt_req.width = 15;
+        stilt_req.depth = 15;
+        stilt_req.height = 12;
+        let cols = usize::from(stilt_req.width) * usize::from(stilt_req.depth);
+        let offsets = vec![0i32; cols];
+        let water_depths = vec![4i32; cols];
+        let stilt_bp = crate::generator::generate_blueprint_with_water(
+            &stilt_req,
+            Some(&offsets),
+            Some(&water_depths),
+        );
+        assert!(stilt_bp.spec.on_stilts, "House over water should activate stilt pier mode");
+        assert!(!stilt_bp.spec.basement, "Underwater stilts should disable flooded basement");
+        let deep_piers = stilt_bp
+            .blocks
+            .iter()
+            .filter(|&(&[_, y, _], b)| y <= -3 && b.block_id != "minecraft:air")
+            .count();
+        assert!(deep_piers > 0 && deep_piers < 90, "Expected open underwater pilings (not solid cube): {deep_piers}");
+
+        // 3. Floor-by-Floor Material Overrides & Weathering Gradients.
+        let mut split_req = sample_request("двухэтажный дом, 1 этаж из булыжника, 2 этаж из тёмного дуба", 6262);
+        split_req.width = 15;
+        split_req.depth = 13;
+        split_req.height = 14;
+        split_req.palette = crate::parser::infer_palette_with_style_and_seed(
+            BuildStyle::Medieval,
+            &split_req.description,
+            split_req.seed as u64,
+        );
+        let split_bp = generate_blueprint(&split_req, None);
+        assert!(split_bp.spec.floors >= 2);
+        assert!(
+            split_bp.blocks.iter().any(|(&[_, y, _], b)| y <= 4 && (b.block_id == "minecraft:cobblestone" || b.block_id == "minecraft:mossy_cobblestone")),
+            "1st floor should keep cobblestone masonry"
+        );
+        assert!(
+            split_bp.blocks.iter().any(|(&[_, y, _], b)| y >= 6 && b.block_id == "minecraft:dark_oak_planks"),
+            "2nd floor should switch to dark_oak_planks"
+        );
+
+        let mut grad_req = sample_request("древняя каменная башня с мхом", 6363);
+        grad_req.category = BuildCategory::Tower;
+        grad_req.width = 11;
+        grad_req.depth = 11;
+        grad_req.height = 18;
+        grad_req.palette = crate::parser::infer_palette_with_style_and_seed(
+            BuildStyle::Medieval,
+            &grad_req.description,
+            grad_req.seed as u64,
+        );
+        let grad_bp = generate_blueprint(&grad_req, None);
+        assert!(
+            grad_bp.blocks.values().any(|b| b.block_id == "minecraft:mossy_stone_bricks"),
+            "Weathered stone walls should include mossy_stone_bricks base gradient"
+        );
+        assert!(
+            grad_bp.blocks.values().any(|b| b.block_id == "minecraft:cracked_stone_bricks"),
+            "Weathered stone walls should include cracked_stone_bricks accent gradient"
+        );
+
+        // 4. Settlement / Village Mode (`<= 96x96`) with multiple oriented buildings & fountain.
+        let mut village_req = sample_request("средневековый квартал деревня с площадью", 6464);
+        village_req.category = BuildCategory::Settlement;
+        village_req.style = BuildStyle::Medieval;
+        village_req.width = 56;
+        village_req.depth = 56;
+        village_req.height = 22;
+        village_req.palette = MaterialPalette::preset(1);
+        let village_bp = generate_blueprint(&village_req, None);
+        assert_eq!(village_bp.width, 56);
+        assert_eq!(village_bp.depth, 56);
+        assert!(village_bp.non_air_count() > 2000, "Village should populate multi-building town: {}", village_bp.non_air_count());
+        assert!(
+            village_bp.blocks.values().any(|b| b.block_id == "minecraft:water")
+                && village_bp.blocks.values().any(|b| b.block_id.ends_with("_door")),
+            "Village should include plaza fountain water and multiple building entrances"
+        );
+    }
+
+    #[test]
+    fn phase7_fixes_roof_doors_windows_and_30_slot_materials() {
+        use crate::persist::{
+            MatFilter, SavedPreset, apply_block_to_slot, decode_share_code, encode_share_code,
+            filtered_slot_choices,
+        };
+
+        // 1. All 30 UI material slots have valid expanded choice catalogs & RU/EN search.
+        assert!(MaterialPalette::WALL_CHOICES.len() >= 70);
+        assert!(MaterialPalette::FOUNDATION_CHOICES.len() >= 40);
+        assert!(MaterialPalette::ROOF_CHOICES.len() >= 45);
+        for slot in 0..30 {
+            let all = filtered_slot_choices(slot, MatFilter::All, "");
+            assert!(
+                !all.is_empty(),
+                "Material slot {slot} must return candidate choices"
+            );
+            for id in &all {
+                assert!(id.starts_with("minecraft:"), "Invalid ID in slot {slot}: {id}");
+            }
+        }
+        assert!(filtered_slot_choices(23, MatFilter::All, "").len() >= 45);
+        assert!(filtered_slot_choices(27, MatFilter::All, "").len() >= 18);
+        assert!(filtered_slot_choices(28, MatFilter::All, "").len() >= 30);
+        assert!(filtered_slot_choices(29, MatFilter::All, "").len() >= 18);
+        assert!(
+            filtered_slot_choices(23, MatFilter::All, "медь")
+                .iter()
+                .any(|id| id == "minecraft:cut_copper_stairs")
+        );
+        assert!(
+            filtered_slot_choices(27, MatFilter::All, "мох")
+                .iter()
+                .any(|id| id == "minecraft:moss_carpet")
+        );
+
+        // 2. All 30 slots apply cleanly & roundtrip via Share-Code BG2 v2.
+        let mut custom_pal = MaterialPalette::preset(0);
+        apply_block_to_slot(&mut custom_pal, 12, "minecraft:yellow_terracotta", false);
+        apply_block_to_slot(&mut custom_pal, 14, "minecraft:cherry_log", false);
+        apply_block_to_slot(&mut custom_pal, 15, "minecraft:purpur_pillar", false);
+        apply_block_to_slot(&mut custom_pal, 16, "minecraft:cut_copper", false);
+        apply_block_to_slot(&mut custom_pal, 17, "minecraft:birch_planks", false);
+        apply_block_to_slot(&mut custom_pal, 18, "minecraft:dark_oak_slab", false);
+        apply_block_to_slot(&mut custom_pal, 19, "minecraft:magenta_stained_glass_pane", false);
+        apply_block_to_slot(&mut custom_pal, 20, "minecraft:crimson_door", false);
+        apply_block_to_slot(&mut custom_pal, 22, "minecraft:bamboo_fence_gate", false);
+        apply_block_to_slot(&mut custom_pal, 23, "minecraft:cut_copper_stairs", false);
+        apply_block_to_slot(&mut custom_pal, 24, "minecraft:tuff_bricks", false);
+        apply_block_to_slot(&mut custom_pal, 25, "minecraft:cherry_leaves", false);
+        apply_block_to_slot(&mut custom_pal, 26, "minecraft:copper_torch", false);
+        apply_block_to_slot(&mut custom_pal, 27, "minecraft:magenta_carpet", false);
+        apply_block_to_slot(&mut custom_pal, 28, "minecraft:smooth_red_sandstone", false);
+        apply_block_to_slot(&mut custom_pal, 29, "minecraft:cyan_wool", false);
+
+        let p = SavedPreset {
+            name: "Тест 30 слотов".into(),
+            width: 17,
+            depth: 15,
+            height: 16,
+            category: BuildCategory::House,
+            style: BuildStyle::Medieval,
+            roof_raw: 1,
+            toggles: [1, 1, 1, 1, 1],
+            noise_level: NoiseLevel::Balanced,
+            adapt_terrain: true,
+            description: "двухэтажная уютная таверна лавка с крыльцом и садом".into(),
+            seed: 4242,
+            palette_manual: true,
+            palette: custom_pal.clone(),
+        };
+        let code = encode_share_code(&p);
+        let decoded = decode_share_code(&code, Some(&p.name)).expect("BG2 v2 share code roundtrip");
+        assert_eq!(decoded.palette, custom_pal);
+
+        // Customized extended slots render into generated building blocks.
+        let mut custom_req = sample_request("двухэтажная уютная таверна лавка с крыльцом и садом", 7171);
+        custom_req.width = 21;
+        custom_req.depth = 19;
+        custom_req.height = 16;
+        custom_req.style = BuildStyle::Cottage;
+        custom_req.palette = custom_pal.clone();
+        let custom_bp = generate_blueprint(&custom_req, None);
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:yellow_terracotta"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:crimson_door"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:magenta_carpet"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:smooth_red_sandstone"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:cut_copper_stairs"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:cyan_wool"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:copper_wall_torch"));
+        assert!(custom_bp.blocks.values().any(|b| b.block_id == "minecraft:cherry_log"));
+
+        // 3. Regressions across 8 seeds: properly jambed doors, no 1x1 pier/gable window shards, no roof-step holes!
+        let mut checked_doors = 0usize;
+        let is_solid_jamb = |bp: &crate::generator::GeneratedBlueprint, x: i32, y: i32, z: i32| -> bool {
+            bp.blocks.get(&[x, y, z]).is_some_and(|b| {
+                let id = b.block_id.as_str();
+                id != "minecraft:air"
+                    && id != "minecraft:ladder"
+                    && !id.contains("glass")
+                    && !id.ends_with("_door")
+            })
+        };
+        let is_clear_pass = |bp: &crate::generator::GeneratedBlueprint, x: i32, y: i32, z: i32| -> bool {
+            bp.blocks.get(&[x, y, z]).is_none_or(|b| {
+                let id = b.block_id.as_str();
+                id == "minecraft:air" || id.ends_with("_carpet") || id == "minecraft:torch"
+            })
+        };
+
+        for seed in 100..=107 {
+            let mut req = sample_request("двухэтажный просторный дом с крыльцом и садом", seed);
+            req.width = 17;
+            req.depth = 15;
+            req.height = 17;
+            req.style = BuildStyle::Medieval;
+            req.palette = MaterialPalette::preset_for_style(BuildStyle::Medieval);
+            let bp = generate_blueprint(&req, None);
+
+            // (a) Every lower door must have solid wall jambs on both left/right flanks AND clear passage!
+            for (&[x, y, z], blk) in &bp.blocks {
+                if blk.block_id.ends_with("_door")
+                    && blk.props.iter().any(|&(k, v)| k == "half" && v == "lower")
+                {
+                    checked_doors += 1;
+                    let along_x_jambs = (is_solid_jamb(&bp, x - 1, y, z)
+                        || bp.blocks.get(&[x - 1, y, z]).is_some_and(|b| b.block_id.ends_with("_door")))
+                        && (is_solid_jamb(&bp, x + 1, y, z)
+                            || bp.blocks.get(&[x + 1, y, z]).is_some_and(|b| b.block_id.ends_with("_door")));
+                    let along_z_jambs = (is_solid_jamb(&bp, x, y, z - 1)
+                        || bp.blocks.get(&[x, y, z - 1]).is_some_and(|b| b.block_id.ends_with("_door")))
+                        && (is_solid_jamb(&bp, x, y, z + 1)
+                            || bp.blocks.get(&[x, y, z + 1]).is_some_and(|b| b.block_id.ends_with("_door")));
+                    assert!(
+                        along_x_jambs || along_z_jambs,
+                        "Seed {seed}: Door at ({x},{y},{z}) lacks solid flanking jambs"
+                    );
+                    if blk.props.iter().any(|&(k, v)| k == "open" && v == "true") {
+                        let pass_z = is_clear_pass(&bp, x, y, z - 1) && is_clear_pass(&bp, x, y, z + 1);
+                        let pass_x = is_clear_pass(&bp, x - 1, y, z) && is_clear_pass(&bp, x + 1, y, z);
+                        assert!(
+                            (along_x_jambs && pass_z) || (along_z_jambs && pass_x),
+                            "Seed {seed}: Open interior door at ({x},{y},{z}) obstructed by wall/ladder"
+                        );
+                    }
+                }
+            }
+
+            // (b) No lone glass block trapped inside a vertical frame pillar (`y-1 == frame && y+1 == frame`).
+            let frame_id = req.palette.frame.as_str();
+            for (&[x, y, z], blk) in &bp.blocks {
+                if blk.block_id.contains("glass") {
+                    let below_frame = bp.blocks.get(&[x, y - 1, z]).is_some_and(|b| b.block_id == frame_id);
+                    let above_frame = bp.blocks.get(&[x, y + 1, z]).is_some_and(|b| b.block_id == frame_id);
+                    assert!(
+                        !(below_frame && above_frame),
+                        "Seed {seed}: Glass shard trapped between frame logs at ({x},{y},{z})"
+                    );
+                }
+            }
+
+            // (c) Attic roof enclosure: above roof_base_y + 1, no interior attic air voxel inside the
+            // structural roof/gable envelope should horizontally see outside sky through an unsealed step drop.
+            let roof_base_y = i32::from(bp.spec.foundation_height)
+                + i32::from(bp.spec.floors) * i32::from(bp.spec.floor_height);
+            let is_roof_envelope = |id: &str| -> bool {
+                id == req.palette.roof_block
+                    || id == req.palette.wall
+                    || id == req.palette.wall_upper
+                    || id == req.palette.wall_accent
+                    || id == req.palette.frame
+                    || id == req.palette.roof_stairs
+                    || id == req.palette.roof_slab
+                    || id.ends_with("_stairs")
+                    || id.ends_with("_slab")
+            };
+            let mut col_roof_top: BTreeMap<(i32, i32), i32> = BTreeMap::new();
+            for (&[x, y, z], blk) in &bp.blocks {
+                if y >= roof_base_y && is_roof_envelope(blk.block_id.as_str()) {
+                    let e = col_roof_top.entry((x, z)).or_insert(y);
+                    if y > *e {
+                        *e = y;
+                    }
+                }
+            }
+            for (&(x, z), &top_y) in &col_roof_top {
+                // Only inspect columns inside the actual building attic (solid floor/plate at roof_base_y),
+                // skipping exterior 1-block overhanging eaves outside the walls.
+                if bp.blocks.get(&[x, roof_base_y, z]).is_none_or(|b| b.block_id == "minecraft:air") {
+                    continue;
+                }
+                for y in (roof_base_y + 1)..top_y {
+                    let is_air_here = bp.blocks.get(&[x, y, z]).is_none_or(|b| b.block_id == "minecraft:air");
+                    if !is_air_here {
+                        continue;
+                    }
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let nb_top = col_roof_top.get(&(x + dx, z + dz)).copied().unwrap_or(0);
+                        if nb_top < y {
+                            let nb_cur_air = bp.blocks.get(&[x + dx, y, z + dz]).is_none_or(|b| b.block_id == "minecraft:air");
+                            let nb_above_air = bp.blocks.get(&[x + dx, y + 1, z + dz]).is_none_or(|b| b.block_id == "minecraft:air");
+                            let col_dump: Vec<(i32, &str)> = (roof_base_y..=top_y)
+                                .map(|yy| {
+                                    (
+                                        yy,
+                                        bp.blocks
+                                            .get(&[x, yy, z])
+                                            .map(|b| b.block_id.as_str())
+                                            .unwrap_or("air"),
+                                    )
+                                })
+                                .collect();
+                            let nb_cols: Vec<_> = [(6,12),(7,11),(7,12),(8,12),(7,13)]
+                                .into_iter()
+                                .map(|(cx, cz)| {
+                                    let items: Vec<_> = (7..=13)
+                                        .map(|yy| (yy, bp.blocks.get(&[cx, yy, cz]).map(|b| b.block_id.as_str()).unwrap_or("air")))
+                                        .collect();
+                                    ((cx, cz), items)
+                                })
+                                .collect();
+                            assert!(
+                                !(nb_cur_air && nb_above_air),
+                                "Seed {seed} ({:?}, dormer={}, turret={}): Unsealed attic roof gap at ({x},{y},{z}) [top={top_y}] facing ({},{}) [nb_top={nb_top}, roof_base_y={roof_base_y}] col={col_dump:?} nbs={nb_cols:?}",
+                                bp.spec.roof_style,
+                                bp.spec.dormers,
+                                bp.spec.corner_turret,
+                                x + dx,
+                                z + dz
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for seed in 200..=205 {
+            let mut g_req = sample_request("двухэтажный большой дом с двускатной крышей и флигелем", seed);
+            g_req.width = 19;
+            g_req.depth = 17;
+            g_req.height = 18;
+            g_req.style = BuildStyle::Cottage;
+            let g_bp = generate_blueprint(&g_req, None);
+            let roof_base_y = i32::from(g_bp.spec.foundation_height)
+                + i32::from(g_bp.spec.floors) * i32::from(g_bp.spec.floor_height);
+            let mut col_top: BTreeMap<(i32, i32), i32> = BTreeMap::new();
+            for (&[x, y, z], blk) in &g_bp.blocks {
+                if y >= roof_base_y
+                    && blk.block_id != "minecraft:air"
+                    && blk.block_id != g_req.palette.chimney_block
+                    && !blk.block_id.ends_with("_trapdoor")
+                    && !blk.block_id.ends_with("_leaves")
+                {
+                    let e = col_top.entry((x, z)).or_insert(y);
+                    if y > *e {
+                        *e = y;
+                    }
+                }
+            }
+            for (&(x, z), &top_y) in &col_top {
+                if g_bp.blocks.get(&[x, roof_base_y, z]).is_none_or(|b| b.block_id == "minecraft:air") {
+                    continue;
+                }
+                for y in (roof_base_y + 1)..top_y {
+                    if g_bp.blocks.get(&[x, y, z]).is_none_or(|b| b.block_id == "minecraft:air") {
+                        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            let nb_top = col_top.get(&(x + dx, z + dz)).copied().unwrap_or(0);
+                            if nb_top < y {
+                                let nb_cur_air = g_bp.blocks.get(&[x + dx, y, z + dz]).is_none_or(|b| b.block_id == "minecraft:air");
+                                let nb_above_air = g_bp.blocks.get(&[x + dx, y + 1, z + dz]).is_none_or(|b| b.block_id == "minecraft:air");
+                                assert!(
+                                    !(nb_cur_air && nb_above_air),
+                                    "Gable seed {seed}: Unsealed step/gable gap at ({x},{y},{z}) facing ({},{})",
+                                    x + dx,
+                                    z + dz
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked_doors >= 16, "Expected doors checked across 8 multi-story seeds, got {checked_doors}");
+    }
+
+    #[test]
+    fn test_material_palette_block_lists_expand_shrink_and_mix_modes() {
+        use std::collections::BTreeSet;
+        use crate::model::MixMode;
+
+        let mut pal = MaterialPalette::preset(0);
+        assert_eq!(pal.slot_blocks(MaterialPalette::SLOT_WALL).len(), 1);
+        assert!(!pal.remove_slot_block_at(MaterialPalette::SLOT_WALL, 0));
+
+        assert!(pal.add_slot_block(MaterialPalette::SLOT_WALL, "minecraft:mossy_stone_bricks"));
+        assert!(pal.add_slot_block(MaterialPalette::SLOT_WALL, "minecraft:andesite"));
+        // Weighted repeat entry allowed up to MAX_BLOCKS_PER_SLOT
+        assert!(pal.add_slot_block(MaterialPalette::SLOT_WALL, "minecraft:mossy_stone_bricks"));
+        assert_eq!(pal.slot_blocks(MaterialPalette::SLOT_WALL).len(), 4);
+        assert!(pal.remove_slot_block_at(MaterialPalette::SLOT_WALL, 3));
+        assert_eq!(pal.slot_blocks(MaterialPalette::SLOT_WALL).len(), 3);
+
+        // Replace middle entry and test shrinking back down to 1 minimum
+        pal.replace_slot_block_at(MaterialPalette::SLOT_WALL, 1, "minecraft:cracked_stone_bricks");
+        assert_eq!(
+            pal.slot_blocks(MaterialPalette::SLOT_WALL)[1],
+            "minecraft:cracked_stone_bricks"
+        );
+        for mode in [MixMode::Patches, MixMode::Scatter, MixMode::Stripes, MixMode::Checker] {
+            pal.mix_mode = mode;
+            let mut seen = BTreeSet::new();
+            for u in 0..10 {
+                for y in 0..6 {
+                    for v in 0..10 {
+                        seen.insert(pal.pick(MaterialPalette::SLOT_WALL, 42, u, y, v));
+                    }
+                }
+            }
+            assert!(
+                seen.len() >= 2,
+                "MixMode {:?} should emit multiple materials from slot list, got {:?}",
+                mode,
+                seen
+            );
+        }
+
+        assert!(pal.remove_slot_block_at(MaterialPalette::SLOT_WALL, 1));
+        assert!(pal.remove_slot_block_at(MaterialPalette::SLOT_WALL, 1));
+        assert_eq!(pal.slot_blocks(MaterialPalette::SLOT_WALL).len(), 1);
+        assert!(!pal.remove_slot_block_at(MaterialPalette::SLOT_WALL, 0));
+
+        // Verify upper cap MAX_BLOCKS_PER_SLOT
+        for i in 1..MaterialPalette::MAX_BLOCKS_PER_SLOT {
+            assert!(
+                pal.add_slot_block(MaterialPalette::SLOT_WALL, &format!("minecraft:custom_block_{i}")),
+                "Expected add up to cap at {i}"
+            );
+        }
+        assert_eq!(
+            pal.slot_blocks(MaterialPalette::SLOT_WALL).len(),
+            MaterialPalette::MAX_BLOCKS_PER_SLOT
+        );
+        assert!(!pal.add_slot_block(MaterialPalette::SLOT_WALL, "minecraft:overflow_block"));
+    }
+
+    #[test]
+    fn test_share_code_v3_and_picker_filtering() {
+        use crate::model::MixMode;
+        use crate::persist::{
+            MatFilter, SavedPreset, add_block_to_slot, decode_share_code, encode_share_code,
+            filtered_picker_choices, parse_favorites, remove_block_from_slot_at,
+            replace_block_in_slot_at, serialize_favorites, toggle_block_in_slot,
+        };
+
+        let mut pal = MaterialPalette::preset(1);
+        pal.mix_mode = MixMode::Checker;
+        assert!(add_block_to_slot(&mut pal, MaterialPalette::SLOT_WALL, "minecraft:calcite", false));
+        assert!(add_block_to_slot(
+            &mut pal,
+            MaterialPalette::SLOT_WALL_UPPER,
+            "minecraft:birch_planks",
+            false
+        ));
+        assert!(add_block_to_slot(&mut pal, MaterialPalette::SLOT_ROOF, "minecraft:blackstone", false));
+        assert!(add_block_to_slot(
+            &mut pal,
+            MaterialPalette::SLOT_AWNING,
+            "minecraft:cyan_wool",
+            false
+        ));
+
+        let preset = SavedPreset {
+            name: "ListMixTest".into(),
+            width: 15,
+            depth: 13,
+            height: 14,
+            category: BuildCategory::House,
+            style: BuildStyle::Medieval,
+            roof_raw: 1,
+            toggles: [0, 1, 2, 0, 1],
+            noise_level: NoiseLevel::Balanced,
+            adapt_terrain: true,
+            description: "дом с разными блоками".into(),
+            seed: 987654,
+            palette_manual: true,
+            palette: pal.clone(),
+        };
+        let code = encode_share_code(&preset);
+        assert!(code.starts_with("BG2"));
+        let decoded = decode_share_code(&code, None).expect("decode BG2 v3 share code");
+        assert_eq!(decoded.palette.mix_mode, MixMode::Checker);
+        assert_eq!(
+            decoded.palette.slot_blocks(MaterialPalette::SLOT_WALL),
+            pal.slot_blocks(MaterialPalette::SLOT_WALL)
+        );
+        assert_eq!(
+            decoded.palette.slot_blocks(MaterialPalette::SLOT_WALL_UPPER),
+            pal.slot_blocks(MaterialPalette::SLOT_WALL_UPPER)
+        );
+        assert_eq!(
+            decoded.palette.slot_blocks(MaterialPalette::SLOT_AWNING),
+            pal.slot_blocks(MaterialPalette::SLOT_AWNING)
+        );
+
+        let fav_raw = serialize_favorites(&[decoded]);
+        let fav_back = parse_favorites(&fav_raw);
+        assert_eq!(fav_back.len(), 1);
+        assert_eq!(fav_back[0].palette.mix_mode, MixMode::Checker);
+
+        // Curated vs All-World block catalog + RU/EN filter search
+        let world_blocks = vec![
+            "minecraft:tuff_bricks".to_owned(),
+            "testmod:custom_beam".to_owned(),
+            "minecraft:mossy_stone_bricks".to_owned(),
+        ];
+        let all_tuff = filtered_picker_choices(
+            MaterialPalette::SLOT_WALL,
+            true,
+            &world_blocks,
+            MatFilter::All,
+            "tuFf",
+        );
+        assert!(all_tuff.contains(&"minecraft:tuff_bricks".to_owned()));
+        let ru_slate = filtered_picker_choices(
+            MaterialPalette::SLOT_WALL,
+            true,
+            &world_blocks,
+            MatFilter::Stone,
+            "сланец",
+        );
+        assert!(!ru_slate.is_empty());
+        let mod_custom = filtered_picker_choices(
+            MaterialPalette::SLOT_WALL,
+            true,
+            &world_blocks,
+            MatFilter::All,
+            "custom_beam",
+        );
+        assert_eq!(mod_custom, vec!["testmod:custom_beam".to_owned()]);
+
+        // Persist UI mutators (`toggle` returns false when removed)
+        assert!(!toggle_block_in_slot(&mut pal, MaterialPalette::SLOT_WALL, "minecraft:calcite", false));
+        assert!(!pal.slot_contains(MaterialPalette::SLOT_WALL, "minecraft:calcite"));
+        assert!(add_block_to_slot(&mut pal, MaterialPalette::SLOT_WALL, "minecraft:granite", false));
+        replace_block_in_slot_at(&mut pal, MaterialPalette::SLOT_WALL, 1, "minecraft:diorite", false);
+        assert!(pal.slot_contains(MaterialPalette::SLOT_WALL, "minecraft:diorite"));
+        assert!(remove_block_from_slot_at(&mut pal, MaterialPalette::SLOT_WALL, 1));
+    }
+
+    #[test]
+    fn test_multi_block_list_generation_and_door_consistency() {
+        use std::collections::BTreeSet;
+        use crate::model::MixMode;
+
+        for mode in [MixMode::Patches, MixMode::Scatter, MixMode::Stripes, MixMode::Checker] {
+            let mut req = sample_request("двухэтажный уютный дом с крыльцом", 777 + i64::from(mode.to_idx()));
+            req.width = 15;
+            req.depth = 13;
+            req.height = 14;
+            let pal = &mut req.palette;
+            pal.mix_mode = mode;
+            pal.add_slot_block(MaterialPalette::SLOT_WALL, "minecraft:birch_planks");
+            pal.add_slot_block(MaterialPalette::SLOT_WALL, "minecraft:spruce_planks");
+            pal.add_slot_block(MaterialPalette::SLOT_ROOF, "minecraft:cobbled_deepslate");
+            pal.add_slot_block(MaterialPalette::SLOT_ROOF, "minecraft:blackstone");
+            pal.add_slot_block(MaterialPalette::SLOT_DOOR, "minecraft:spruce_door");
+            pal.add_slot_block(MaterialPalette::SLOT_DOOR, "minecraft:dark_oak_door");
+            pal.add_slot_block(MaterialPalette::SLOT_FENCE, "minecraft:spruce_fence");
+
+            let bp = generate_blueprint(&req, None);
+            let mut wall_ids_seen = BTreeSet::new();
+            let mut roof_ids_seen = BTreeSet::new();
+            let mut doors_found = 0usize;
+
+            for (&[x, y, z], blk) in &bp.blocks {
+                if req.palette.slot_contains(MaterialPalette::SLOT_WALL, &blk.block_id) {
+                    wall_ids_seen.insert(blk.block_id.clone());
+                }
+                if req.palette.slot_contains(MaterialPalette::SLOT_ROOF, &blk.block_id)
+                    || blk.block_id.contains("deepslate_tile")
+                    || blk.block_id.contains("cobbled_deepslate")
+                    || blk.block_id.contains("blackstone")
+                {
+                    roof_ids_seen.insert(blk.block_id.clone());
+                }
+                if blk.block_id.ends_with("_door")
+                    && blk.props.iter().any(|(k, v)| *k == "half" && *v == "lower")
+                {
+                    let upper = bp
+                        .blocks
+                        .get(&[x, y + 1, z])
+                        .expect("Upper half of door must exist");
+                    assert_eq!(
+                        upper.block_id, blk.block_id,
+                        "Upper & lower door halves must share exact block_id at ({x},{y},{z}) in {:?}",
+                        mode
+                    );
+                    doors_found += 1;
+                }
+            }
+            assert!(doors_found >= 1, "Expected >=1 doorway in {:?}", mode);
+            assert!(
+                wall_ids_seen.len() >= 2,
+                "Expected multiple wall materials generated in {:?}, got {:?}",
+                mode,
+                wall_ids_seen
+            );
+            assert!(
+                roof_ids_seen.len() >= 2,
+                "Expected multiple roof materials generated in {:?}, got {:?}",
+                mode,
+                roof_ids_seen
+            );
+        }
+    }
+
+    #[test]
+    fn phase9_bridge_diversity_full_scale_and_no_clones() {
+        use std::collections::BTreeSet;
+        use crate::parser::{BridgeVariant, infer_palette_with_style_and_seed};
+
+        // Reproduces exact user screenshot scenario: Gothic arched bridge at 21x70x12 across different seeds.
+        let seeds = [2_504_692_i64, 600_562, 101_010, 202_020, 303_030, 404_040, 505_050, 606_060];
+        let mut variants_seen = BTreeSet::new();
+        let mut fingerprints: Vec<(i64, usize, BTreeMap<[i32; 3], String>)> = Vec::new();
+
+        for &seed in &seeds {
+            let mut req = sample_request("арочный мост", seed);
+            req.category = BuildCategory::Bridge;
+            req.style = BuildStyle::Gothic;
+            req.width = 21;
+            req.depth = 70;
+            req.height = 12;
+            req.palette = infer_palette_with_style_and_seed(BuildStyle::Gothic, &req.description, seed as u64);
+
+            let bp = generate_blueprint(&req, None);
+            variants_seen.insert(format!("{:?}", bp.spec.bridge_variant));
+
+            let min_x = bp.blocks.iter().filter(|(_, b)| b.block_id != "minecraft:air").map(|(p, _)| p[0]).min().unwrap_or(0);
+            let max_x = bp.blocks.iter().filter(|(_, b)| b.block_id != "minecraft:air").map(|(p, _)| p[0]).max().unwrap_or(0);
+            let span_x = max_x - min_x + 1;
+            assert!(
+                span_x >= 11,
+                "Expected 21-wide bridge (seed {seed}) to scale past old 9-block cap, got span_x={span_x}"
+            );
+
+            let map: BTreeMap<[i32; 3], String> = bp
+                .blocks
+                .iter()
+                .filter(|(_, b)| b.block_id != "minecraft:air")
+                .map(|(&p, b)| (p, b.block_id.clone()))
+                .collect();
+            assert!(map.len() > 800, "Bridge seed {seed} too empty: {}", map.len());
+            fingerprints.push((seed, map.len(), map));
+        }
+
+        assert!(
+            variants_seen.len() >= 3,
+            "Expected 'арочный мост' to produce >=3 distinct bridge archetypes across seeds, got {:?}",
+            variants_seen
+        );
+
+        let (_, _, ref base_map) = fingerprints[0];
+        let (_, _, ref second_map) = fingerprints[1];
+        let mut diff_count = 0usize;
+        for (pos, id) in base_map {
+            if second_map.get(pos) != Some(id) {
+                diff_count += 1;
+            }
+        }
+        for pos in second_map.keys() {
+            if !base_map.contains_key(pos) {
+                diff_count += 1;
+            }
+        }
+        assert!(
+            diff_count >= base_map.len() / 4,
+            "Expected >=25% structural diff between seeds 2504692 and 600562, got only {diff_count} blocks (base={})",
+            base_map.len()
+        );
+
+        // Verify all explicit specialized BridgeVariants produce rich distinct builds.
+        for (prompt, expected_variant, w, d, h) in [
+            ("вантовый подвесной мост с пилонами и канатами", BridgeVariant::Suspension, 19, 44, 18),
+            ("римский двухъярусный акведук мост с каналом воды", BridgeVariant::Aqueduct, 15, 42, 16),
+            ("японский горбатый лунный мост тайко с воротами тории", BridgeVariant::TaikoMoon, 13, 29, 14),
+            ("крепостной разводной мост со сторожевыми башнями", BridgeVariant::FortifiedGate, 15, 36, 16),
+            ("деревянный понтонный пирс пристань мост", BridgeVariant::PontoonPier, 13, 30, 12),
+        ] {
+            let mut req = sample_request(prompt, 7777);
+            req.category = BuildCategory::Bridge;
+            req.width = w;
+            req.depth = d;
+            req.height = h;
+            let bp = generate_blueprint(&req, None);
+            assert_eq!(bp.spec.bridge_variant, expected_variant);
+            assert!(
+                bp.non_air_count() > 400,
+                "Bridge variant {:?} too small: {}",
+                expected_variant,
+                bp.non_air_count()
+            );
+            assert!(
+                !bp.blocks.values().any(|b| b.block_id == "minecraft:chain"),
+                "Found invalid legacy minecraft:chain in {:?}",
+                expected_variant
+            );
+        }
+    }
+
+    #[test]
+    fn phase9_new_landmarks_and_all_28_presets_generate_cleanly() {
+        use std::collections::BTreeSet;
+        use crate::parser::{StructureTheme, infer_palette_with_style_and_seed};
+
+        let mut themes_seen = BTreeSet::new();
+        for &(slug, cat, style, w, d, h, desc) in CLI_PRESETS {
+            let mut req = sample_request(desc, 9191);
+            req.category = cat;
+            req.style = style;
+            req.width = w;
+            req.depth = d;
+            req.height = h;
+            req.palette = infer_palette_with_style_and_seed(style, desc, 9191);
+            let bp = generate_blueprint(&req, None);
+            themes_seen.insert(format!("{:?}", bp.spec.theme));
+            assert!(
+                bp.non_air_count() > 200,
+                "Preset '{slug}' generated too few blocks: {}",
+                bp.non_air_count()
+            );
+            assert!(
+                !bp.blocks.values().any(|b| b.block_id == "minecraft:chain"),
+                "Preset '{slug}' emitted forbidden minecraft:chain"
+            );
+            for b in bp.blocks.values() {
+                if b.block_id.ends_with("_leaves") {
+                    assert!(
+                        b.props.iter().any(|&(k, v)| k == "persistent" && v == "true"),
+                        "Preset '{slug}' emitted non-persistent leaves"
+                    );
+                }
+            }
+        }
+
+        for expected in [
+            StructureTheme::Pyramid,
+            StructureTheme::TriumphalArch,
+            StructureTheme::Observatory,
+            StructureTheme::ClockTower,
+            StructureTheme::Watermill,
+            StructureTheme::Cathedral,
+            StructureTheme::JapaneseCastle,
+            StructureTheme::Bazaar,
+            StructureTheme::Treehouse,
+            StructureTheme::OnsenBath,
+        ] {
+            assert!(
+                themes_seen.contains(&format!("{expected:?}")),
+                "Expected theme {:?} to be exercised by presets",
+                expected
+            );
+        }
+
+        // Clocktower and Cathedral both include a hanging bell.
+        for slug in ["clocktower", "cathedral"] {
+            let p = find_cli_preset(slug).unwrap();
+            let mut req = sample_request(p.6, 5151);
+            req.category = p.1;
+            req.style = p.2;
+            req.width = p.3;
+            req.depth = p.4;
+            req.height = p.5;
+            let bp = generate_blueprint(&req, None);
+            assert!(
+                bp.blocks.values().any(|b| b.block_id == "minecraft:bell"),
+                "Expected minecraft:bell inside preset '{slug}'"
+            );
+        }
+
+        // Canal + Arched Bridge & Varied Settlement Layouts across seeds.
+        let mut saw_water_canal_or_fountain = false;
+        let mut town_counts = Vec::new();
+        for seed in 10..18 {
+            let mut req = sample_request("большой город квартал", seed);
+            req.category = BuildCategory::Settlement;
+            req.width = 48;
+            req.depth = 48;
+            req.height = 20;
+            let bp = generate_blueprint(&req, None);
+            if bp.blocks.values().any(|b| b.block_id == "minecraft:water") {
+                saw_water_canal_or_fountain = true;
+            }
+            town_counts.push(bp.non_air_count());
+        }
+        assert!(saw_water_canal_or_fountain);
+        let min_c = *town_counts.iter().min().unwrap();
+        let max_c = *town_counts.iter().max().unwrap();
+        assert!(
+            max_c - min_c > 500,
+            "Expected settlements across seeds to vary markedly in block massing, got {town_counts:?}"
+        );
+    }
+
+    #[test]
+    fn phase10_all_44_new_structures_and_72_presets_build_cleanly() {
+        use std::collections::HashMap;
+        use crate::model::RoofStyle;
+        use crate::parser::StructureTheme;
+        use crate::server_builder::{CLI_PRESETS, find_cli_preset};
+
+        assert_eq!(CLI_PRESETS.len(), 72);
+        let mut seen_new_themes: HashMap<StructureTheme, &'static str> = HashMap::new();
+
+        for (idx, &(slug, cat, style, w, d, h, desc)) in CLI_PRESETS.iter().enumerate() {
+            assert_eq!(find_cli_preset(slug).map(|p| p.0), Some(slug), "Preset slug '{slug}' must resolve");
+
+            let mut req = sample_request(desc, 9001 + idx as i64);
+            req.category = cat;
+            req.style = style;
+            req.width = w;
+            req.depth = d;
+            req.height = h;
+            req.palette = crate::parser::infer_palette_with_style_and_seed(style, desc, req.seed as u64);
+            let bp = generate_blueprint(&req, None);
+
+            assert!(
+                bp.non_air_count() > 180,
+                "Preset '{slug}' generated too few blocks ({})",
+                bp.non_air_count()
+            );
+
+            for (pos, blk) in &bp.blocks {
+                assert_ne!(
+                    blk.block_id, "minecraft:chain",
+                    "Preset '{slug}' used removed 26.3 block minecraft:chain at {pos:?}"
+                );
+                if blk.block_id.ends_with("_leaves") {
+                    assert!(
+                        blk.props.iter().any(|(k, v)| *k == "persistent" && *v == "true"),
+                        "Preset '{slug}' emitted decaying leaves {} at {pos:?}",
+                        blk.block_id
+                    );
+                }
+                if blk.block_id.ends_with("_door") && !blk.block_id.ends_with("trapdoor") {
+                    let has_half = blk.props.iter().any(|(k, v)| *k == "half" && *v == "lower");
+                    if has_half {
+                        let upper = bp.blocks.get(&[pos[0], pos[1] + 1, pos[2]]);
+                        assert!(
+                            upper.is_some_and(|u| u.block_id == blk.block_id
+                                && u.props.iter().any(|(k, v)| *k == "half" && *v == "upper")),
+                            "Preset '{slug}' has orphan lower door half at {pos:?}"
+                        );
+                    }
+                }
+            }
+
+            if idx >= 28 {
+                assert_ne!(
+                    bp.spec.theme,
+                    StructureTheme::Standard,
+                    "New preset '{slug}' must trigger a dedicated StructureTheme"
+                );
+                if let Some(prev) = seen_new_themes.insert(bp.spec.theme, slug) {
+                    panic!("Theme collision: presets '{prev}' and '{slug}' both mapped to {:?}", bp.spec.theme);
+                }
+            }
+        }
+
+        assert_eq!(
+            seen_new_themes.len(),
+            44,
+            "All 44 new StructureTheme variants must be exercised across new presets, got {}",
+            seen_new_themes.len()
+        );
+
+        let check_has_id = |slug: &str, expected_id: &str| {
+            let p = find_cli_preset(slug).unwrap();
+            let mut req = sample_request(p.6, 4242);
+            req.category = p.1;
+            req.style = p.2;
+            req.width = p.3;
+            req.depth = p.4;
+            req.height = p.5;
+            req.palette = crate::parser::infer_palette_with_style_and_seed(p.2, p.6, 4242);
+            let bp = generate_blueprint(&req, None);
+            assert!(
+                bp.blocks.values().any(|b| b.block_id == expected_id),
+                "Preset '{slug}' should contain '{expected_id}'"
+            );
+            bp
+        };
+
+        let pantheon_bp = check_has_id("pantheon", "minecraft:quartz_pillar");
+        assert_eq!(pantheon_bp.spec.roof_style, RoofStyle::Dome);
+
+        let parthenon_bp = check_has_id("parthenon", "minecraft:quartz_pillar");
+        assert!(parthenon_bp.spec.arcade_gallery);
+
+        let _ = check_has_id("ishtar_gate", "minecraft:lapis_block");
+        let _ = check_has_id("ishtar_gate", "minecraft:gold_block");
+        let _ = check_has_id("ship", "minecraft:white_wool");
+        let _ = check_has_id("station", "minecraft:rail");
+        let _ = check_has_id("mushroom", "minecraft:red_mushroom_block");
+        let _ = check_has_id("dragon", "minecraft:bone_block");
+
+        let catacombs_bp = check_has_id("catacombs", "minecraft:soul_lantern");
+        assert!(
+            catacombs_bp.blocks.keys().any(|p| p[1] <= -4),
+            "Mausoleum/catacombs must carve subterranean chamber at y <= -4"
+        );
+
+        let venice_bp = check_has_id("venice", "minecraft:water");
+        assert!(
+            venice_bp.non_air_count() > 1200,
+            "Floating Venice canal town should have extensive stilt walkways and waterfront lots"
+        );
+    }
+
+    #[test]
+    fn bilingual_ui_commands_and_presets_work_in_en_and_ru() {
+        use crate::model::{SetLangRequest, UiLang, translate_palette_name};
+        use crate::persist::MatFilter;
+        use crate::server_builder::{CLI_PRESET_DESCS_EN, cli_preset_desc, player_lang, set_player_lang};
+
+        assert_eq!(UiLang::default(), UiLang::En);
+        assert_eq!(UiLang::En.toggle(), UiLang::Ru);
+        assert_eq!(UiLang::Ru.toggle(), UiLang::En);
+        assert_eq!(UiLang::parse("en"), Some(UiLang::En));
+        assert_eq!(UiLang::parse("русский"), Some(UiLang::Ru));
+
+        let lang_req = SetLangRequest { lang: UiLang::Ru };
+        let bytes = encode_payload(&lang_req, 1024).expect("encode SetLangRequest");
+        let dec_lang: SetLangRequest = decode_payload(&bytes).expect("decode SetLangRequest");
+        assert_eq!(dec_lang, lang_req);
+
+        assert_ne!(MatFilter::All.label(UiLang::En), MatFilter::All.label(UiLang::Ru));
+        for idx in 0..MaterialPalette::PRESET_COUNT {
+            let p = MaterialPalette::preset(idx);
+            let en_name = p.display_name(UiLang::En);
+            let ru_name = p.display_name(UiLang::Ru);
+            assert_ne!(en_name, ru_name, "Preset palette #{idx} must have distinct EN and RU names");
+            assert_eq!(translate_palette_name(en_name, UiLang::Ru), ru_name);
+            assert_eq!(translate_palette_name(ru_name, UiLang::En), en_name);
+        }
+        assert_eq!(translate_palette_name("Своя палитра", UiLang::En), "Custom Palette");
+        assert_eq!(translate_palette_name("Custom Palette", UiLang::Ru), "Своя палитра");
+
+        assert_eq!(CLI_PRESETS.len(), CLI_PRESET_DESCS_EN.len());
+        for (idx, preset) in CLI_PRESETS.iter().enumerate() {
+            let en = cli_preset_desc(idx, UiLang::En);
+            let ru = cli_preset_desc(idx, UiLang::Ru);
+            assert!(!en.is_empty() && !ru.is_empty());
+            let spec_en = parse_description(preset.1, preset.2, en, preset.3, preset.4, preset.5, NoiseLevel::Balanced, 555);
+            let spec_ru = parse_description(preset.1, preset.2, ru, preset.3, preset.4, preset.5, NoiseLevel::Balanced, 555);
+            assert_eq!(
+                spec_en.theme, spec_ru.theme,
+                "EN/RU preset #{idx} ('{}') should resolve to same StructureTheme",
+                preset.0
+            );
+        }
+
+        assert_eq!(find_cli_preset("spaceport").map(|p| p.0), Some("rocket"));
+        assert_eq!(find_cli_preset("pantheon").map(|p| p.0), Some("pantheon"));
+
+        // Verify per-player language switching via `/buildgen lang ru|en` on dedicated test player 99.
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(99, 100);
+            let player = host.player(99).unwrap();
+            let level_dim = host.level("minecraft:overworld").unwrap().dimension();
+
+            set_player_lang(Some(player), UiLang::En);
+            assert_eq!(player_lang(Some(player)), UiLang::En);
+
+            let ru_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "lang".into()],
+                vec![CommandArgument::new(
+                    "lang".into(),
+                    CommandArgumentValue::String("ru".into()),
+                )],
+                level_dim,
+                [0.0, 64.0, 0.0],
+            );
+            let mut ru_ev = RunModCommandEvent {
+                command: &ru_cmd,
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut ru_ev), Flow::Cancel);
+            assert_eq!(player_lang(Some(player)), UiLang::Ru);
+            if let Some((_, raw)) = host.sent_payloads.last()
+                && let Ok(resp) = decode_payload::<crate::model::BuildResponse>(raw)
+            {
+                assert_eq!(resp.message, "__LANG__:ru");
+            }
+            let ru_build = execute_build(&mut host, Some(player), sample_request("cozy house", 12345));
+            assert!(ru_build.ok);
+            assert!(ru_build.message.contains("[отмен:"), "Expected RU feedback: {}", ru_build.message);
+
+            let en_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "lang".into()],
+                vec![CommandArgument::new(
+                    "lang".into(),
+                    CommandArgumentValue::String("en".into()),
+                )],
+                level_dim,
+                [0.0, 64.0, 0.0],
+            );
+            let mut en_ev = RunModCommandEvent {
+                command: &en_cmd,
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut en_ev), Flow::Cancel);
+            assert_eq!(player_lang(Some(player)), UiLang::En);
+            if let Some((_, raw)) = host.sent_payloads.last()
+                && let Ok(resp) = decode_payload::<crate::model::BuildResponse>(raw)
+            {
+                assert_eq!(resp.message, "__LANG__:en");
+            }
+            let en_build = execute_build(&mut host, Some(player), sample_request("cozy house", 12346));
+            assert!(en_build.ok);
+            assert!(en_build.message.contains("[undo:"), "Expected EN feedback: {}", en_build.message);
+        });
+    }
+}
