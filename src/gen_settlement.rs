@@ -522,28 +522,6 @@ pub fn generate_settlement(
         } else {
             (span_len, bw, CardinalFacing::East)
         };
-        let bridge_req = BuildRequest {
-            dimension: req.dimension.clone(),
-            origin_x: 0,
-            origin_y: 0,
-            origin_z: 0,
-            width: rw,
-            depth: rd,
-            height: height.clamp(9, 14),
-            category: BuildCategory::Bridge,
-            style: spec.style,
-            facing,
-            noise_level: req.noise_level,
-            seed: (req.seed as u64 ^ (0xA91E_5500 + bi as u64)).cast_signed(),
-            description: bridge_desc.into(),
-            adapt_terrain: false,
-            air_only: req.air_only,
-            wear_pct: 0,
-            overgrowth_pct: 0,
-            biome_hint: req.biome_hint.clone(),
-            palette: pal.clone(),
-        };
-        let bbp = crate::generator::generate_blueprint_with_water(&bridge_req, None, None);
         let mid = (s + e) / 2;
         let bx0 = if along_z {
             fixed_coord - i32::from(rw) / 2
@@ -555,6 +533,58 @@ pub fn generate_settlement(
         } else {
             fixed_coord - i32::from(rd) / 2
         };
+        let bank_y_a = if along_z {
+            let z_edge = (bz0 - 1).clamp(1, d - 2);
+            road_y_grid[(z_edge * w + fixed_coord.clamp(1, w - 2)) as usize]
+        } else {
+            let x_edge = (bx0 - 1).clamp(1, w - 2);
+            road_y_grid[(fixed_coord.clamp(1, d - 2) * w + x_edge) as usize]
+        };
+        let bank_y_b = if along_z {
+            let z_edge = (bz0 + i32::from(rd)).clamp(1, d - 2);
+            road_y_grid[(z_edge * w + fixed_coord.clamp(1, w - 2)) as usize]
+        } else {
+            let x_edge = (bx0 + i32::from(rw)).clamp(1, w - 2);
+            road_y_grid[(fixed_coord.clamp(1, d - 2) * w + x_edge) as usize]
+        };
+        let mut bridge_terrain = vec![0i32; usize::from(rw) * usize::from(rd)];
+        for bz in 0..i32::from(rd) {
+            for bx in 0..i32::from(rw) {
+                let t = if along_z {
+                    bz as f64 / i32::from(rd).saturating_sub(1).max(1) as f64
+                } else {
+                    bx as f64 / i32::from(rw).saturating_sub(1).max(1) as f64
+                };
+                bridge_terrain[(bz * i32::from(rw) + bx) as usize] =
+                    (bank_y_a as f64 + t * (bank_y_b - bank_y_a) as f64).round() as i32;
+            }
+        }
+        let bridge_req = BuildRequest {
+            dimension: req.dimension.clone(),
+            origin_x: 0,
+            origin_y: 0,
+            origin_z: 0,
+            width: rw,
+            depth: rd,
+            height: height.clamp(10, 15),
+            category: BuildCategory::Bridge,
+            style: spec.style,
+            facing,
+            noise_level: req.noise_level,
+            seed: (req.seed as u64 ^ (0xA91E_5500 + bi as u64)).cast_signed(),
+            description: bridge_desc.into(),
+            adapt_terrain: true,
+            air_only: req.air_only,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            biome_hint: req.biome_hint.clone(),
+            palette: pal.clone(),
+        };
+        let bbp = crate::generator::generate_blueprint_with_water(
+            &bridge_req,
+            Some(&bridge_terrain),
+            None,
+        );
         for ([bx, by, bz], blk) in bbp.blocks {
             if blk.block_id == "minecraft:air" && by <= 0 {
                 continue;
@@ -562,7 +592,7 @@ pub fn generate_settlement(
             let wx = bx0 + bx;
             let wz = bz0 + bz;
             if (1..(w - 1)).contains(&wx) && (1..(d - 1)).contains(&wz) {
-                blocks.insert([wx, by - 1, wz], blk);
+                blocks.insert([wx, by, wz], blk);
             }
         }
     }
@@ -592,14 +622,14 @@ pub fn generate_settlement(
             origin_z: 0,
             width: bw,
             depth: 9,
-            height: height.clamp(8, 12),
+            height: height.clamp(9, 13),
             category: BuildCategory::Bridge,
             style: spec.style,
             facing: CardinalFacing::South,
             noise_level: req.noise_level,
             seed: (req.seed as u64 ^ 0xB41D_6E00_1122).cast_signed(),
             description: "арочный каменный мост через канал".into(),
-            adapt_terrain: req.adapt_terrain,
+            adapt_terrain: false,
             air_only: req.air_only,
             wear_pct: 0,
             overgrowth_pct: 0,
@@ -610,10 +640,13 @@ pub fn generate_settlement(
         let bx0 = cx - i32::from(bw) / 2;
         let bz0 = cz - 4;
         for ([bx, by, bz], blk) in bridge_bp.blocks {
+            if blk.block_id == "minecraft:air" && by <= 0 {
+                continue;
+            }
             let wx = bx0 + bx;
             let wz = bz0 + bz;
             if (0..w).contains(&wx) && (0..d).contains(&wz) {
-                blocks.insert([wx, plaza_y + by - 2, wz], blk);
+                blocks.insert([wx, plaza_y + by, wz], blk);
             }
         }
     } else if town_mode == 2 {

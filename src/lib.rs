@@ -4266,4 +4266,173 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn v041_bridge_walkability_and_headroom_work() {
+        let cases: &[(&str, BuildStyle, u16, u16, u16, i32)] = &[
+            ("крепостной разводной мост со сторожевыми башнями", BuildStyle::Desert, 13, 27, 10, -1),
+            ("крепостной разводной мост со сторожевыми башнями", BuildStyle::Medieval, 15, 36, 12, 0),
+            ("деревянный крытый мост", BuildStyle::Cottage, 11, 25, 10, -1),
+            ("деревянный крытый мост", BuildStyle::Japanese, 9, 19, 12, 0),
+            ("японский горбатый лунный мост тайко с воротами тории", BuildStyle::Japanese, 13, 29, 12, -1),
+            ("римский двухъярусный акведук мост с каналом воды", BuildStyle::Classical, 9, 25, 11, -1),
+            ("римский двухъярусный акведук мост с каналом воды", BuildStyle::Classical, 15, 35, 16, 0),
+            ("вантовый подвесной мост с пилонами и канатами", BuildStyle::Modern, 15, 35, 14, -1),
+            ("деревянный понтонный пирс пристань мост", BuildStyle::Nordic, 11, 25, 10, -1),
+            ("арочный каменный мост", BuildStyle::Gothic, 13, 29, 11, -1),
+        ];
+
+        for &(desc, style, w, d, h, bank_terr) in cases {
+            for &use_terrain in &[true, false] {
+                let offs = use_terrain.then(|| vec![bank_terr; usize::from(w) * usize::from(d)]);
+                for &seed in &[101_i64, 4242, 99_999] {
+                    let mut req = sample_request(desc, seed);
+                    req.category = BuildCategory::Bridge;
+                    req.style = style;
+                    req.width = w;
+                    req.depth = d;
+                    req.height = h;
+                    req.adapt_terrain = use_terrain;
+                    req.biome_hint = if style == BuildStyle::Desert {
+                        "minecraft:desert".into()
+                    } else {
+                        String::new()
+                    };
+                    req.palette = MaterialPalette::preset_for_style(style);
+
+                    let bp = generate_blueprint(&req, offs.as_deref());
+                    let cx = i32::from(w) / 2;
+
+                    let walkway_candidates = |lx: i32, lz: i32| -> Vec<f64> {
+                        let mut cands = Vec::new();
+                        for y in -6..i32::from(h) {
+                            let Some(blk) = bp.blocks.get(&[lx, y, lz]) else {
+                                continue;
+                            };
+                            let id = blk.block_id.as_str();
+                            if id == "minecraft:air" || id == "minecraft:water" {
+                                continue;
+                            }
+                            let clear_1 = bp.blocks.get(&[lx, y + 1, lz]).is_none_or(|b| b.block_id == "minecraft:air");
+                            let clear_2 = bp.blocks.get(&[lx, y + 2, lz]).is_none_or(|b| b.block_id == "minecraft:air");
+                            if clear_1 && clear_2 {
+                                let top = if id.ends_with("_slab")
+                                    && blk.props.iter().any(|&(k, v)| k == "type" && v == "bottom")
+                                {
+                                    f64::from(y) + 0.5
+                                } else {
+                                    f64::from(y) + 1.0
+                                };
+                                cands.push(top);
+                            }
+                        }
+                        cands
+                    };
+
+                    // Walk continuously along centerline Z from bank 0 to bank d-1 without hitting roofs/lintels.
+                    let ext_ground_top = if use_terrain { f64::from(bank_terr) + 1.0 } else { 1.0 };
+                    let mut prev_top: Option<f64> = None;
+                    for lz in 0..i32::from(d) {
+                        let target_ref = prev_top.unwrap_or(ext_ground_top);
+                        let center_cands = walkway_candidates(cx, lz);
+                        let center_top = center_cands
+                            .iter()
+                            .copied()
+                            .min_by(|a, b| {
+                                (a - target_ref)
+                                    .abs()
+                                    .partial_cmp(&(b - target_ref).abs())
+                                    .unwrap()
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Bridge '{desc}' seed={seed} h={h} terrain={use_terrain}: no walkable deck at center z={lz}"
+                                )
+                            });
+
+                        if lz == 0 || lz == i32::from(d) - 1 {
+                            let max_entry = if use_terrain { 0.55 } else { 1.01 };
+                            assert!(
+                                (center_top - ext_ground_top).abs() <= max_entry,
+                                "Bridge '{desc}' seed={seed} h={h} terrain={use_terrain}: bank entrance z={lz} center_top={center_top} vs ext_ground={ext_ground_top}"
+                            );
+                        }
+                        if let Some(pt) = prev_top {
+                            assert!(
+                                (center_top - pt).abs() <= 1.01,
+                                "Bridge '{desc}' seed={seed} h={h}: steep jump {pt} -> {center_top} at z={lz}"
+                            );
+                        }
+
+                        // All 3 central lanes (cx-1..=cx+1) must be unobstructed with >= 3.0 headroom at deck level!
+                        for lx in (cx - 1)..=(cx + 1) {
+                            let cands = walkway_candidates(lx, lz);
+                            let lane_top = cands
+                                .iter()
+                                .copied()
+                                .min_by(|a, b| {
+                                    (a - center_top)
+                                        .abs()
+                                        .partial_cmp(&(b - center_top).abs())
+                                        .unwrap()
+                                })
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Bridge '{desc}' seed={seed} h={h} terrain={use_terrain}: blocked walkway lane x={lx} z={lz} near center_top={center_top}"
+                                    )
+                                });
+                            assert!(
+                                (lane_top - center_top).abs() <= 0.55,
+                                "Bridge '{desc}' seed={seed} h={h}: lane x={lx} z={lz} misaligned lane_top={lane_top} vs center_top={center_top}"
+                            );
+                            let base_block_y = (lane_top - 0.01).floor() as i32;
+                            for cy in (base_block_y + 1)..=(base_block_y + 3).min(i32::from(h) - 1) {
+                                let blk = bp.blocks.get(&[lx, cy, lz]);
+                                assert!(
+                                    blk.is_none_or(|b| b.block_id == "minecraft:air"),
+                                    "Bridge '{desc}' seed={seed} h={h} terrain={use_terrain}: head obstacle {:?} at [{lx},{cy},{lz}] above tread top={lane_top}",
+                                    blk.map(|b| &b.block_id)
+                                );
+                            }
+                        }
+
+                        prev_top = Some(center_top);
+                    }
+                }
+            }
+        }
+
+        // Asymmetric river bank heights (-2 on north, +2 on south) stay flush at both ends!
+        let w = 13u16;
+        let d = 25u16;
+        let mut asym = vec![0i32; usize::from(w) * usize::from(d)];
+        for lz in 0..i32::from(d) {
+            let y = if lz < 5 {
+                -2
+            } else if lz > 19 {
+                2
+            } else {
+                -4
+            };
+            for lx in 0..i32::from(w) {
+                asym[(lz * i32::from(w) + lx) as usize] = y;
+            }
+        }
+        let mut req = sample_request("крепостной разводной мост со сторожевыми башнями", 31415);
+        req.category = BuildCategory::Bridge;
+        req.width = w;
+        req.depth = d;
+        req.height = 14;
+        req.adapt_terrain = true;
+        let bp = generate_blueprint(&req, Some(&asym));
+        let cx = i32::from(w) / 2;
+        assert!(
+            bp.blocks.get(&[cx, -2, 0]).is_some_and(|b| b.block_id != "minecraft:air"),
+            "North bank z=0 must anchor at terr=-2"
+        );
+        assert!(
+            bp.blocks.get(&[cx, 2, i32::from(d) - 1]).is_some_and(|b| b.block_id != "minecraft:air"),
+            "South bank z=end must anchor at terr=+2"
+        );
+    }
 }

@@ -417,8 +417,10 @@ pub(crate) fn apply_weathering_and_overgrowth(
             }
         }
 
-        // Drop partial rubble onto exposed floor/ground below eroded upper blocks (max ~22% so ruined remains lighter).
-        if wear >= 0.20 {
+        // Drop partial rubble onto exposed floor/ground below eroded upper blocks (keep bridges walkable below 70% wear).
+        if wear >= 0.20
+            && (bp.spec.category != crate::model::BuildCategory::Bridge || wear >= 0.70)
+        {
             let mut placed_rubble: HashSet<[i32; 2]> = HashSet::new();
             for ep in eroded_cols {
                 if !placed_rubble.insert([ep[0], ep[2]]) {
@@ -515,8 +517,8 @@ pub(crate) fn apply_weathering_and_overgrowth(
             }
         }
 
-        // B. Exterior wall climbing leaf mounds & ground-hugging bushes.
-        if over >= 0.22 {
+        // B. Exterior wall climbing leaf mounds & ground-hugging bushes (keep bridge decks clear).
+        if over >= 0.22 && bp.spec.category != crate::model::BuildCategory::Bridge {
             let dirs = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
             let mut leaf_spots = Vec::new();
             for (&pos, blk) in &bp.blocks {
@@ -648,8 +650,13 @@ pub(crate) fn apply_weathering_and_overgrowth(
             }
         }
 
-        // E. Heavy overgrowth (>= 65%): occasional compact wild shrubs/trees reclaiming open ruin ground.
-        if over >= 0.65 && !arid && w >= 11 && d >= 11 {
+        // E. Heavy overgrowth (>= 65%): occasional compact wild shrubs/trees reclaiming open ruin ground (skip narrow bridge roadways).
+        if over >= 0.65
+            && !arid
+            && w >= 11
+            && d >= 11
+            && bp.spec.category != crate::model::BuildCategory::Bridge
+        {
             let shrub_budget = ((w * d) / 140).clamp(1, 5) as usize;
             let mut placed_shrubs = 0usize;
             for _attempt in 0..(shrub_budget * 6) {

@@ -140,9 +140,77 @@ fn pick_stair_for_slot(
     half: &'static str,
 ) -> PlannedBlock {
     let blk_id = pal.pick(slot, seed, u, y, v);
+    let fallback_slot = if slot == MaterialPalette::SLOT_ROOF {
+        MaterialPalette::SLOT_ROOF
+    } else {
+        MaterialPalette::SLOT_STAIR_BLOCK
+    };
     let stair_id = MaterialPalette::resolve_stair_id(&blk_id)
-        .unwrap_or_else(|| pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, u, y, v));
+        .or_else(|| {
+            MaterialPalette::resolve_stair_id(&pal.pick(
+                MaterialPalette::SLOT_FOUNDATION,
+                seed,
+                u,
+                y,
+                v,
+            ))
+        })
+        .unwrap_or_else(|| pal.pick_stair(fallback_slot, seed, u, y, v));
     make_stair(&stair_id, facing, half)
+}
+
+fn sample_bank_terr(
+    ax: BridgeAxes,
+    terrain_offsets: Option<&[i32]>,
+    c0: i32,
+    c1: i32,
+    along: i32,
+) -> Option<i32> {
+    let offs = terrain_offsets?;
+    let lo = (c0 + 1).min(c1);
+    let hi = (c1 - 1).max(lo);
+    let mut ys = Vec::with_capacity((hi - lo + 1) as usize);
+    for c in lo..=hi {
+        ys.push(ax.terr(Some(offs), c, along).clamp(-5, 6));
+    }
+    if ys.is_empty() {
+        ys.push(ax.terr(Some(offs), (c0 + c1) / 2, along).clamp(-5, 6));
+    }
+    ys.sort_unstable();
+    Some(ys[ys.len() / 2])
+}
+
+fn variant_headroom_reserve(variant: BridgeVariant) -> i32 {
+    match variant {
+        BridgeVariant::FortifiedGate
+        | BridgeVariant::CoveredTimber
+        | BridgeVariant::Aqueduct
+        | BridgeVariant::Suspension => 6,
+        BridgeVariant::TaikoMoon
+        | BridgeVariant::PontoonPier
+        | BridgeVariant::MasonryArch
+        | BridgeVariant::GothicRibbedArch
+        | BridgeVariant::GrandSingleArch => 5,
+    }
+}
+
+fn compute_walk_top_profile(deck_profile: &[i32]) -> Vec<i32> {
+    let n = deck_profile.len();
+    let mut top = Vec::with_capacity(n);
+    for i in 0..n {
+        let dy = deck_profile[i];
+        let prev = if i > 0 { deck_profile[i - 1] } else { dy };
+        let next = if i + 1 < n { deck_profile[i + 1] } else { dy };
+        let has_step = next > dy || prev > dy;
+        top.push(dy + i32::from(has_step));
+    }
+    top
+}
+
+fn max_walk_window(walk_top: &[i32], center: i32, radius: i32) -> i32 {
+    let lo = (center - radius).max(0) as usize;
+    let hi = (center + radius).min(walk_top.len() as i32 - 1) as usize;
+    walk_top[lo..=hi].iter().copied().max().unwrap_or(0)
 }
 
 /// Computes bridge cross-section bounds `c0..=c1` utilizing large requested widths proportionally.
@@ -236,51 +304,69 @@ fn compute_arch_spans(
     spans
 }
 
-/// Computes deck elevation curve `deck_y[along]` for the full bridge length.
+/// Computes deck elevation curve `deck_y[along]` anchored cleanly to each bank's ground level.
 fn compute_deck_profile(
     ax: BridgeAxes,
     variant: BridgeVariant,
     spans: &[(i32, i32)],
+    c0: i32,
+    c1: i32,
     terrain_offsets: Option<&[i32]>,
     rng: &mut SplitMix64,
 ) -> Vec<i32> {
     let along_len = ax.along_len;
-    let mid_c = ax.cross_len / 2;
-    let end_terr_a = ax.terr(terrain_offsets, mid_c, 0);
-    let end_terr_b = ax.terr(terrain_offsets, mid_c, along_len - 1);
-    let end_anchor_y = ((end_terr_a + end_terr_b) / 2 + 1).clamp(1, (ax.height - 4).max(1));
+    let reserve = variant_headroom_reserve(variant);
+    let max_deck_ceiling = (ax.height - reserve).max(1).min(ax.height - 3).max(-2);
+
+    let raw_a = sample_bank_terr(ax, terrain_offsets, c0, c1, 0).unwrap_or(0);
+    let raw_b = sample_bank_terr(ax, terrain_offsets, c0, c1, along_len - 1).unwrap_or(0);
+    let mut end_y_a = raw_a.clamp(-4, max_deck_ceiling);
+    let mut end_y_b = raw_b.clamp(-4, max_deck_ceiling);
+    let max_diff = (along_len - 1).max(0);
+    if (end_y_b - end_y_a).abs() > max_diff {
+        let mid_end = (end_y_a + end_y_b) / 2;
+        let half_d = max_diff / 2;
+        end_y_a = end_y_a.clamp(mid_end - half_d, mid_end + half_d);
+        end_y_b = end_y_b.clamp(mid_end - half_d, mid_end + half_d);
+    }
+    let bank_hi = end_y_a.max(end_y_b);
 
     let base_high = match variant {
-        BridgeVariant::PontoonPier => (end_anchor_y + 1).clamp(2, 3),
-        BridgeVariant::Aqueduct => ((ax.height * 36) / 100).clamp(4, (ax.height - 7).max(4)),
-        BridgeVariant::TaikoMoon => (end_anchor_y + 1).clamp(2, (ax.height - 6).max(2)),
+        BridgeVariant::PontoonPier => (bank_hi + 1).clamp(bank_hi, (bank_hi + 2).min(max_deck_ceiling)),
+        BridgeVariant::Aqueduct => {
+            (bank_hi + ((ax.height * 22) / 100).clamp(2, 5)).min(max_deck_ceiling)
+        }
+        BridgeVariant::TaikoMoon => (bank_hi + 1).min(max_deck_ceiling),
         BridgeVariant::GrandSingleArch => {
-            let lo = (ax.height / 3).clamp(3, 6);
-            let hi = ((ax.height * 55) / 100).clamp(lo, (ax.height - 4).max(lo));
+            let lo = (bank_hi + 2).min(max_deck_ceiling);
+            let hi = (bank_hi + 5).clamp(lo, max_deck_ceiling);
             rng.range_i32(lo, hi)
         }
-        BridgeVariant::Suspension => ((ax.height * 35) / 100).clamp(4, (ax.height - 8).max(4)),
+        BridgeVariant::Suspension => {
+            (bank_hi + ((ax.height * 22) / 100).clamp(2, 5)).min(max_deck_ceiling)
+        }
         BridgeVariant::CoveredTimber => {
-            let lo = (ax.height / 4).clamp(2, 4);
-            let hi = ((ax.height * 40) / 100).clamp(lo, (ax.height - 5).max(lo));
+            let lo = (bank_hi + 1).min(max_deck_ceiling);
+            let hi = (bank_hi + 3).clamp(lo, max_deck_ceiling);
             rng.range_i32(lo, hi)
         }
-        _ => {
-            let lo = (ax.height / 3).clamp(3, 5);
-            let hi = ((ax.height * 58) / 100).clamp(lo, (ax.height - 5).max(lo));
+        BridgeVariant::MasonryArch | BridgeVariant::GothicRibbedArch | BridgeVariant::FortifiedGate => {
+            let lo = (bank_hi + 2).min(max_deck_ceiling);
+            let hi = (bank_hi + 4).clamp(lo, max_deck_ceiling);
             rng.range_i32(lo, hi)
         }
     };
 
+    let headroom_left = (max_deck_ceiling - base_high).max(0);
     let camber = match variant {
         BridgeVariant::PontoonPier | BridgeVariant::Aqueduct => 0,
-        BridgeVariant::TaikoMoon => (ax.height - base_high - 3).clamp(3, 7),
-        BridgeVariant::GrandSingleArch => (ax.height - base_high - 3).clamp(1, 4),
-        BridgeVariant::Suspension => (ax.height / 7).clamp(1, 3),
-        BridgeVariant::CoveredTimber => rng.range_i32(1, 2),
+        BridgeVariant::TaikoMoon => headroom_left.min(6).max(if headroom_left >= 3 { 3 } else { headroom_left }),
+        BridgeVariant::GrandSingleArch => headroom_left.min(4),
+        BridgeVariant::Suspension => headroom_left.min((ax.height / 7).clamp(1, 3)),
+        BridgeVariant::CoveredTimber => headroom_left.min(rng.range_i32(1, 2)),
         BridgeVariant::MasonryArch | BridgeVariant::GothicRibbedArch | BridgeVariant::FortifiedGate => {
-            if rng.next_f64() < 0.68 {
-                rng.range_i32(1, (ax.height - base_high - 3).clamp(1, 3))
+            if headroom_left > 0 && rng.next_f64() < 0.68 {
+                rng.range_i32(1, headroom_left.min(3))
             } else {
                 0
             }
@@ -289,33 +375,59 @@ fn compute_deck_profile(
 
     let span_start = spans.first().map_or(2, |s| s.0);
     let span_end = spans.last().map_or(along_len - 3, |s| s.1);
+    let flat_ends = along_len >= 9 && (end_y_a - end_y_b).abs() <= along_len - 3;
     let mut profile = vec![base_high; along_len as usize];
 
     for along in 0..along_len {
-        let mut y = if variant == BridgeVariant::TaikoMoon || camber >= 3 {
-            let t = along as f64 / (along_len - 1).max(1) as f64;
+        let mut y = if along == 0 {
+            end_y_a
+        } else if along == along_len - 1 {
+            end_y_b
+        } else if flat_ends && along == 1 {
+            end_y_a
+        } else if flat_ends && along == along_len - 2 {
+            end_y_b
+        } else if variant == BridgeVariant::TaikoMoon || camber >= 3 {
+            let ramp0 = if flat_ends { 1 } else { 0 };
+            let ramp1 = if flat_ends { along_len - 2 } else { along_len - 1 };
+            let denom = (ramp1 - ramp0).max(1) as f64;
+            let t = ((along - ramp0) as f64 / denom).clamp(0.0, 1.0);
+            let edge_y = (end_y_a as f64) * (1.0 - t) + (end_y_b as f64) * t;
             let arch_curve = (std::f64::consts::PI * t).sin().powf(0.88);
-            let target_peak = (base_high + camber).min(ax.height - 3);
-            (end_anchor_y as f64 + (target_peak - end_anchor_y) as f64 * arch_curve).round() as i32
+            let target_peak = (base_high + camber).min(max_deck_ceiling);
+            (edge_y + (target_peak as f64 - edge_y) * arch_curve).round() as i32
         } else if along < span_start {
-            let d = (span_start - along) as f64 / span_start.max(1) as f64;
-            let ramp_y = (base_high as f64 - d * (base_high - end_anchor_y).max(0) as f64).round() as i32;
-            ramp_y.max(end_anchor_y)
+            let start_i = if flat_ends { 1 } else { 0 };
+            let d = (span_start - along) as f64 / (span_start - start_i).max(1) as f64;
+            let ramp_y = (base_high as f64 - d * (base_high - end_y_a).max(0) as f64).round() as i32;
+            ramp_y.max(end_y_a)
         } else if along > span_end {
-            let rem = (along_len - 1 - span_end).max(1);
+            let end_i = if flat_ends { along_len - 2 } else { along_len - 1 };
+            let rem = (end_i - span_end).max(1);
             let d = (along - span_end) as f64 / rem as f64;
-            let ramp_y = (base_high as f64 - d * (base_high - end_anchor_y).max(0) as f64).round() as i32;
-            ramp_y.max(end_anchor_y)
+            let ramp_y = (base_high as f64 - d * (base_high - end_y_b).max(0) as f64).round() as i32;
+            ramp_y.max(end_y_b)
         } else {
             let t = (along - span_start) as f64 / (span_end - span_start).max(1) as f64;
             let hump = (std::f64::consts::PI * t).sin();
             base_high + (hump * f64::from(camber)).round() as i32
         };
 
-        y = y.clamp(1, (ax.height - 2).max(1));
+        let (dist_a, dist_b) = if flat_ends {
+            ((along - 1).max(0), (along_len - 2 - along).max(0))
+        } else {
+            (along, along_len - 1 - along)
+        };
+        let lo_env = (end_y_a - dist_a).max(end_y_b - dist_b).max(-5);
+        let hi_env = (end_y_a + dist_a).min(end_y_b + dist_b).min(max_deck_ceiling);
+        y = y.clamp(lo_env.min(hi_env), hi_env);
         profile[along as usize] = y;
     }
 
+    profile[0] = end_y_a;
+    if let Some(last) = profile.last_mut() {
+        *last = end_y_b;
+    }
     for i in 1..profile.len() {
         let prev = profile[i - 1];
         if profile[i] > prev + 1 {
@@ -328,6 +440,8 @@ fn compute_deck_profile(
         let next = profile[i + 1];
         if profile[i] > next + 1 {
             profile[i] = next + 1;
+        } else if profile[i] < next - 1 {
+            profile[i] = next - 1;
         }
     }
 
@@ -365,7 +479,7 @@ fn compute_arch_void_ceiling(
     (min_clear as f64 + shape * rise).round() as i32
 }
 
-/// Places a decorative/structural bridge pylon or castle gatehouse turret spanning `[cross0..=cross1]`.
+/// Places a decorative/structural bridge pylon or castle gatehouse turret spanning `[c0..=c1]` with guaranteed headroom.
 #[allow(clippy::too_many_arguments)]
 fn build_bridge_tower(
     ax: BridgeAxes,
@@ -375,29 +489,45 @@ fn build_bridge_tower(
     c0: i32,
     c1: i32,
     along_center: i32,
-    deck_y: i32,
+    deck_profile: &[i32],
+    walk_top: &[i32],
     top_y: i32,
     portal_half_w: i32,
     point_spire: bool,
 ) {
     let mid_c = (c0 + c1) / 2;
-    let portal_top = (deck_y + 4).min(top_y - 2);
+    let center_dy = deck_profile[along_center as usize];
+    let min_dy = (-1..=1)
+        .filter_map(|da| {
+            let a = along_center + da;
+            (0..ax.along_len).contains(&a).then(|| deck_profile[a as usize])
+        })
+        .min()
+        .unwrap_or(center_dy);
+    let max_walk = max_walk_window(walk_top, along_center, 1);
+    let eff_top_y = top_y.max(max_walk + 6).min(ax.height - 2);
+    let portal_top = (max_walk + 5).min(eff_top_y - 2);
+    let has_arch_roof = portal_top >= max_walk + 4 && eff_top_y >= portal_top + 1;
     let pier_width_c0 = (c0 - 1).max(0);
     let pier_width_c1 = (c1 + 1).min(ax.cross_len - 1);
+    let base_anchor = (min_dy - 4).max(-6);
 
     for da in -1..=1 {
         let a = along_center + da;
         if a < 0 || a >= ax.along_len {
             continue;
         }
-        for c in [pier_width_c0, c0, c0 + 1, c1 - 1, c1, pier_width_c1] {
+        let slice_dy = deck_profile[a as usize];
+        let slice_walk = walk_top[a as usize];
+
+        for c in pier_width_c0..=pier_width_c1 {
             if c < 0 || c >= ax.cross_len || (c - mid_c).abs() <= portal_half_w {
                 continue;
             }
-            for y in -2..=top_y {
-                let blk = if y < deck_y {
+            for y in base_anchor..=eff_top_y {
+                let blk = if y < slice_dy {
                     PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, y, a))
-                } else if y == portal_top || y == top_y {
+                } else if y == portal_top || y == eff_top_y {
                     PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, c, y, a))
                 } else if c == pier_width_c0 || c == pier_width_c1 {
                     make_frame_block_at(pal, "y", seed, c, y, a)
@@ -411,16 +541,16 @@ fn build_bridge_tower(
                     blocks,
                     c,
                     a,
-                    top_y + 1,
-                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, c, top_y + 1, a)),
+                    eff_top_y + 1,
+                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, c, eff_top_y + 1, a)),
                 );
-                if point_spire && top_y + 2 < ax.height {
+                if point_spire && eff_top_y + 2 < ax.height {
                     ax.set(
                         blocks,
                         c,
                         a,
-                        top_y + 2,
-                        make_bridge_light(pal.pick(MaterialPalette::SLOT_LIGHT, seed, c, top_y + 2, a), false),
+                        eff_top_y + 2,
+                        make_bridge_light(pal.pick(MaterialPalette::SLOT_LIGHT, seed, c, eff_top_y + 2, a), false),
                     );
                 }
             } else if da != 0 && (c == pier_width_c0 || c == pier_width_c1) {
@@ -428,8 +558,8 @@ fn build_bridge_tower(
                     blocks,
                     c,
                     a,
-                    top_y + 1,
-                    make_slab(&pal.pick(MaterialPalette::SLOT_ROOF, seed, c, top_y + 1, a), "bottom"),
+                    eff_top_y + 1,
+                    make_slab(&pal.pick(MaterialPalette::SLOT_ROOF, seed, c, eff_top_y + 1, a), "bottom"),
                 );
             }
         }
@@ -439,74 +569,87 @@ fn build_bridge_tower(
                 continue;
             }
             let edge_dist = portal_half_w - (c - mid_c).abs();
-            let local_arch_y = portal_top - if edge_dist == 0 { 1 } else { 0 };
-            for y in (deck_y + 1)..=top_y {
-                if y < local_arch_y {
-                    ax.set(blocks, c, a, y, PlannedBlock::simple("minecraft:air"));
-                } else if y == local_arch_y && da == 0 && edge_dist == 0 {
-                    let face = if c < mid_c {
-                        ax.dir_cross_pos()
-                    } else {
-                        ax.dir_cross_neg()
-                    };
-                    ax.set(
-                        blocks,
-                        c,
-                        a,
-                        y,
-                        pick_stair_for_slot(pal, MaterialPalette::SLOT_FOUNDATION, seed, c, y, a, face, "top"),
-                    );
-                } else if y == local_arch_y && da.abs() == 1 {
-                    ax.set(blocks, c, a, y, PlannedBlock::simple("minecraft:iron_bars"));
-                } else if y > local_arch_y {
-                    let is_window = da == 0 && c == mid_c && y == top_y - 1 && top_y - local_arch_y >= 2;
-                    let blk = if is_window {
-                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WINDOW_ACCENT, seed, c, y, a))
-                    } else if y == top_y {
-                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, c, y, a))
-                    } else {
-                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, y, a))
-                    };
-                    ax.set(blocks, c, a, y, blk);
-                }
+            let local_arch_y = if edge_dist == 0 && portal_top - 1 >= max_walk + 4 {
+                portal_top - 1
+            } else {
+                portal_top
+            };
+            let clear_end = if has_arch_roof { local_arch_y } else { eff_top_y + 1 };
+            for y in (slice_walk + 1)..clear_end {
+                ax.set(blocks, c, a, y, PlannedBlock::simple("minecraft:air"));
             }
-            if top_y + 1 < ax.height && ((c + da).abs() % 2 == 0 || point_spire) {
-                if point_spire {
-                    let ridge_h = (portal_half_w - (c - mid_c).abs()).min(2) + 1;
-                    for ry in 1..=ridge_h {
-                        if top_y + ry < ax.height {
+            if has_arch_roof {
+                for y in local_arch_y..=eff_top_y {
+                    if y == local_arch_y {
+                        if da == 0 && edge_dist == 0 && local_arch_y < portal_top {
+                            let face = if c < mid_c {
+                                ax.dir_cross_pos()
+                            } else {
+                                ax.dir_cross_neg()
+                            };
                             ax.set(
                                 blocks,
                                 c,
                                 a,
-                                top_y + ry,
-                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, c, top_y + ry, a)),
+                                y,
+                                pick_stair_for_slot(pal, MaterialPalette::SLOT_FOUNDATION, seed, c, y, a, face, "top"),
                             );
+                        } else if da.abs() == 1 {
+                            ax.set(blocks, c, a, y, PlannedBlock::simple("minecraft:iron_bars"));
+                        } else {
+                            ax.set(blocks, c, a, y, PlannedBlock::simple("minecraft:air"));
                         }
+                    } else {
+                        let is_window = da == 0 && c == mid_c && y == eff_top_y - 1 && eff_top_y - local_arch_y >= 2;
+                        let blk = if is_window {
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WINDOW_ACCENT, seed, c, y, a))
+                        } else if y == eff_top_y {
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, c, y, a))
+                        } else {
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, y, a))
+                        };
+                        ax.set(blocks, c, a, y, blk);
                     }
-                } else if (c + a).abs() % 2 == 0 {
-                    ax.set(
-                        blocks,
-                        c,
-                        a,
-                        top_y + 1,
-                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, c, top_y + 1, a)),
-                    );
-                } else {
-                    ax.set(
-                        blocks,
-                        c,
-                        a,
-                        top_y + 1,
-                        make_slab(&pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, top_y + 1, a), "bottom"),
-                    );
+                }
+                if eff_top_y + 1 < ax.height && ((c + da).abs() % 2 == 0 || point_spire) {
+                    if point_spire {
+                        let ridge_h = (portal_half_w - (c - mid_c).abs()).min(2) + 1;
+                        for ry in 1..=ridge_h {
+                            if eff_top_y + ry < ax.height {
+                                ax.set(
+                                    blocks,
+                                    c,
+                                    a,
+                                    eff_top_y + ry,
+                                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, c, eff_top_y + ry, a)),
+                                );
+                            }
+                        }
+                    } else if (c + a).abs() % 2 == 0 {
+                        ax.set(
+                            blocks,
+                            c,
+                            a,
+                            eff_top_y + 1,
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, c, eff_top_y + 1, a)),
+                        );
+                    } else {
+                        ax.set(
+                            blocks,
+                            c,
+                            a,
+                            eff_top_y + 1,
+                            make_slab(&pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, eff_top_y + 1, a), "bottom"),
+                        );
+                    }
                 }
             }
         }
     }
 }
 
-/// Builds a Japanese scarlet/timber Torii gate at road position `along_center`.
+/// Builds a Japanese scarlet/timber Torii gate at road position `along_center` with guaranteed headroom.
+#[allow(clippy::too_many_arguments)]
 fn build_torii_portal(
     ax: BridgeAxes,
     blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
@@ -516,13 +659,15 @@ fn build_torii_portal(
     c1: i32,
     along_center: i32,
     deck_y: i32,
+    walk_top: &[i32],
 ) {
     let mid_c = (c0 + c1) / 2;
     let col_off = ((c1 - c0) / 2 - 1).clamp(2, 4);
     let col_left = (mid_c - col_off).max(c0);
     let col_right = (mid_c + col_off).min(c1);
-    let gate_h = (deck_y + 5).min(ax.height - 2);
-    if gate_h <= deck_y + 2 {
+    let local_walk = max_walk_window(walk_top, along_center, 1);
+    let gate_h = (local_walk + 6).min(ax.height - 2);
+    if gate_h <= local_walk + 2 {
         return;
     }
 
@@ -545,6 +690,24 @@ fn build_torii_portal(
         }
     }
 
+    if gate_h - 1 < local_walk + 4 {
+        if gate_h + 1 < ax.height {
+            for col_c in [col_left, col_right] {
+                ax.set(
+                    blocks,
+                    col_c,
+                    along_center,
+                    gate_h + 1,
+                    make_bridge_light(
+                        pal.pick(MaterialPalette::SLOT_LIGHT, seed, col_c, gate_h + 1, along_center),
+                        false,
+                    ),
+                );
+            }
+        }
+        return;
+    }
+
     let beam_axis = ax.axis_cross();
     for c in (col_left - 1).max(0)..=(col_right + 1).min(ax.cross_len - 1) {
         ax.set(
@@ -562,7 +725,7 @@ fn build_torii_portal(
         gate_h,
         PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, mid_c, gate_h, along_center)),
     );
-    if gate_h - 2 > deck_y + 2 {
+    if gate_h - 2 >= local_walk + 4 {
         ax.set(
             blocks,
             mid_c,
@@ -631,14 +794,15 @@ fn build_suspension_rig(
     c0: i32,
     c1: i32,
     deck_profile: &[i32],
+    walk_top: &[i32],
     rng: &mut SplitMix64,
 ) {
     let along_len = ax.along_len;
     let pylon_a = (along_len / 4).clamp(4, (along_len / 2 - 4).max(4));
     let pylon_b = (along_len - 1 - pylon_a).max(pylon_a + 6).min(along_len - 4);
     let mid_along = (pylon_a + pylon_b) / 2;
-    let peak_deck = deck_profile.iter().copied().max().unwrap_or(5);
-    let pylon_top = (ax.height - 2).clamp(peak_deck + 5, ax.height - 1);
+    let peak_walk = walk_top.iter().copied().max().unwrap_or(5);
+    let pylon_top = (ax.height - 2).max(peak_walk + 5).min(ax.height - 1);
     let sag_min = (deck_profile[mid_along as usize] + 2).min(pylon_top - 2);
     let use_copper_cable = rng.next_f64() < 0.40;
     let hanger_interval = if along_len >= 40 { 3 } else { 2 };
@@ -660,11 +824,13 @@ fn build_suspension_rig(
 
     for pylon in [pylon_a, pylon_b] {
         let dy = deck_profile[pylon as usize];
+        let local_walk = max_walk_window(walk_top, pylon, 1);
         for da in -1..=0 {
             let a = (pylon + da).clamp(0, along_len - 1);
+            let slice_dy = deck_profile[a as usize];
             for &c in &[c0, c1] {
-                for y in -2..=pylon_top {
-                    let blk = if y <= dy {
+                for y in (slice_dy - 4).max(-6)..=pylon_top {
+                    let blk = if y <= slice_dy {
                         PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, y, a))
                     } else if y == pylon_top {
                         PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, c, y, a))
@@ -675,11 +841,11 @@ fn build_suspension_rig(
                 }
             }
         }
-        let low_brace = dy + 5;
+        let low_brace = (local_walk + 4).max(dy + 5);
         let top_brace = pylon_top - 1;
         for c in (c0 + 1)..c1 {
             for &by in &[low_brace, top_brace] {
-                if by <= pylon_top && by >= dy + 4 {
+                if by <= pylon_top && by >= local_walk + 4 {
                     ax.set(
                         blocks,
                         c,
@@ -762,26 +928,38 @@ fn build_aqueduct_upper_tier(
     seed: u64,
     c0: i32,
     c1: i32,
-    lower_deck_y: i32,
+    walk_top: &[i32],
     spans: &[(i32, i32)],
 ) {
-    let channel_floor_y = (ax.height - 4).clamp(lower_deck_y + 4, (ax.height - 3).max(lower_deck_y + 2));
-    if channel_floor_y <= lower_deck_y + 2 || channel_floor_y + 1 >= ax.height {
+    let max_walk = walk_top.iter().copied().max().unwrap_or(4);
+    let min_floor_y = max_walk + 4;
+    if min_floor_y + 1 >= ax.height || ax.height - 2 < min_floor_y {
         return;
     }
+    let channel_floor_y = (ax.height - 3).clamp(min_floor_y, ax.height - 2);
     let mid_c = (c0 + c1) / 2;
-    let channel_hw = ((c1 - c0) / 4).clamp(1, 3);
-    let aq_c0 = (mid_c - channel_hw - 1).max(c0 + 1);
-    let aq_c1 = (mid_c + channel_hw + 1).min(c1 - 1);
+    let (aq_c0, aq_c1) = if c1 - c0 < 8 {
+        (c0, c1)
+    } else {
+        let channel_hw = ((c1 - c0) / 4).clamp(2, 3);
+        let a0 = (mid_c - channel_hw - 1).max(c0);
+        let a1 = (mid_c + channel_hw + 1).min(c1);
+        if a1 - a0 >= 4 {
+            (a0, a1)
+        } else {
+            (c0, c1)
+        }
+    };
 
     for a in 0..ax.along_len {
+        let local_walk = walk_top[a as usize];
         let in_main_span = spans.iter().any(|&(s0, s1)| a >= s0 && a <= s1);
-        let sub_arch_open = in_main_span && (a % 4 != 0) && channel_floor_y - lower_deck_y >= 4;
+        let sub_arch_open = in_main_span && (a % 4 != 0) && channel_floor_y - local_walk >= 4;
         for c in [aq_c0, aq_c1] {
-            for y in (lower_deck_y + 1)..channel_floor_y {
+            for y in (local_walk + 1)..channel_floor_y {
                 let open_here = sub_arch_open && y < channel_floor_y - 1;
                 if !open_here {
-                    let blk = if y == channel_floor_y - 1 || y == lower_deck_y + 1 {
+                    let blk = if y == channel_floor_y - 1 || y == local_walk + 1 {
                         PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, c, y, a))
                     } else {
                         make_pillar_block_at(pal, "y", seed, c, y, a)
@@ -840,6 +1018,7 @@ fn build_covered_canopy(
     c0: i32,
     c1: i32,
     deck_profile: &[i32],
+    walk_top: &[i32],
     rng: &mut SplitMix64,
 ) {
     let along_len = ax.along_len;
@@ -853,7 +1032,11 @@ fn build_covered_canopy(
 
     for a in cov_start..=cov_end {
         let dy = deck_profile[a as usize];
-        let wall_top = (dy + 3).min(ax.height - 3);
+        let local_walk = max_walk_window(walk_top, a, 1);
+        let wall_top = (dy + 4).max(local_walk + 4).min(ax.height - 2);
+        if wall_top < local_walk + 4 {
+            continue;
+        }
         let is_post = a == cov_start || a == cov_end || ((a - cov_start) % post_step == 0);
 
         for &c in &[c0, c1] {
@@ -869,7 +1052,7 @@ fn build_covered_canopy(
                     dy + 1,
                     PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, c, dy + 1, a)),
                 );
-                if !open_gallery {
+                if !open_gallery && dy + 2 < wall_top {
                     ax.set(
                         blocks,
                         c,
@@ -888,7 +1071,7 @@ fn build_covered_canopy(
             }
         }
 
-        if is_post && wall_top < ax.height - 2 {
+        if is_post && wall_top < ax.height - 1 {
             for c in (c0 + 1)..c1 {
                 ax.set(
                     blocks,
@@ -898,7 +1081,7 @@ fn build_covered_canopy(
                     make_beam_block_at(pal, ax.axis_cross(), seed, c, wall_top, a),
                 );
             }
-            if wall_top - 1 > dy + 2 {
+            if wall_top - 1 >= local_walk + 4 {
                 ax.set(
                     blocks,
                     mid_c,
@@ -915,6 +1098,9 @@ fn build_covered_canopy(
             let dc = (c - mid_c).abs();
             let edge_rise = eave_half - dc;
             let ry = (wall_top + 1 + edge_rise / 2).min(ax.height - 1);
+            if c > c0 && c < c1 && ry < local_walk + 4 {
+                continue;
+            }
             if dc == 0 {
                 let ridge = if is_japanese {
                     PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, c, ry, a))
@@ -922,7 +1108,7 @@ fn build_covered_canopy(
                     make_slab(&pal.pick(MaterialPalette::SLOT_ROOF, seed, c, ry, a), "bottom")
                 };
                 ax.set(blocks, c, a, ry, ridge);
-                if ry > wall_top + 1 {
+                if ry > wall_top + 1 && ry - 1 >= local_walk + 4 {
                     ax.set(
                         blocks,
                         c,
@@ -986,12 +1172,16 @@ pub(crate) fn generate_bridge(
     let (c0, c1) = compute_bridge_width(ax.cross_len, variant, &mut rng);
     let mid_c = (c0 + c1) / 2;
     let spans = compute_arch_spans(ax.along_len, variant, &mut rng);
-    let deck_profile = compute_deck_profile(ax, variant, &spans, terrain_offsets, &mut rng);
+    let deck_profile = compute_deck_profile(ax, variant, &spans, c0, c1, terrain_offsets, &mut rng);
+    let walk_top = compute_walk_top_profile(&deck_profile);
 
     let cutwater_prow = rng.next_f64() < 0.72;
     let open_spandrels = !matches!(variant, BridgeVariant::PontoonPier | BridgeVariant::Suspension)
         && rng.next_f64() < 0.48;
-    let balcony_mode = if ax.cross_len - (c1 - c0 + 1) >= 4 && ax.along_len >= 19 {
+    let balcony_mode = if ax.cross_len - (c1 - c0 + 1) >= 4
+        && ax.along_len >= 19
+        && variant != BridgeVariant::CoveredTimber
+    {
         rng.range_i32(0, 2)
     } else {
         0
@@ -1013,14 +1203,29 @@ pub(crate) fn generate_bridge(
         }
     }
 
-    // 1. Substructure: Abutments, Cutwater Piers, Carved Arch Vaults & Roadway Deck.
+    let step_slot = if matches!(
+        variant,
+        BridgeVariant::CoveredTimber | BridgeVariant::PontoonPier | BridgeVariant::TaikoMoon
+    ) {
+        MaterialPalette::SLOT_FLOOR
+    } else {
+        MaterialPalette::SLOT_PAVING
+    };
+
+    // 1. Substructure: Abutments, Cutwater Piers, Carved Arch Vaults & Smooth Stepped Roadway Deck.
     for along in 0..ax.along_len {
         let dy = deck_profile[along as usize];
         let prev_dy = if along > 0 { deck_profile[(along - 1) as usize] } else { dy };
+        let prev2_dy = if along > 1 { deck_profile[(along - 2) as usize] } else { prev_dy };
         let next_dy = if along + 1 < ax.along_len {
             deck_profile[(along + 1) as usize]
         } else {
             dy
+        };
+        let next2_dy = if along + 2 < ax.along_len {
+            deck_profile[(along + 2) as usize]
+        } else {
+            next_dy
         };
 
         let matching_span = spans.iter().find(|&&(s0, s1)| along >= s0 && along <= s1).copied();
@@ -1029,7 +1234,7 @@ pub(crate) fn generate_bridge(
 
         for c in c0..=c1 {
             let terr = ax.terr(terrain_offsets, c, along).clamp(-5, 3);
-            let floor_anchor = (terr - 4).max(-6);
+            let floor_anchor = (terr - 4).min(dy - 2).max(-6);
 
             if variant == BridgeVariant::PontoonPier {
                 let is_bents = matching_span.is_none() || (along % 4 == 0);
@@ -1038,7 +1243,7 @@ pub(crate) fn generate_bridge(
                     for y in floor_anchor..dy {
                         ax.set(&mut blocks, c, along, y, make_frame_block_at(pal, "y", seed, c, y, along));
                     }
-                } else if is_bents && dy - 1 >= 0 {
+                } else if is_bents && dy - 1 >= floor_anchor {
                     ax.set(
                         &mut blocks,
                         c,
@@ -1075,7 +1280,7 @@ pub(crate) fn generate_bridge(
                                 dy - 1,
                                 PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FRAME, seed, c, dy - 1, along)),
                             );
-                        } else if dy - 1 >= 0 {
+                        } else if dy - 1 >= floor_anchor {
                             ax.set(
                                 &mut blocks,
                                 c,
@@ -1085,32 +1290,34 @@ pub(crate) fn generate_bridge(
                             );
                         }
                     } else if variant == BridgeVariant::TaikoMoon {
-                        let beam_y = (dy - 1).max(1);
-                        if is_rib_col {
-                            ax.set(
-                                &mut blocks,
-                                c,
-                                along,
-                                beam_y,
-                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, c, beam_y, along)),
-                            );
-                            if beam_y - 1 >= 1 {
+                        let beam_y = dy - 1;
+                        if beam_y < dy && beam_y >= floor_anchor {
+                            if is_rib_col {
                                 ax.set(
                                     &mut blocks,
                                     c,
                                     along,
-                                    beam_y - 1,
-                                    pick_stair_for_slot(pal, MaterialPalette::SLOT_ROOF, seed, c, beam_y - 1, along, stair_face, "top"),
+                                    beam_y,
+                                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, c, beam_y, along)),
+                                );
+                                if beam_y - 1 >= floor_anchor {
+                                    ax.set(
+                                        &mut blocks,
+                                        c,
+                                        along,
+                                        beam_y - 1,
+                                        pick_stair_for_slot(pal, MaterialPalette::SLOT_ROOF, seed, c, beam_y - 1, along, stair_face, "top"),
+                                    );
+                                }
+                            } else if along % 3 == 0 {
+                                ax.set(
+                                    &mut blocks,
+                                    c,
+                                    along,
+                                    beam_y,
+                                    make_beam_block_at(pal, ax.axis_cross(), seed, c, beam_y, along),
                                 );
                             }
-                        } else if (along % 3 == 0) && beam_y >= 1 {
-                            ax.set(
-                                &mut blocks,
-                                c,
-                                along,
-                                beam_y,
-                                make_beam_block_at(pal, ax.axis_cross(), seed, c, beam_y, along),
-                            );
                         }
                     } else {
                         let fill_bot = arch_void;
@@ -1191,49 +1398,44 @@ pub(crate) fn generate_bridge(
             }
 
             if is_cutwater_center && cutwater_prow && variant != BridgeVariant::PontoonPier {
-                let pier_top = (dy - 1).min(terr + 4).max(1);
-                for side in [-1, 1] {
-                    for dist in 1..=2 {
-                        if dist == 2 && pier_top <= 2 {
-                            continue;
-                        }
-                        let pc = if side < 0 { c0 - dist } else { c1 + dist };
-                        if pc < 0 || pc >= ax.cross_len {
-                            continue;
-                        }
-                        let local_top = pier_top - (dist - 1);
-                        let da_max = if dist == 1 { 1 } else { 0 };
-                        for da in -da_max..=da_max {
-                            let pa = along + da;
-                            if pa < 0 || pa >= ax.along_len {
+                let pier_top = (dy - 1).min(terr + 4).clamp(-5, dy - 1);
+                if pier_top >= -4 {
+                    for side in [-1, 1] {
+                        for dist in 1..=2 {
+                            let pc = if side < 0 { c0 - dist } else { c1 + dist };
+                            if pc < 0 || pc >= ax.cross_len {
                                 continue;
                             }
-                            let pterr = ax.terr(terrain_offsets, pc, pa).clamp(-5, 2);
-                            for y in (pterr - 3).max(-6)..=local_top {
-                                let blk = if y == local_top {
-                                    make_slab(&pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pc, y, pa), "bottom")
-                                } else {
-                                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pc, y, pa))
-                                };
-                                ax.set(&mut blocks, pc, pa, y, blk);
+                            let local_top = pier_top - (dist - 1);
+                            let pterr = ax.terr(terrain_offsets, pc, along).clamp(-5, 2);
+                            let pbot = (pterr - 3).max(-6);
+                            if dist == 2 && local_top <= pbot + 1 {
+                                continue;
+                            }
+                            let da_max = if dist == 1 { 1 } else { 0 };
+                            for da in -da_max..=da_max {
+                                let pa = along + da;
+                                if pa < 0 || pa >= ax.along_len {
+                                    continue;
+                                }
+                                let pterr_a = ax.terr(terrain_offsets, pc, pa).clamp(-5, 2);
+                                for y in (pterr_a - 3).max(-6)..=local_top {
+                                    let blk = if y == local_top {
+                                        make_slab(&pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pc, y, pa), "bottom")
+                                    } else {
+                                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pc, y, pa))
+                                    };
+                                    ax.set(&mut blocks, pc, pa, y, blk);
+                                }
                             }
                         }
                     }
                 }
             }
 
-            let rising = next_dy > dy || prev_dy > dy;
             let is_curb = c == c0 || c == c1;
             let deck_blk = if is_curb {
                 PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, c, dy, along))
-            } else if variant == BridgeVariant::CoveredTimber && (along <= 1 || along >= ax.along_len - 2) {
-                make_slab(&pal.pick(MaterialPalette::SLOT_FLOOR, seed, c, dy, along), "bottom")
-            } else if rising
-                && (c - mid_c).abs() <= (c1 - c0) / 2 - 1
-                && (along % 2 == 1)
-                && variant == BridgeVariant::TaikoMoon
-            {
-                make_slab(&pal.pick(MaterialPalette::SLOT_FLOOR, seed, c, dy, along), "bottom")
             } else if matches!(
                 variant,
                 BridgeVariant::CoveredTimber | BridgeVariant::PontoonPier | BridgeVariant::TaikoMoon
@@ -1248,14 +1450,48 @@ pub(crate) fn generate_bridge(
             };
             ax.set(&mut blocks, c, along, dy, deck_blk);
 
-            if (next_dy == dy + 1 || prev_dy == dy + 1) && !is_curb && variant != BridgeVariant::CoveredTimber {
-                ax.set(
-                    &mut blocks,
-                    c,
-                    along,
-                    dy + 1,
-                    make_slab(&pal.pick(MaterialPalette::SLOT_PAVING, seed, c, dy + 1, along), "bottom"),
-                );
+            if !is_curb {
+                if next_dy == dy + 1 && prev_dy != dy + 1 {
+                    let blk = if next2_dy <= dy + 1 {
+                        make_slab(&pal.pick(step_slot, seed, c, dy + 1, along), "bottom")
+                    } else {
+                        pick_stair_for_slot(
+                            pal,
+                            step_slot,
+                            seed,
+                            c,
+                            dy + 1,
+                            along,
+                            ax.dir_along_fwd(),
+                            "bottom",
+                        )
+                    };
+                    ax.set(&mut blocks, c, along, dy + 1, blk);
+                } else if prev_dy == dy + 1 && next_dy != dy + 1 {
+                    let blk = if prev2_dy <= dy + 1 {
+                        make_slab(&pal.pick(step_slot, seed, c, dy + 1, along), "bottom")
+                    } else {
+                        pick_stair_for_slot(
+                            pal,
+                            step_slot,
+                            seed,
+                            c,
+                            dy + 1,
+                            along,
+                            ax.dir_along_back(),
+                            "bottom",
+                        )
+                    };
+                    ax.set(&mut blocks, c, along, dy + 1, blk);
+                } else if next_dy == dy + 1 && prev_dy == dy + 1 {
+                    ax.set(
+                        &mut blocks,
+                        c,
+                        along,
+                        dy + 1,
+                        make_slab(&pal.pick(step_slot, seed, c, dy + 1, along), "bottom"),
+                    );
+                }
             }
         }
 
@@ -1358,24 +1594,24 @@ pub(crate) fn generate_bridge(
     // 3. Variant-Specific Monumental Superstructures!
     let mid_along = ax.along_len / 2;
     let portal_hw = ((c1 - c0) / 2 - 1).clamp(1, 4);
+    let mut tower_zones: Vec<i32> = Vec::new();
 
     match variant {
         BridgeVariant::Suspension => {
-            build_suspension_rig(ax, &mut blocks, pal, seed, c0, c1, &deck_profile, &mut rng);
+            build_suspension_rig(ax, &mut blocks, pal, seed, c0, c1, &deck_profile, &walk_top, &mut rng);
         }
         BridgeVariant::Aqueduct => {
-            let lower_y = deck_profile[mid_along as usize];
-            build_aqueduct_upper_tier(ax, &mut blocks, pal, seed, c0, c1, lower_y, &spans);
+            build_aqueduct_upper_tier(ax, &mut blocks, pal, seed, c0, c1, &walk_top, &spans);
         }
         BridgeVariant::CoveredTimber => {
-            build_covered_canopy(ax, &mut blocks, pal, &spec, seed, c0, c1, &deck_profile, &mut rng);
+            build_covered_canopy(ax, &mut blocks, pal, &spec, seed, c0, c1, &deck_profile, &walk_top, &mut rng);
         }
         BridgeVariant::TaikoMoon => {
             let g1 = 1.min(ax.along_len - 2);
             let g2 = (ax.along_len - 2).max(g1 + 2);
-            build_torii_portal(ax, &mut blocks, pal, seed, c0, c1, g1, deck_profile[g1 as usize]);
+            build_torii_portal(ax, &mut blocks, pal, seed, c0, c1, g1, deck_profile[g1 as usize], &walk_top);
             if g2 != g1 {
-                build_torii_portal(ax, &mut blocks, pal, seed, c0, c1, g2, deck_profile[g2 as usize]);
+                build_torii_portal(ax, &mut blocks, pal, seed, c0, c1, g2, deck_profile[g2 as usize], &walk_top);
             }
         }
         BridgeVariant::FortifiedGate => {
@@ -1384,20 +1620,23 @@ pub(crate) fn generate_bridge(
                 for ga in [2, (ax.along_len - 3).max(4)] {
                     let dy = deck_profile[ga as usize];
                     let top_y = (dy + 6).min(ax.height - 2);
-                    build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, ga, dy, top_y, portal_hw, false);
+                    build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, ga, &deck_profile, &walk_top, top_y, portal_hw, false);
+                    tower_zones.push(ga);
                 }
             }
             if mode == 1 || mode == 2 {
                 let dy = deck_profile[mid_along as usize];
                 let top_y = (dy + 7).min(ax.height - 2);
-                build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, mid_along, dy, top_y, portal_hw, false);
+                build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, mid_along, &deck_profile, &walk_top, top_y, portal_hw, false);
+                tower_zones.push(mid_along);
             }
         }
         BridgeVariant::GothicRibbedArch => {
             if rng.next_f64() < 0.55 {
                 let dy = deck_profile[mid_along as usize];
                 let top_y = (dy + 6).min(ax.height - 3);
-                build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, mid_along, dy, top_y, portal_hw, true);
+                build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, mid_along, &deck_profile, &walk_top, top_y, portal_hw, true);
+                tower_zones.push(mid_along);
             }
         }
         BridgeVariant::GrandSingleArch | BridgeVariant::MasonryArch => {
@@ -1405,7 +1644,8 @@ pub(crate) fn generate_bridge(
             if deco == 1 {
                 let dy = deck_profile[mid_along as usize];
                 let top_y = (dy + 6).min(ax.height - 2);
-                build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, mid_along, dy, top_y, portal_hw, true);
+                build_bridge_tower(ax, &mut blocks, pal, seed, c0, c1, mid_along, &deck_profile, &walk_top, top_y, portal_hw, true);
+                tower_zones.push(mid_along);
             } else if deco == 2 {
                 for &ea in &[1, (ax.along_len - 2).max(2)] {
                     let dy = deck_profile[ea as usize];
@@ -1424,13 +1664,14 @@ pub(crate) fn generate_bridge(
         }
         BridgeVariant::PontoonPier => {
             let dy = deck_profile[mid_along as usize];
-            let gazebo_top = (dy + 5).min(ax.height - 2);
-            if gazebo_top >= dy + 3 && ax.along_len >= 13 {
-                let g_a0 = (mid_along - 2).max(1);
-                let g_a1 = (mid_along + 2).min(ax.along_len - 2);
+            let g_a0 = (mid_along - 2).max(1);
+            let g_a1 = (mid_along + 2).min(ax.along_len - 2);
+            let max_gaz_walk = max_walk_window(&walk_top, mid_along, 2);
+            let gazebo_top = (max_gaz_walk + 4).max(dy + 5).min(ax.height - 2);
+            if gazebo_top >= max_gaz_walk + 4 && ax.along_len >= 13 {
                 for &gc in &[c0, c1] {
                     for &ga in &[g_a0, g_a1] {
-                        for y in (dy + 1)..gazebo_top {
+                        for y in (deck_profile[ga as usize] + 1)..gazebo_top {
                             ax.set(&mut blocks, gc, ga, y, make_frame_block_at(pal, "y", seed, gc, y, ga));
                         }
                     }
@@ -1452,13 +1693,15 @@ pub(crate) fn generate_bridge(
                         );
                     }
                 }
-                ax.set(
-                    &mut blocks,
-                    mid_c,
-                    mid_along,
-                    gazebo_top,
-                    make_bridge_light(pal.pick(MaterialPalette::SLOT_LIGHT, seed, mid_c, gazebo_top, mid_along), true),
-                );
+                if gazebo_top >= max_gaz_walk + 4 {
+                    ax.set(
+                        &mut blocks,
+                        mid_c,
+                        mid_along,
+                        gazebo_top,
+                        make_bridge_light(pal.pick(MaterialPalette::SLOT_LIGHT, seed, mid_c, gazebo_top, mid_along), true),
+                    );
+                }
             }
         }
     }
@@ -1472,6 +1715,9 @@ pub(crate) fn generate_bridge(
             bay_centers.extend(pier_centers.iter().copied());
         }
         for bay_a in bay_centers {
+            if tower_zones.iter().any(|&ta| (bay_a - ta).abs() <= 2) {
+                continue;
+            }
             let dy = deck_profile[bay_a as usize];
             for side in [-1, 1] {
                 let bc = if side < 0 { c0 - 1 } else { c1 + 1 };
@@ -1486,6 +1732,7 @@ pub(crate) fn generate_bridge(
                     }
                     let reach_outer = da.abs() <= 1;
                     let edge_c = if side < 0 { c0 } else { c1 };
+                    let edge_wt = walk_top[a as usize];
                     ax.set(
                         &mut blocks,
                         edge_c,
@@ -1493,9 +1740,10 @@ pub(crate) fn generate_bridge(
                         dy,
                         PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PAVING, seed, edge_c, dy, a)),
                     );
-                    ax.set(&mut blocks, edge_c, a, dy + 1, PlannedBlock::simple("minecraft:air"));
-                    if da.abs() <= 1 {
-                        ax.set(&mut blocks, edge_c, a, dy + 2, PlannedBlock::simple("minecraft:air"));
+                    for cy in (dy + 1)..=(edge_wt + 3).min(ax.height - 1) {
+                        if da.abs() <= 1 || cy <= dy + 1 {
+                            ax.set(&mut blocks, edge_c, a, cy, PlannedBlock::simple("minecraft:air"));
+                        }
                     }
                     ax.set(
                         &mut blocks,
@@ -1578,10 +1826,27 @@ pub(crate) fn generate_bridge(
             }
             let dy = deck_profile[along as usize];
             for &c in &[c0, c1] {
-                if noise.cell_hash(c, along, 99) > 0.45 && dy - 1 >= 1 {
+                if noise.cell_hash(c, along, 99) > 0.45 && dy - 1 >= -4 {
                     let leaf = make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, c, dy - 1, along));
                     ax.set(&mut blocks, c, along, dy - 1, leaf);
                 }
+            }
+        }
+    }
+
+    // 6. Universal Bridge Walkthrough & Overhead Clearance Invariant: guarantee 3 clear blocks above every deck/step.
+    for along in 0..ax.along_len {
+        let in_tower = tower_zones.iter().any(|&ta| (along - ta).abs() <= 1);
+        let (clear_c0, clear_c1) = if in_tower {
+            ((mid_c - portal_hw).max(c0 + 1), (mid_c + portal_hw).min(c1 - 1))
+        } else {
+            (c0 + 1, c1 - 1)
+        };
+        let clear_lo = walk_top[along as usize] + 1;
+        let clear_hi = (walk_top[along as usize] + 3).min(ax.height - 1);
+        for c in clear_c0..=clear_c1 {
+            for y in clear_lo..=clear_hi {
+                ax.set(&mut blocks, c, along, y, PlannedBlock::simple("minecraft:air"));
             }
         }
     }
@@ -1591,7 +1856,7 @@ pub(crate) fn generate_bridge(
 
     let (door_u, door_v) = ax.uv(mid_c, ax.along_len - 1);
     let [dlx, dlz] = grid.to_local_xz(door_u, door_v);
-    let door_y = deck_profile[(ax.along_len - 1) as usize] + 1;
+    let door_y = walk_top[(ax.along_len - 1) as usize] + 1;
 
     GeneratedBlueprint {
         spec,
