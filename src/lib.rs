@@ -8,6 +8,7 @@ mod gen_fantasy_folk;
 mod gen_fortress;
 mod gen_landmarks;
 mod gen_modern_industrial;
+pub mod gen_preview;
 mod gen_exterior;
 mod gen_interior;
 mod gen_roof;
@@ -4434,5 +4435,151 @@ mod tests {
             bp.blocks.get(&[cx, 2, i32::from(d) - 1]).is_some_and(|b| b.block_id != "minecraft:air"),
             "South bank z=end must anchor at terr=+2"
         );
+    }
+
+    #[test]
+    fn live_3d_hologram_preview_renders_translucent_bluish_shapes_and_creases() {
+        let mut req = sample_request("cozy oak house with porch, windows, basement, and gable roof", 7777);
+        req.width = 15;
+        req.depth = 13;
+        req.height = 12;
+        let bp = generate_blueprint(&req, None);
+        let mesh = crate::gen_preview::build_hologram_mesh(&bp, None);
+
+        assert!(mesh.quads.len() >= 25, "expected rich 3D hologram faces, got {}", mesh.quads.len());
+        assert!(mesh.lines.len() >= 15, "expected architectural crease edges, got {}", mesh.lines.len());
+
+        let has_negative_y_cell = bp.blocks.keys().any(|&[_, y, _]| y < 0);
+        let mut saw_negative_y_quad = false;
+        for q in &mesh.quads {
+            let a = (q.color >> 24) & 0xFF;
+            let r = (q.color >> 16) & 0xFF;
+            let g = (q.color >> 8) & 0xFF;
+            let b = q.color & 0xFF;
+            assert!(
+                (0x20..=0x90).contains(&a),
+                "hologram alpha 0x{a:02X} must be semi-transparent"
+            );
+            assert!(
+                b >= g && b >= r,
+                "hologram color 0x{:08X} should preserve bluish tint",
+                q.color
+            );
+            for c in q.corners {
+                assert!(c[0].is_finite() && c[1].is_finite() && c[2].is_finite());
+                if c[1] < -0.05 {
+                    saw_negative_y_quad = true;
+                }
+            }
+        }
+        if has_negative_y_cell {
+            assert!(saw_negative_y_quad, "basement/foundation geometry below Y=0 must appear in 3D preview");
+        }
+        let (fitted_q, fitted_l) =
+            mesh.fit_budget(crate::gen_preview::TARGET_MAX_QUADS, crate::gen_preview::TARGET_MAX_LINES);
+        assert!(!fitted_q.is_empty() && fitted_q.len() <= crate::gen_preview::TARGET_MAX_QUADS);
+        assert!(fitted_l.len() <= crate::gen_preview::TARGET_MAX_LINES);
+    }
+
+    #[test]
+    fn live_3d_hologram_slice_and_large_structures_stay_within_view_capacity() {
+        let mut req = sample_request("cozy oak house with windows and gable roof", 4242);
+        req.width = 13;
+        req.depth = 11;
+        req.height = 12;
+        let bp = generate_blueprint(&req, None);
+        let sliced = crate::gen_preview::build_hologram_mesh(&bp, Some(4));
+        assert!(!sliced.quads.is_empty());
+        assert!(
+            sliced
+                .quads
+                .iter()
+                .all(|q| q.corners.iter().all(|c| c[1] <= 5.05)),
+            "sliced preview must clip geometry above Y=4"
+        );
+        assert!(
+            sliced.quads.iter().any(|q| q.color == crate::gen_preview::SLICE_CAP_ARGB),
+            "sliced preview should highlight the horizontal Y-cut plane"
+        );
+
+        let mut bridge_req = sample_request("каменный арочный мост с фонарями и башнями", 9001);
+        bridge_req.category = BuildCategory::Bridge;
+        bridge_req.width = 13;
+        bridge_req.depth = 37;
+        bridge_req.height = 14;
+        let bridge_bp = generate_blueprint(&bridge_req, None);
+        let bridge_mesh = crate::gen_preview::build_hologram_mesh(&bridge_bp, None);
+        let (bq, bl) = bridge_mesh.fit_budget(
+            crate::gen_preview::TARGET_MAX_QUADS,
+            crate::gen_preview::TARGET_MAX_LINES,
+        );
+        assert!(!bq.is_empty() && bq.len() <= crate::gen_preview::TARGET_MAX_QUADS);
+        assert!(bl.len() <= crate::gen_preview::TARGET_MAX_LINES);
+
+        let mut city_req = sample_request("средневековый каменный город с рынком, фонтаном и стенами", 5555);
+        city_req.category = BuildCategory::Settlement;
+        city_req.width = 72;
+        city_req.depth = 72;
+        city_req.height = 30;
+        let city_bp = generate_blueprint(&city_req, None);
+        let city_mesh = crate::gen_preview::build_hologram_mesh(&city_bp, None);
+        let (cq, cl) = city_mesh.fit_budget(
+            crate::gen_preview::TARGET_MAX_QUADS,
+            crate::gen_preview::TARGET_MAX_LINES,
+        );
+        assert!(
+            !cq.is_empty() && cq.len() <= crate::gen_preview::TARGET_MAX_QUADS,
+            "large settlement preview exceeded quad budget: {}",
+            cq.len()
+        );
+        assert!(
+            cl.len() <= crate::gen_preview::TARGET_MAX_LINES,
+            "large settlement preview exceeded line budget: {}",
+            cl.len()
+        );
+    }
+
+    fn is_horizon_allowed_hmod_path(rel: &str) -> bool {
+        if rel.is_empty() || rel.contains('\\') || rel.starts_with('/') {
+            return false;
+        }
+        if matches!(rel, "horizon-mod.toml" | "layouts.toml" | "uses.json" | "icon.png") {
+            return true;
+        }
+        if rel.starts_with("assets/") || rel.starts_with("data/") {
+            return true;
+        }
+        if matches!(rel, "Cargo.toml" | "Cargo.lock" | "build.rs") {
+            return true;
+        }
+        if let Some(sub) = rel.strip_prefix("src/") {
+            return sub.ends_with(".rs") || sub.ends_with(".toml");
+        }
+        !rel.contains('/')
+            && ["README", "LICENSE", "LICENCE", "COPYING", "NOTICE"]
+                .iter()
+                .any(|pfx| rel.starts_with(pfx))
+    }
+
+    #[test]
+    fn hmod_package_path_allowlist_rejects_gitignore_and_unknown_files() {
+        assert!(!is_horizon_allowed_hmod_path(".gitignore"));
+        assert!(!is_horizon_allowed_hmod_path(".git/HEAD"));
+        assert!(!is_horizon_allowed_hmod_path("target/release/mod.dll"));
+        assert!(!is_horizon_allowed_hmod_path("HOW_TO_INSTALL.txt"));
+        assert!(!is_horizon_allowed_hmod_path("building_generator-0.4.1.hmod"));
+
+        for rel in [
+            "horizon-mod.toml",
+            "uses.json",
+            "Cargo.toml",
+            "icon.png",
+            "LICENSE",
+            "README.md",
+            "src/lib.rs",
+            "src/gen_preview.rs",
+        ] {
+            assert!(is_horizon_allowed_hmod_path(rel), "expected valid path {rel}");
+        }
     }
 }

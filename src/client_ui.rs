@@ -385,6 +385,9 @@ struct PreviewKey {
     eff_desc: String,
     seed: u64,
     roof_raw: u8,
+    toggles_raw: [u8; 5],
+    adapt_terrain: bool,
+    terrain_fp: u64,
     preview_slice_y: Option<i32>,
     palette_fp: u64,
     wear_pct: u8,
@@ -453,9 +456,13 @@ struct ClientUiState {
     auto_sync_wood: bool,
     world_select: WorldSelectMode,
     aimed_block: Option<[i32; 3]>,
+    terrain_cache_key: Option<(bool, i32, i32, i32, u16, u16)>,
+    cached_terrain_offsets: Option<Vec<i32>>,
+    cached_water_depths: Option<Vec<i32>>,
+    cached_terrain_fp: u64,
+    last_terrain_sample_ms: u64,
     preview_key: Option<PreviewKey>,
-    preview_lines: Vec<([f64; 3], [f64; 3], u32)>,
-    preview_quads: Vec<([[f64; 3]; 4], u32)>,
+    preview_mesh: crate::gen_preview::HologramMesh,
     preview_bom: Vec<(String, usize)>,
     preview_total_blocks: usize,
     build_progress: Option<(u8, usize, usize, String)>,
@@ -529,9 +536,13 @@ impl Default for ClientUiState {
             auto_sync_wood: true,
             world_select: WorldSelectMode::Inactive,
             aimed_block: None,
+            terrain_cache_key: None,
+            cached_terrain_offsets: None,
+            cached_water_depths: None,
+            cached_terrain_fp: 0,
+            last_terrain_sample_ms: 0,
             preview_key: None,
-            preview_lines: Vec::new(),
-            preview_quads: Vec::new(),
+            preview_mesh: crate::gen_preview::HologramMesh::default(),
             preview_bom: Vec::new(),
             preview_total_blocks: 0,
             build_progress: None,
@@ -3525,8 +3536,16 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
     }
     let size = event.draw.size();
 
+    let active = with_state(|st| {
+        effective_preview_box(st.world_select, st.aimed_block, st.origin, st.width, st.depth, st.height)
+    });
+    if let Some((bmin, _bmax, eff_w, eff_d, _eff_h)) = active {
+        sync_client_terrain_for_preview(host, bmin, eff_w, eff_d, true);
+    }
+
     with_state(|st| {
-        ensure_preview_cached(st);
+        let (_, _, eff_w, eff_d, eff_h) = active.unwrap_or(([0, 0, 0], [0, 0, 0], st.width, st.depth, st.height));
+        ensure_preview_cached(st, eff_w, eff_d, eff_h);
         if st.dirty
             || st
                 .screen
@@ -4147,22 +4166,162 @@ fn push_box_lines(lines: &mut Vec<WorldLine>, min: [f64; 3], max: [f64; 3], colo
     }
 }
 
-fn ensure_preview_data(st: &mut ClientUiState) -> (Vec<([f64; 3], [f64; 3], u32)>, Vec<([[f64; 3]; 4], u32)>) {
-    ensure_preview_cached(st);
-    (st.preview_lines.clone(), st.preview_quads.clone())
+fn effective_preview_box(
+    mode: WorldSelectMode,
+    aimed: Option<[i32; 3]>,
+    origin: Option<[i32; 3]>,
+    w: u16,
+    d: u16,
+    h: u16,
+) -> Option<([i32; 3], [i32; 3], u16, u16, u16)> {
+    match mode {
+        WorldSelectMode::PickingCorner2 { c1 } => {
+            let p2 = aimed.unwrap_or(c1);
+            let min_x = c1[0].min(p2[0]);
+            let min_y = c1[1].min(p2[1]);
+            let min_z = c1[2].min(p2[2]);
+            let eff_w = ((c1[0].max(p2[0]) - min_x + 1) as u16).clamp(7, 96);
+            let eff_d = ((c1[2].max(p2[2]) - min_z + 1) as u16).clamp(7, 96);
+            let min = [min_x, min_y, min_z];
+            let max = [
+                min_x + i32::from(eff_w),
+                min_y + i32::from(h),
+                min_z + i32::from(eff_d),
+            ];
+            Some((min, max, eff_w, eff_d, h))
+        }
+        WorldSelectMode::PickingCorner1 => aimed.map(|p| {
+            let min = [p[0] - i32::from(w / 2), p[1], p[2] - i32::from(d / 2)];
+            let max = [min[0] + i32::from(w), min[1] + i32::from(h), min[2] + i32::from(d)];
+            (min, max, w, d, h)
+        }),
+        WorldSelectMode::Inactive => origin.map(|o| {
+            (o, [o[0] + i32::from(w), o[1] + i32::from(h), o[2] + i32::from(d)], w, d, h)
+        }),
+    }
 }
 
-fn ensure_preview_cached(st: &mut ClientUiState) {
+fn terrain_fingerprint(offsets: Option<&[i32]>, waters: Option<&[i32]>) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    if let Some(offs) = offsets {
+        for &v in offs {
+            for b in v.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+    }
+    if let Some(ws) = waters {
+        h ^= 0x9e37_79b9_7f4a_7c15;
+        for &v in ws {
+            for b in v.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+    }
+    h
+}
+
+fn sync_client_terrain_for_preview(
+    host: &dyn ClientHost,
+    origin: [i32; 3],
+    w: u16,
+    d: u16,
+    force: bool,
+) {
+    let now = host.millis();
+    let sample_plan = with_state(|st| {
+        let key = (st.adapt_terrain, origin[0], origin[1], origin[2], w, d);
+        if st.terrain_cache_key.as_ref() == Some(&key) {
+            return None;
+        }
+        if !st.adapt_terrain {
+            st.terrain_cache_key = Some(key);
+            st.cached_terrain_offsets = None;
+            st.cached_water_depths = None;
+            st.cached_terrain_fp = 0;
+            return None;
+        }
+        if !force && st.terrain_cache_key.is_some() && now.saturating_sub(st.last_terrain_sample_ms) < 60 {
+            return None;
+        }
+        Some(key)
+    });
+
+    let Some(key) = sample_plan else {
+        return;
+    };
+
+    let iw = i32::from(w.clamp(7, 96));
+    let id = i32::from(d.clamp(7, 96));
+    let mut cols = Vec::with_capacity((iw * id) as usize);
+    for lz in 0..id {
+        for lx in 0..iw {
+            cols.push((origin[0] + lx, origin[2] + lz));
+        }
+    }
+
+    let surf = host.client_surface_heights(&cols, Heightmap::MotionBlockingNoLeaves).ok();
+    let floor = surf
+        .as_ref()
+        .and_then(|_| host.client_surface_heights(&cols, Heightmap::OceanFloor).ok());
+
+    let (offsets, waters) = if let Some(surf_h) = surf {
+        let off: Vec<i32> = surf_h
+            .iter()
+            .map(|opt| opt.map_or(0, |sy| (sy - 1) - origin[1]))
+            .collect();
+        let wat = floor.map(|fl| {
+            surf_h
+                .iter()
+                .zip(fl.iter())
+                .map(|(s, f)| match (s, f) {
+                    (Some(sy), Some(fy)) if sy > fy => (sy - fy).clamp(0, 16),
+                    _ => 0,
+                })
+                .collect::<Vec<i32>>()
+        });
+        (Some(off), wat)
+    } else {
+        (None, None)
+    };
+
+    let fp = terrain_fingerprint(offsets.as_deref(), waters.as_deref());
+    with_state(|st| {
+        st.terrain_cache_key = Some(key);
+        st.cached_terrain_offsets = offsets;
+        st.cached_water_depths = waters;
+        st.cached_terrain_fp = fp;
+        st.last_terrain_sample_ms = now;
+    });
+}
+
+fn ensure_preview_data(
+    st: &mut ClientUiState,
+    eff_w: u16,
+    eff_d: u16,
+    eff_h: u16,
+    max_quads: usize,
+    max_lines: usize,
+) -> (Vec<crate::gen_preview::PreviewQuad>, Vec<crate::gen_preview::PreviewLine>, Option<i32>) {
+    ensure_preview_cached(st, eff_w, eff_d, eff_h);
+    let (qs, ls) = st.preview_mesh.fit_budget(max_quads, max_lines);
+    (qs.to_vec(), ls.to_vec(), st.preview_slice_y)
+}
+
+fn ensure_preview_cached(st: &mut ClientUiState, eff_w: u16, eff_d: u16, eff_h: u16) {
     let eff_desc = effective_description(st);
     let biome_key = if st.use_biome_auto {
         st.detected_biome.clone()
     } else {
         String::new()
     };
+    let toggles_raw = st.toggles.map(|t| t as u8);
     let key = PreviewKey {
-        width: st.width,
-        depth: st.depth,
-        height: st.height,
+        width: eff_w,
+        depth: eff_d,
+        height: eff_h,
         category: st.category,
         style: st.style,
         facing: st.facing,
@@ -4170,11 +4329,14 @@ fn ensure_preview_cached(st: &mut ClientUiState) {
         eff_desc: eff_desc.clone(),
         seed: st.seed,
         roof_raw: st.roof_choice as u8,
+        toggles_raw,
+        adapt_terrain: st.adapt_terrain,
+        terrain_fp: if st.adapt_terrain { st.cached_terrain_fp } else { 0 },
         preview_slice_y: st.preview_slice_y,
         palette_fp: palette_fingerprint(&st.palette),
         wear_pct: st.wear_pct,
         overgrowth_pct: st.overgrowth_pct,
-        biome_hint: biome_key,
+        biome_hint: biome_key.clone(),
     };
     if st.preview_key.as_ref() == Some(&key) {
         return;
@@ -4185,218 +4347,46 @@ fn ensure_preview_cached(st: &mut ClientUiState) {
         origin_x: 0,
         origin_y: 0,
         origin_z: 0,
-        width: st.width,
-        depth: st.depth,
-        height: st.height,
+        width: eff_w,
+        depth: eff_d,
+        height: eff_h,
         category: st.category,
         style: st.style,
         facing: st.facing,
         noise_level: st.noise_level,
         seed: st.seed as i64,
         description: eff_desc,
-        adapt_terrain: false,
+        adapt_terrain: st.adapt_terrain,
         air_only: false,
         wear_pct: st.wear_pct,
         overgrowth_pct: st.overgrowth_pct,
-        biome_hint: if st.use_biome_auto {
-            st.detected_biome.clone()
-        } else {
-            String::new()
-        },
+        biome_hint: biome_key,
         palette: st.palette.clone(),
     };
-    let bp = crate::generator::generate_blueprint(&req, None);
+    let terrain_off = if st.adapt_terrain {
+        st.cached_terrain_offsets.as_deref()
+    } else {
+        None
+    };
+    let water_dep = if st.adapt_terrain {
+        st.cached_water_depths.as_deref()
+    } else {
+        None
+    };
+    let bp = crate::generator::generate_blueprint_with_water(&req, terrain_off, water_dep);
     let (bom_total, bom_list) = bp.material_breakdown();
     if st.preview_total_blocks != bom_total || st.preview_bom != bom_list {
         st.preview_total_blocks = bom_total;
         st.preview_bom = bom_list;
         st.dirty = true;
     }
-    let w = i32::from(bp.width);
-    let d = i32::from(bp.depth);
     let clip_max_y = st.preview_slice_y.map(|sy| sy.clamp(0, i32::from(bp.height)));
-
-    let mut top_y = vec![-1i32; (w * d).max(1) as usize];
-    let mut top_cat = vec![0u8; (w * d).max(1) as usize];
-    let mut base_y = vec![i32::MAX; (w * d).max(1) as usize];
-
-    for (&[x, y, z], planned) in &bp.blocks {
-        if let Some(cy) = clip_max_y
-            && y > cy
-        {
-            continue;
-        }
-        if planned.block_id != "minecraft:air" && x >= 0 && x < w && z >= 0 && z < d && y >= 0 {
-            let idx = (z * w + x) as usize;
-            if y < base_y[idx] {
-                base_y[idx] = y;
-            }
-            if y > top_y[idx] {
-                top_y[idx] = y;
-                let id = planned.block_id.as_str();
-                top_cat[idx] = if id == "minecraft:water" {
-                    3
-                } else if id.ends_with("_wool")
-                    || id.ends_with("lantern")
-                    || id == "minecraft:spore_blossom"
-                    || id == "minecraft:campfire"
-                {
-                    2
-                } else if id.ends_with("_leaves")
-                    || id == "minecraft:azalea"
-                    || id == "minecraft:flowering_azalea"
-                    || id == "minecraft:bamboo"
-                    || id == "minecraft:vine"
-                {
-                    4
-                } else if id.ends_with("_stairs")
-                    || id.ends_with("_slab")
-                    || id == "minecraft:ladder"
-                    || (clip_max_y.is_none() && y >= i32::from(bp.height) * 5 / 12)
-                {
-                    1
-                } else {
-                    0
-                };
-            }
-        }
-    }
-
-    let mut segs: Vec<([f64; 3], [f64; 3], u32)> = Vec::new();
-    let mut pquads: Vec<([[f64; 3]; 4], u32)> = Vec::new();
-    let stride = if w * d > 1600 {
-        3
-    } else if w * d > 700 && clip_max_y.is_none() {
-        2
-    } else {
-        1
-    };
-
-    let mut z = 0;
-    while z < d && segs.len() < 460 {
-        let mut x = 0;
-        while x < w && segs.len() < 460 {
-            let idx0 = (z * w + x) as usize;
-            let y0 = top_y[idx0];
-            if y0 >= 0 {
-                let col = match top_cat[idx0] {
-                    1 => 0xCCFBBF24, // amber/gold stairs/roof
-                    2 => 0xEEFB923C, // coral/amber awnings/lanterns
-                    3 => 0xCC22D3EE, // cyan ponds/water
-                    4 => 0xAA34D399, // emerald foliage
-                    _ => 0x8838BDF8, // sky walls/floor
-                };
-                let fy = f64::from(y0 + 1) + 0.03;
-
-                // Translucent horizontal slice volume tiles on cut plane or key interior zones.
-                if pquads.len() < 160
-                    && (clip_max_y.is_some()
-                        || (x % 2 == 0 && z % 2 == 0 && top_cat[idx0] == 3))
-                {
-                    let qcol = match (clip_max_y, top_cat[idx0], y0) {
-                        (Some(cy), _, y) if y == cy => 0x44FB_BF24, // sliced wall top
-                        (_, 1, _) => 0x48FB_923C,                    // stair/roof
-                        (_, 3, _) => 0x4422_D3EE,                    // water/pond
-                        (_, 4, _) => 0x2634_D399,                    // foliage
-                        _ => 0x1A38_BDF8,                            // interior floor
-                    };
-                    let fx0 = f64::from(x);
-                    let fz0 = f64::from(z);
-                    let s = f64::from(stride);
-                    pquads.push((
-                        [
-                            [fx0, fy, fz0],
-                            [fx0, fy, fz0 + s],
-                            [fx0 + s, fy, fz0 + s],
-                            [fx0 + s, fy, fz0],
-                        ],
-                        qcol,
-                    ));
-                }
-
-                let nx = (x + stride).min(w - 1);
-                if nx > x {
-                    let yx = top_y[(z * w + nx) as usize];
-                    if yx >= 0 && (yx - y0).abs() <= 2 {
-                        segs.push((
-                            [f64::from(x) + 0.5, fy, f64::from(z) + 0.5],
-                            [f64::from(nx) + 0.5, f64::from(yx + 1) + 0.03, f64::from(z) + 0.5],
-                            col,
-                        ));
-                    }
-                }
-                let nz = (z + stride).min(d - 1);
-                if nz > z {
-                    let yz = top_y[(nz * w + x) as usize];
-                    if yz >= 0 && (yz - y0).abs() <= 2 {
-                        segs.push((
-                            [f64::from(x) + 0.5, fy, f64::from(z) + 0.5],
-                            [f64::from(x) + 0.5, f64::from(yz + 1) + 0.03, f64::from(nz) + 0.5],
-                            col,
-                        ));
-                    }
-                }
-            }
-            x += stride;
-        }
-        z += stride;
-    }
-
-    if let Some(cy) = clip_max_y {
-        let sy = f64::from(cy + 1) + 0.04;
-        let fw = f64::from(bp.width);
-        let fd = f64::from(bp.depth);
-        let scol = 0xEEFB_BF24;
-        segs.push(([0.0, sy, 0.0], [fw, sy, 0.0], scol));
-        segs.push(([fw, sy, 0.0], [fw, sy, fd], scol));
-        segs.push(([fw, sy, fd], [0.0, sy, fd], scol));
-        segs.push(([0.0, sy, fd], [0.0, sy, 0.0], scol));
-    }
-
-    if let Some([dx, dy, dz]) = bp.door_pos {
-        let fx = f64::from(dx);
-        let fy = f64::from(dy);
-        let fz = f64::from(dz);
-        segs.push(([fx, fy, fz], [fx, fy + 2.0, fz], 0xFF34_D399));
-        segs.push(([fx + 1.0, fy, fz], [fx + 1.0, fy + 2.0, fz], 0xFF34_D399));
-        segs.push(([fx, fy + 2.0, fz], [fx + 1.0, fy + 2.0, fz], 0xFF34_D399));
-        pquads.push((
-            [
-                [fx, fy + 0.05, fz],
-                [fx, fy + 0.05, fz + 1.0],
-                [fx + 1.0, fy + 0.05, fz + 1.0],
-                [fx + 1.0, fy + 0.05, fz],
-            ],
-            0x6634_D399,
-        ));
-    }
-
-    if bp.spec.basement {
-        let fw = f64::from(bp.width);
-        let fd = f64::from(bp.depth);
-        let by = -4.0;
-        let col = 0xCCBA_68C8;
-        segs.push(([1.0, by, 1.0], [fw - 1.0, by, 1.0], col));
-        segs.push(([fw - 1.0, by, 1.0], [fw - 1.0, by, fd - 1.0], col));
-        segs.push(([fw - 1.0, by, fd - 1.0], [1.0, by, fd - 1.0], col));
-        segs.push(([1.0, by, fd - 1.0], [1.0, by, 1.0], col));
-        for &(cx, cz) in &[
-            (1.0, 1.0),
-            (fw - 1.0, 1.0),
-            (fw - 1.0, fd - 1.0),
-            (1.0, fd - 1.0),
-        ] {
-            segs.push(([cx, by, cz], [cx, 0.0, cz], col));
-        }
-    }
-
+    st.preview_mesh = crate::gen_preview::build_hologram_mesh(&bp, clip_max_y);
     st.preview_key = Some(key);
-    st.preview_lines = segs;
-    st.preview_quads = pquads;
 }
 
 pub fn on_submit_custom_geometry(
-    _host: &dyn ClientHost,
+    host: &dyn ClientHost,
     event: &mut SubmitCustomGeometryEvent<'_>,
 ) {
     let snapshot = with_state(|st| {
@@ -4417,89 +4407,99 @@ pub fn on_submit_custom_geometry(
         return;
     }
 
+    let active_box = effective_preview_box(mode, aimed, origin, w, d, h);
+    let Some((bmin, bmax, eff_w, eff_d, eff_h)) = active_box else {
+        return;
+    };
+
+    // Refresh real client surface terrain heights on hover/relocation when Terrain adaptation is ON.
+    sync_client_terrain_for_preview(host, bmin, eff_w, eff_d, false);
+
+    let usage = event.draw.usage();
+    let avail_quads = (usage.quad_capacity.saturating_sub(usage.quads) as usize).saturating_sub(8);
+    let avail_lines = (usage.line_capacity.saturating_sub(usage.lines) as usize).saturating_sub(48);
+
     let mut lines = Vec::new();
     let mut quads = Vec::new();
 
-    // Preview box during selection or when placed.
-    let active_box: Option<([i32; 3], [i32; 3])> = match mode {
-        WorldSelectMode::PickingCorner2 { c1 } => {
-            let p2 = aimed.unwrap_or(c1);
-            let min = [c1[0].min(p2[0]), c1[1].min(p2[1]), c1[2].min(p2[2])];
-            let max = [
-                c1[0].max(p2[0]) + 1,
-                c1[1].min(p2[1]) + i32::from(h),
-                c1[2].max(p2[2]) + 1,
-            ];
-            Some((min, max))
-        }
-        WorldSelectMode::PickingCorner1 => aimed.map(|p| {
-            let min = [p[0] - i32::from(w / 2), p[1], p[2] - i32::from(d / 2)];
-            let max = [min[0] + i32::from(w), min[1] + i32::from(h), min[2] + i32::from(d)];
-            (min, max)
-        }),
-        WorldSelectMode::Inactive => origin.map(|o| {
-            (o, [o[0] + i32::from(w), o[1] + i32::from(h), o[2] + i32::from(d)])
-        }),
-    };
+    let fmin = [bmin[0] as f64, bmin[1] as f64, bmin[2] as f64];
+    let fmax = [bmax[0] as f64, bmax[1] as f64, bmax[2] as f64];
 
-    if let Some((bmin, bmax)) = active_box {
-        let fmin = [bmin[0] as f64, bmin[1] as f64, bmin[2] as f64];
-        let fmax = [bmax[0] as f64, bmax[1] as f64, bmax[2] as f64];
-        push_box_lines(&mut lines, fmin, fmax, 0xFF38_BDF8, 2.5);
+    // Gentle living pulse on outer hologram frame so users clearly see live preview bounds.
+    let phase = ((host.millis() / 45) % 40) as i32;
+    let pulse = if phase <= 20 { phase } else { 40 - phase }; // 0..=20
+    let frame_col = if pulse > 10 { 0xE860_D5FF } else { 0xD038_BDF8 };
+    push_box_lines(&mut lines, fmin, fmax, frame_col, 2.2);
 
-        // Translucent ground floor highlight
+    // Subtle translucent ground footprint highlight.
+    quads.push(WorldQuad::new(
+        [
+            [fmin[0], fmin[1] + 0.02, fmin[2]],
+            [fmin[0], fmin[1] + 0.02, fmax[2]],
+            [fmax[0], fmin[1] + 0.02, fmax[2]],
+            [fmax[0], fmin[1] + 0.02, fmin[2]],
+        ],
+        0x1C38_BDF8,
+        WorldDepth::Tested,
+    ));
+
+    let (preview_q, preview_l, slice_y) = with_state(|st| {
+        ensure_preview_data(st, eff_w, eff_d, eff_h, avail_quads, avail_lines)
+    });
+
+    for pq in preview_q {
         quads.push(WorldQuad::new(
             [
-                [fmin[0], fmin[1] + 0.03, fmin[2]],
-                [fmin[0], fmin[1] + 0.03, fmax[2]],
-                [fmax[0], fmin[1] + 0.03, fmax[2]],
-                [fmax[0], fmin[1] + 0.03, fmin[2]],
+                [fmin[0] + pq.corners[0][0], fmin[1] + pq.corners[0][1], fmin[2] + pq.corners[0][2]],
+                [fmin[0] + pq.corners[1][0], fmin[1] + pq.corners[1][1], fmin[2] + pq.corners[1][2]],
+                [fmin[0] + pq.corners[2][0], fmin[1] + pq.corners[2][1], fmin[2] + pq.corners[2][2]],
+                [fmin[0] + pq.corners[3][0], fmin[1] + pq.corners[3][1], fmin[2] + pq.corners[3][2]],
             ],
-            0x2038_BDF8,
+            pq.color,
             WorldDepth::Tested,
         ));
+    }
 
-        let (preview_l, preview_q) = with_state(ensure_preview_data);
-        for (a, b, color) in preview_l {
-            lines.push(WorldLine::new(
-                [fmin[0] + a[0], fmin[1] + a[1], fmin[2] + a[2]],
-                [fmin[0] + b[0], fmin[1] + b[1], fmin[2] + b[2]],
-                color,
-                1.4,
-                WorldDepth::Tested,
-            ));
-        }
-        for (qc, color) in preview_q {
-            quads.push(WorldQuad::new(
-                [
-                    [fmin[0] + qc[0][0], fmin[1] + qc[0][1], fmin[2] + qc[0][2]],
-                    [fmin[0] + qc[1][0], fmin[1] + qc[1][1], fmin[2] + qc[1][2]],
-                    [fmin[0] + qc[2][0], fmin[1] + qc[2][1], fmin[2] + qc[2][2]],
-                    [fmin[0] + qc[3][0], fmin[1] + qc[3][1], fmin[2] + qc[3][2]],
-                ],
-                color,
-                WorldDepth::Tested,
-            ));
-        }
-
-        // Golden directional arrow on front entrance side!
-        let cx = (fmin[0] + fmax[0]) * 0.5;
-        let cz = (fmin[2] + fmax[2]) * 0.5;
-        let y = fmin[1] + 0.12;
-        let (ax, az, dx, dz) = match facing {
-            CardinalFacing::North => (cx, fmin[2], 0.0, -2.0),
-            CardinalFacing::South => (cx, fmax[2], 0.0, 2.0),
-            CardinalFacing::East => (fmax[0], cz, 2.0, 0.0),
-            CardinalFacing::West => (fmin[0], cz, -2.0, 0.0),
-        };
+    for pl in preview_l {
         lines.push(WorldLine::new(
-            [ax, y, az],
-            [ax + dx, y, az + dz],
-            0xFFFBBF24,
-            3.5,
-            WorldDepth::ThroughWalls,
+            [fmin[0] + pl.a[0], fmin[1] + pl.a[1], fmin[2] + pl.a[2]],
+            [fmin[0] + pl.b[0], fmin[1] + pl.b[1], fmin[2] + pl.b[2]],
+            pl.color,
+            pl.width,
+            WorldDepth::Tested,
         ));
     }
+
+    if let Some(sy) = slice_y {
+        let cut_y = fmin[1] + f64::from(sy.clamp(0, i32::from(eff_h)) + 1) + 0.03;
+        let scol = crate::gen_preview::SLICE_CAP_ARGB | 0xFF00_0000;
+        for (p0, p1) in [
+            ([fmin[0], cut_y, fmin[2]], [fmax[0], cut_y, fmin[2]]),
+            ([fmax[0], cut_y, fmin[2]], [fmax[0], cut_y, fmax[2]]),
+            ([fmax[0], cut_y, fmax[2]], [fmin[0], cut_y, fmax[2]]),
+            ([fmin[0], cut_y, fmax[2]], [fmin[0], cut_y, fmin[2]]),
+        ] {
+            lines.push(WorldLine::new(p0, p1, scol, 2.2, WorldDepth::Tested));
+        }
+    }
+
+    // Golden directional arrow on front entrance side!
+    let cx = (fmin[0] + fmax[0]) * 0.5;
+    let cz = (fmin[2] + fmax[2]) * 0.5;
+    let y = fmin[1] + 0.14;
+    let (ax, az, dx, dz) = match facing {
+        CardinalFacing::North => (cx, fmin[2], 0.0, -2.0),
+        CardinalFacing::South => (cx, fmax[2], 0.0, 2.0),
+        CardinalFacing::East => (fmax[0], cz, 2.0, 0.0),
+        CardinalFacing::West => (fmin[0], cz, -2.0, 0.0),
+    };
+    lines.push(WorldLine::new(
+        [ax, y, az],
+        [ax + dx, y, az + dz],
+        0xFFFBBF24,
+        3.5,
+        WorldDepth::ThroughWalls,
+    ));
 
     if mode != WorldSelectMode::Inactive
         && let Some(p) = aimed
@@ -4511,6 +4511,15 @@ pub fn on_submit_custom_geometry(
             0xFFFACC15,
             2.0,
         );
+    }
+
+    let final_line_cap = usage.line_capacity.saturating_sub(usage.lines) as usize;
+    let final_quad_cap = usage.quad_capacity.saturating_sub(usage.quads) as usize;
+    if lines.len() > final_line_cap {
+        lines.truncate(final_line_cap);
+    }
+    if quads.len() > final_quad_cap {
+        quads.truncate(final_quad_cap);
     }
 
     if !lines.is_empty() {

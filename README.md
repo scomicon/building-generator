@@ -2,7 +2,7 @@
 
 **Building Generator** (`building_generator`) is an MIT-licensed bilingual (**English / Russian**) procedural architecture native mod for **Horizon** (Minecraft: Java Edition `26.3`, Horizon Native Mod API `0.2`).
 
-Generate detailed multi-room buildings, monuments, bridges, airship docks, castles, temples, and **Settlement 2.0** multi-district cities from English or Russian text prompts, world biomes, noise seeds, or the 72-structure catalog — complete with an interactive `F8` GUI featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), **Biome Auto-Style**, **0–100% Wear/Ruin & Overgrowth**, live 3D hologram preview, **Material Estimate (BOM)**, **Air Only** placement filter, 30-slot block lists, two-phase construction, **5-step Undo/Redo**, and **server OP security**.
+Generate detailed multi-room buildings, monuments, bridges, airship docks, castles, temples, and **Settlement 2.0** multi-district cities from English or Russian text prompts, world biomes, noise seeds, or the 72-structure catalog — complete with an interactive `F8` GUI featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), **live translucent bluish 3D hologram preview in the world before placement**, **Biome Auto-Style**, **0–100% Wear/Ruin & Overgrowth**, **Material Estimate (BOM)**, **Air Only** placement filter, 30-slot block lists, two-phase construction, **5-step Undo/Redo**, and **server OP security**.
 
 ---
 
@@ -24,7 +24,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
   - **Wear / Ruin (`0–100%`) & Overgrowth (`0–100%`):** Applies masonry cracking, copper oxidation stages, shattered panes, structural skyline collapse, fallen rubble, cobwebs, biome flora/moss carpets, clinging leaves, and hanging directional vines across all 61 themes, landmarks, bridges, and cities (`BG2:...` share codes & `favorites.txt` compatible).
 - **Interactive In-Game UI (`F8`):**
   - **Header Material Estimate (`Blocks: N` / `Смета: N`):** live block-count & stack breakdown (`xN (st+rem)`) across all required block types (with doors/beds counted per 2-block item) and one-click **Copy List** to clipboard.
-  - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, **Air Only** toggle (only replaces air blocks so existing builds & hillsides remain intact), persistent disk favorites (`favorites.txt`), `BG2:...` share codes (preserving `air_only`, `wear_pct`, and `overgrowth_pct`), and 3D wireframe + translucent quad hologram with vertical slicing (`[` / `]`).
+  - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, **Air Only** toggle (only replaces air blocks so existing builds & hillsides remain intact), persistent disk favorites (`favorites.txt`), `BG2:...` share codes (preserving `air_only`, `wear_pct`, and `overgrowth_pct`), and a real-time **semi-transparent bluish 3D architectural hologram** (greedy-merged walls, roofs, stairs, slabs, windows, lanterns, terrain foundations & basement geometry, vertical slicing `[` / `]`, auto-updating on any change).
   - **2. Style & Noise + 72-Preset Catalog:** category/style/roof overrides, **Biome Auto**, **Wear %**, **Moss %**, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
   - **3. Materials (30 Architectural Slots):** scrollable slot inspector, per-slot ordered block lists (`Patches` / `Scatter` / `Stripes` / `Checker` mix modes), and a dedicated searchable block picker with item icons (`Rec.` / `All` world blocks).
 - **Safe Two-Phase Placement, Undo/Redo & Server Security:**
@@ -52,7 +52,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
 ## Installation
 
 ### From Release (`.hmod`)
-1. Download `building_generator-0.4.1.hmod` from the release artifacts.
+1. Download `building_generator-0.4.2.hmod` from the release artifacts.
 2. Place it in your Horizon instance's `horizon-mods/` (or `horizon-native-mods/`) folder, or add it via the Horizon Launcher Native Mods tab.
 3. Rebuild the instance with native code trusted (`--trust-native-code`) in Horizon Launcher.
 
