@@ -3,7 +3,7 @@ use mod_api::PayloadCodec;
 /// Mod version string, falling back when Horizon's prebuilt-api rustc compiles without Cargo env vars.
 pub const MOD_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(ver) => ver,
-    None => "0.2.1",
+    None => "0.3.0",
 };
 
 /// UI and chat feedback language supported by the mod (`En` default, switchable to `Ru`).
@@ -2307,12 +2307,19 @@ pub struct BuildRequest {
     pub seed: i64,
     pub description: String,
     pub adapt_terrain: bool,
+    pub air_only: bool,
     pub palette: MaterialPalette,
 }
 
 /// Client-to-server undo request.
 #[derive(Clone, Debug, PartialEq, Eq, PayloadCodec)]
 pub struct UndoRequest {
+    pub dimension: String,
+}
+
+/// Client-to-server redo request: re-apply the last undone build edit.
+#[derive(Clone, Debug, PartialEq, Eq, PayloadCodec)]
+pub struct RedoRequest {
     pub dimension: String,
 }
 

@@ -1,4 +1,4 @@
 {
   "mod.building_generator.name": "Building Generator",
-  "mod.building_generator.description": "Bilingual (EN/RU) noise-driven procedural building generator from descriptions, catalog presets, and custom material lists"
+  "mod.building_generator.description": "Bilingual (EN/RU) noise-driven procedural building generator with 3D hologram preview, material estimate, air-only mode, undo/redo, and OP security"
 }

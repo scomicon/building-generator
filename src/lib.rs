@@ -155,8 +155,8 @@ mod tests {
     use crate::noise::NoiseField;
     use crate::parser::{StructureTheme, infer_palette_from_text, parse_description};
     use crate::server_builder::{
-        CLI_PRESETS, blueprint_to_phased_runs, execute_build, execute_reroll, execute_undo,
-        find_cli_preset, handle_command,
+        CLI_PRESETS, blueprint_to_phased_runs, execute_build, execute_redo, execute_reroll,
+        execute_undo, find_cli_preset, handle_command,
     };
     use crate::BuildingGeneratorMod;
 
@@ -176,6 +176,7 @@ mod tests {
             seed,
             description: desc.into(),
             adapt_terrain: true,
+            air_only: false,
             palette: MaterialPalette::preset(0),
         }
     }
@@ -730,6 +731,7 @@ mod tests {
         world_blocks: BTreeMap<[i32; 3], BlockState>,
         air_key: BlockKey,
         sent_payloads: Vec<(String, Vec<u8>)>,
+        player_perms: HashMap<u128, u8>,
     }
 
     impl TestWorldHost {
@@ -747,6 +749,7 @@ mod tests {
                 world_blocks: BTreeMap::new(),
                 air_key,
                 sent_payloads: Vec::new(),
+                player_perms: HashMap::new(),
             };
             let grass = BlockStateRecord::new(grass_key, 0).into();
             for x in 0..40 {
@@ -755,6 +758,10 @@ mod tests {
                 }
             }
             host
+        }
+
+        fn set_player_perm(&mut self, uuid: u128, level: u8) {
+            self.player_perms.insert(uuid, level);
         }
     }
 
@@ -933,10 +940,25 @@ mod tests {
                 .get(player.uuid())
                 .and_then(|_| mod_api::Identifier::parse("minecraft:overworld").ok())
         }
+
+        fn player_permission_level(&self, player: mod_api::PlayerRef) -> Option<u8> {
+            self.fake.players.get(player.uuid())?;
+            Some(self.player_perms.get(&player.uuid()).copied().unwrap_or(4))
+        }
     }
 
     impl BackendMut for TestWorldHost {}
-    mod_api::impl_backend_mut_areas!(TestWorldHost, except(payloads));
+    mod_api::impl_backend_mut_areas!(TestWorldHost, except(payloads, players));
+
+    impl PlayersBackendMut for TestWorldHost {
+        fn player_tell(
+            &mut self,
+            _player: mod_api::PlayerRef,
+            _line: mod_api::Text,
+        ) -> Result<bool, mod_api::TextFormError> {
+            Ok(true)
+        }
+    }
 
     impl PayloadsBackendMut for TestWorldHost {
         fn player_send_payload(
@@ -962,6 +984,8 @@ mod tests {
                 ModEntry::new("test_registry", Box::new(TestRegistryMod)),
             ];
             mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
             let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
 
             let mut host = TestWorldHost::new(keys);
@@ -1075,9 +1099,23 @@ mod tests {
         let usages: Vec<&str> = cmds.iter().map(|c| c.usage.as_str()).collect();
         assert!(usages.contains(&"buildgen"));
         assert!(usages.contains(&"buildgen undo"));
+        assert!(usages.contains(&"buildgen redo"));
         assert!(usages.contains(&"buildgen lang <lang:text>"));
         assert!(usages.iter().any(|u| u.starts_with("buildgen generate")));
         assert!(usages.iter().any(|u| u.starts_with("buildgen size")));
+        for cmd in &cmds {
+            if matches!(
+                cmd.usage.as_str(),
+                "buildgen undo"
+                    | "buildgen redo"
+                    | "buildgen reroll"
+                    | "buildgen preset <preset:text>"
+                    | "buildgen generate <description:text>"
+            ) || cmd.usage.starts_with("buildgen size ")
+            {
+                assert!(cmd.level >= 2, "expected OP level >= 2 for {}", cmd.usage);
+            }
+        }
 
         let mut suggestions = Vec::new();
         let mut tab_ev = mod_api::TabCompleteEvent {
@@ -1091,6 +1129,7 @@ mod tests {
         assert!(suggestions.iter().any(|s| s.text == "generate"));
         assert!(suggestions.iter().any(|s| s.text == "lang"));
         assert!(suggestions.iter().any(|s| s.text == "undo"));
+        assert!(suggestions.iter().any(|s| s.text == "redo"));
 
         let mut lang_suggestions = Vec::new();
         let mut tab_lang = mod_api::TabCompleteEvent {
@@ -1305,6 +1344,8 @@ mod tests {
                 ModEntry::new("test_registry", Box::new(TestRegistryMod)),
             ];
             mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
             let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
 
             let mut host = TestWorldHost::new(keys);
@@ -1323,7 +1364,7 @@ mod tests {
             let b1 = execute_build(&mut host, Some(player), req);
             assert!(b1.ok, "initial build failed: {}", b1.message);
             assert!(
-                b1.message.contains("[undo: 1/5]") || b1.message.contains("[отмен: 1/5]"),
+                b1.message.contains("[undo: 1/5") || b1.message.contains("[отмен: 1/5"),
                 "Build message should expose undo stack depth: {}",
                 b1.message
             );
@@ -1334,7 +1375,7 @@ mod tests {
             let reroll_resp = execute_reroll(&mut host, Some(player), "minecraft:overworld");
             assert!(reroll_resp.ok, "reroll failed: {}", reroll_resp.message);
             assert!(
-                reroll_resp.message.contains("[undo: 1/5]") || reroll_resp.message.contains("[отмен: 1/5]"),
+                reroll_resp.message.contains("[undo: 1/5") || reroll_resp.message.contains("[отмен: 1/5"),
                 "Reroll should keep stack at 1/5: {}",
                 reroll_resp.message
             );
@@ -1345,7 +1386,7 @@ mod tests {
             let undo_resp = execute_undo(&mut host, Some(player), "minecraft:overworld");
             assert!(undo_resp.ok, "undo after reroll failed: {}", undo_resp.message);
             assert!(
-                undo_resp.message.contains("[undo: 0/5]") || undo_resp.message.contains("[отмен: 0/5]"),
+                undo_resp.message.contains("[undo: 0/5") || undo_resp.message.contains("[отмен: 0/5"),
                 "Undo message should report 0/5 remaining: {}",
                 undo_resp.message
             );
@@ -1369,6 +1410,7 @@ mod tests {
                     seed: 1000 + idx as i64,
                     description: desc.into(),
                     adapt_terrain: true,
+                    air_only: false,
                     palette: pal,
                 };
                 let pbp = generate_blueprint(&preq, None);
@@ -2650,6 +2692,7 @@ mod tests {
             toggles: [1, 2, 0, 1, 1],
             noise_level: NoiseLevel::Wild,
             adapt_terrain: true,
+            air_only: true,
             description: "квартал античный с колоннами и садом".into(),
             seed: 987_654_321,
             palette_manual: true,
@@ -2823,6 +2866,7 @@ mod tests {
             toggles: [1, 1, 1, 1, 1],
             noise_level: NoiseLevel::Balanced,
             adapt_terrain: true,
+            air_only: false,
             description: "двухэтажная уютная таверна лавка с крыльцом и садом".into(),
             seed: 4242,
             palette_manual: true,
@@ -3138,6 +3182,7 @@ mod tests {
             toggles: [0, 1, 2, 0, 1],
             noise_level: NoiseLevel::Balanced,
             adapt_terrain: true,
+            air_only: false,
             description: "дом с разными блоками".into(),
             seed: 987654,
             palette_manual: true,
@@ -3632,6 +3677,8 @@ mod tests {
                 ModEntry::new("test_registry", Box::new(TestRegistryMod)),
             ];
             mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
             let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
             let mut host = TestWorldHost::new(keys);
             host.fake.join(99, 100);
@@ -3696,6 +3743,271 @@ mod tests {
             let en_build = execute_build(&mut host, Some(player), sample_request("cozy house", 12346));
             assert!(en_build.ok);
             assert!(en_build.message.contains("[undo:"), "Expected EN feedback: {}", en_build.message);
+        });
+    }
+
+    #[test]
+    fn v030_redo_air_only_bom_and_server_security_work() {
+        use crate::model::{RedoRequest, SetLangRequest, UiLang, UndoRequest};
+        use crate::server_builder::{
+            clear_rate_limit_for_test, handle_build_payload, handle_redo_payload,
+            handle_reroll_payload, handle_undo_payload, player_lang, set_player_lang,
+        };
+        use std::sync::Arc;
+
+        struct TestPayloadContext<'a> {
+            host: &'a mut TestWorldHost,
+            player: mod_api::PlayerRef,
+            replies: Vec<(String, Vec<u8>)>,
+        }
+
+        impl mod_api::IPayloadContext for TestPayloadContext<'_> {
+            fn player(&self) -> Result<mod_api::PlayerRef, mod_api::PayloadContextError> {
+                Ok(self.player)
+            }
+            fn flow(&self) -> mod_api::PayloadDirection {
+                mod_api::PayloadDirection::ToServer
+            }
+            fn protocol(&self) -> mod_api::PayloadProtocol {
+                mod_api::PayloadProtocol::Play
+            }
+            fn server_host(&mut self) -> Result<&mut dyn ServerHost, mod_api::PayloadContextError> {
+                Ok(self.host)
+            }
+            fn client_host(&mut self) -> Result<&mut dyn ClientHost, mod_api::PayloadContextError> {
+                Err(mod_api::PayloadContextError::WrongSide)
+            }
+            fn reply(
+                &mut self,
+                id: &mod_api::PayloadId,
+                bytes: mod_api::PayloadBytes,
+            ) -> Result<mod_api::PayloadAccepted, mod_api::PayloadSendError> {
+                self.replies.push((id.0.clone(), bytes.0));
+                Ok(mod_api::PayloadAccepted::Queued)
+            }
+            fn check_payload_token(
+                &self,
+                _: &mod_api::PayloadToken,
+            ) -> Result<(), mod_api::PayloadSendError> {
+                Ok(())
+            }
+            fn disconnect(&mut self, _: mod_api::Text) {}
+            fn enqueue_work(
+                &mut self,
+                _: Arc<dyn mod_api::PayloadWork>,
+            ) -> Result<mod_api::PayloadWorkStatus, mod_api::PayloadContextError> {
+                Ok(mod_api::PayloadWorkStatus::Complete)
+            }
+        }
+
+        // 1. RedoRequest + BuildRequest(air_only=true) codec roundtrip + BOM check.
+        let redo_req = RedoRequest {
+            dimension: "minecraft:overworld".into(),
+        };
+        let rbytes = encode_payload(&redo_req, 1024).expect("encode RedoRequest");
+        assert_eq!(decode_payload::<RedoRequest>(&rbytes).unwrap(), redo_req);
+
+        let mut air_req = sample_request("cozy oak house with porch", 31337);
+        air_req.air_only = true;
+        let bbytes = encode_payload(&air_req, 65_536).expect("encode BuildRequest");
+        assert_eq!(decode_payload::<BuildRequest>(&bbytes).unwrap(), air_req);
+
+        let bom_bp = generate_blueprint(&air_req, None);
+        let (total_non_air, bom) = bom_bp.material_breakdown();
+        assert_eq!(total_non_air, bom_bp.non_air_count());
+        assert!(!bom.is_empty());
+        assert!(bom.windows(2).all(|w| w[0].1 >= w[1].1), "BOM must sort descending");
+
+        // 2. End-to-end Undo -> Redo, Air Only preservation, OP security, sanitization, rate limit.
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(201, 100);
+            host.fake.join(202, 100);
+            let non_op = host.player(201).unwrap();
+            let op_player = host.player(202).unwrap();
+            host.set_player_perm(201, 0);
+            host.set_player_perm(202, 2);
+            set_player_lang(Some(non_op), UiLang::En);
+            set_player_lang(Some(op_player), UiLang::En);
+            clear_rate_limit_for_test();
+
+            // Place protective stone pillar inside build box [10..23, 64..76, 20..31].
+            let stone_key = host.id_to_key["minecraft:cobblestone"];
+            let stone_state: BlockState = BlockStateRecord::new(stone_key, 0).into();
+            let mut protected = Vec::new();
+            for y in 64..=69 {
+                for x in 15..=17 {
+                    for z in 24..=26 {
+                        host.world_blocks.insert([x, y, z], stone_state);
+                        protected.push([x, y, z]);
+                    }
+                }
+            }
+            let before_air = host.world_blocks.clone();
+
+            // Non-OP player cannot build/undo/redo via command or payload, though can switch lang.
+            let level_dim = host.level("minecraft:overworld").unwrap().dimension();
+            let gen_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "generate".into()],
+                vec![CommandArgument::new(
+                    "description".into(),
+                    CommandArgumentValue::String("cozy house".into()),
+                )],
+                level_dim,
+                [15.0, 64.0, 15.0],
+            );
+            let mut deny_ev = RunModCommandEvent {
+                command: &gen_cmd,
+                source: &CommandSource::Player {
+                    player: non_op,
+                    permission: PermissionLevel::All,
+                },
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut deny_ev), Flow::Cancel);
+            assert_eq!(host.world_blocks, before_air, "Non-OP command must not modify world");
+
+            let lang_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "lang".into()],
+                vec![CommandArgument::new(
+                    "lang".into(),
+                    CommandArgumentValue::String("ru".into()),
+                )],
+                level_dim,
+                [15.0, 64.0, 15.0],
+            );
+            let mut lang_ev = RunModCommandEvent {
+                command: &lang_cmd,
+                source: &CommandSource::Player {
+                    player: non_op,
+                    permission: PermissionLevel::All,
+                },
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut lang_ev), Flow::Cancel);
+            assert_eq!(player_lang(Some(non_op)), UiLang::Ru);
+
+            {
+                let mut cx = TestPayloadContext {
+                    host: &mut host,
+                    player: non_op,
+                    replies: Vec::new(),
+                };
+                handle_build_payload(sample_request("cozy house", 111), &mut cx).unwrap();
+                handle_undo_payload(UndoRequest { dimension: "minecraft:overworld".into() }, &mut cx).unwrap();
+                handle_redo_payload(RedoRequest { dimension: "minecraft:overworld".into() }, &mut cx).unwrap();
+                handle_reroll_payload(crate::model::RerollRequest { dimension: "minecraft:overworld".into() }, &mut cx).unwrap();
+            }
+            assert_eq!(host.world_blocks, before_air, "Non-OP payloads must never modify world");
+
+            // Air-only build by OP player preserves all pre-existing cobblestone blocks!
+            let b_resp = execute_build(&mut host, Some(op_player), air_req);
+            assert!(b_resp.ok, "air-only build failed: {}", b_resp.message);
+            assert!(b_resp.message.contains("redo: 0/5"), "expected redo counter: {}", b_resp.message);
+            for pos in &protected {
+                assert_eq!(
+                    host.world_blocks.get(pos).copied(),
+                    Some(stone_state),
+                    "air_only mode overwrote existing block at {:?}",
+                    pos
+                );
+            }
+            let built_snapshot = host.world_blocks.clone();
+            assert_ne!(built_snapshot, before_air);
+
+            // Undo restores exact pre-build state, then Redo restores built snapshot!
+            let u_resp = execute_undo(&mut host, Some(op_player), "minecraft:overworld");
+            assert!(u_resp.ok && u_resp.message.contains("redo: 1/5"), "unexpected undo msg: {}", u_resp.message);
+            assert_eq!(host.world_blocks, before_air);
+
+            let r_resp = execute_redo(&mut host, Some(op_player), "minecraft:overworld");
+            assert!(r_resp.ok && r_resp.message.contains("undo: 1/5 | redo: 0/5"), "unexpected redo msg: {}", r_resp.message);
+            assert_eq!(host.world_blocks, built_snapshot);
+
+            // Undo again, then a fresh build clears Redo stack.
+            assert!(execute_undo(&mut host, Some(op_player), "minecraft:overworld").ok);
+            let mut normal_req = sample_request("cozy oak house", 4242);
+            normal_req.width = 11;
+            normal_req.depth = 9;
+            assert!(execute_build(&mut host, Some(op_player), normal_req).ok);
+            assert!(!execute_redo(&mut host, Some(op_player), "minecraft:overworld").ok);
+
+            // Request bounds sanitization + network rate limiter + Undo/Redo payloads.
+            clear_rate_limit_for_test();
+            let mut bloated = sample_request(&"a".repeat(900), 9090);
+            bloated.width = 500;
+            bloated.depth = 500;
+            bloated.height = 500;
+            bloated.origin_x = 99_999_999;
+            bloated.origin_y = -9999;
+            bloated.dimension = "".into();
+            let sanitized = crate::server_builder::sanitize_build_request(bloated);
+            assert_eq!(sanitized.width, 96);
+            assert_eq!(sanitized.depth, 96);
+            assert_eq!(sanitized.height, 48);
+            assert_eq!(sanitized.origin_x, 29_999_900);
+            assert_eq!(sanitized.origin_y, -2048);
+            assert_eq!(sanitized.dimension, "minecraft:overworld");
+            assert_eq!(sanitized.description.chars().count(), 512);
+
+            let mut net_req = sample_request(&"b".repeat(800), 9090);
+            net_req.width = 13;
+            net_req.depth = 11;
+            net_req.height = 10;
+            net_req.dimension = "   ".into();
+            let before_net = host.world_blocks.clone();
+            {
+                let mut cx = TestPayloadContext {
+                    host: &mut host,
+                    player: op_player,
+                    replies: Vec::new(),
+                };
+                handle_build_payload(net_req.clone(), &mut cx).unwrap();
+            }
+            let after_net = host.world_blocks.clone();
+            assert_ne!(after_net, before_net);
+            {
+                let mut cx = TestPayloadContext {
+                    host: &mut host,
+                    player: op_player,
+                    replies: Vec::new(),
+                };
+                // Immediate second build triggers rate limiter without modifying world again.
+                handle_build_payload(net_req, &mut cx).unwrap();
+            }
+            assert_eq!(host.world_blocks, after_net, "rate-limited build must not mutate world");
+            clear_rate_limit_for_test();
+            {
+                let mut cx = TestPayloadContext {
+                    host: &mut host,
+                    player: op_player,
+                    replies: Vec::new(),
+                };
+                handle_undo_payload(UndoRequest { dimension: "minecraft:overworld".into() }, &mut cx).unwrap();
+            }
+            assert_eq!(host.world_blocks, before_net, "Undo payload must restore world");
+            {
+                let mut cx = TestPayloadContext {
+                    host: &mut host,
+                    player: op_player,
+                    replies: Vec::new(),
+                };
+                handle_redo_payload(RedoRequest { dimension: "minecraft:overworld".into() }, &mut cx).unwrap();
+            }
+            assert_eq!(host.world_blocks, after_net, "Redo payload must re-apply build");
+            let _ = SetLangRequest { lang: UiLang::En };
         });
     }
 }

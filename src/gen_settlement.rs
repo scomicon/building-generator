@@ -278,6 +278,7 @@ pub fn generate_settlement(
             seed: (req.seed as u64 ^ 0xB41D_6E00_1122).cast_signed(),
             description: "арочный каменный мост через канал".into(),
             adapt_terrain: req.adapt_terrain,
+            air_only: req.air_only,
             palette: pal.clone(),
         };
         let bridge_bp = crate::generator::generate_blueprint_with_water(&bridge_req, None, None);
@@ -313,6 +314,7 @@ pub fn generate_settlement(
             seed: (req.seed as u64 ^ 0xC10C_4700_0001).cast_signed(),
             description: mon_desc.into(),
             adapt_terrain: false,
+            air_only: false,
             palette: pal.clone(),
         };
         let mon_bp = crate::generator::generate_blueprint_with_water(&mon_req, None, None);
@@ -535,6 +537,7 @@ pub fn generate_settlement(
             seed: sub_seed as i64,
             description: full_desc,
             adapt_terrain: req.adapt_terrain,
+            air_only: req.air_only,
             palette: pal.clone(),
         };
         let sub_bp = crate::generator::generate_blueprint_with_water(

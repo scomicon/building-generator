@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static CMD_BUILD_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -13,14 +14,15 @@ use mod_api::{
 
 use crate::generator::{GeneratedBlueprint, PlannedBlock};
 use crate::model::{
-    BuildCategory, BuildRequest, BuildResponse, CardinalFacing, NoiseLevel, RerollRequest,
-    SetLangRequest, UiLang, UndoRequest,
+    BuildCategory, BuildRequest, BuildResponse, CardinalFacing, MaterialPalette, NoiseLevel,
+    RedoRequest, RerollRequest, SetLangRequest, UiLang, UndoRequest,
 };
 use crate::network::channels;
 
 pub const BATCH_TASK_TOKEN: u64 = 0x4247_5F42_4154_4348; // "BG_BATCH"
 const MAX_RUNS_PER_BATCH: usize = 3000;
 const MAX_UNDO_HISTORY_PER_PLAYER: usize = 5;
+const MIN_NETWORK_BUILD_INTERVAL: Duration = Duration::from_millis(350);
 
 #[derive(Clone)]
 struct UndoEntry {
@@ -41,12 +43,20 @@ struct PendingBatchJob {
 }
 
 static UNDO_STACK: Mutex<Option<HashMap<u128, Vec<UndoEntry>>>> = Mutex::new(None);
+static REDO_STACK: Mutex<Option<HashMap<u128, Vec<UndoEntry>>>> = Mutex::new(None);
 static LAST_REQUESTS: Mutex<Option<HashMap<u128, BuildRequest>>> = Mutex::new(None);
 static PENDING_JOBS: Mutex<Option<VecDeque<PendingBatchJob>>> = Mutex::new(None);
 static PLAYER_LANG: Mutex<Option<HashMap<u128, UiLang>>> = Mutex::new(None);
+static LAST_BUILD_AT: Mutex<Option<HashMap<u128, Instant>>> = Mutex::new(None);
 
 fn with_undo_map<R>(f: impl FnOnce(&mut HashMap<u128, Vec<UndoEntry>>) -> R) -> R {
     let mut guard = UNDO_STACK.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
+fn with_redo_map<R>(f: impl FnOnce(&mut HashMap<u128, Vec<UndoEntry>>) -> R) -> R {
+    let mut guard = REDO_STACK.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
 }
@@ -61,6 +71,113 @@ fn with_pending_jobs<R>(f: impl FnOnce(&mut VecDeque<PendingBatchJob>) -> R) -> 
     let mut guard = PENDING_JOBS.lock().unwrap_or_else(|e| e.into_inner());
     let q = guard.get_or_insert_with(VecDeque::new);
     f(q)
+}
+
+#[inline]
+fn tr<'a>(lang: UiLang, en: &'a str, ru: &'a str) -> &'a str {
+    match lang {
+        UiLang::En => en,
+        UiLang::Ru => ru,
+    }
+}
+
+pub fn player_has_build_permission(host: &dyn ServerHost, player: PlayerRef) -> bool {
+    player.permission_level(host).is_some_and(|lvl| lvl >= 2)
+}
+
+fn deny_permission_response(lang: UiLang) -> BuildResponse {
+    BuildResponse {
+        ok: false,
+        blocks_changed: 0,
+        message: tr(
+            lang,
+            "Permission denied: operator level 2+ (OP) required.",
+            "Недостаточно прав: требуется уровень оператора (OP 2+).",
+        )
+        .to_owned(),
+    }
+}
+
+fn check_network_action_allowed(
+    host: &dyn ServerHost,
+    player: PlayerRef,
+    lang: UiLang,
+    check_build_rate: bool,
+) -> Result<(), BuildResponse> {
+    if !player_has_build_permission(host, player) {
+        return Err(deny_permission_response(lang));
+    }
+    if check_build_rate {
+        let uid = player.uuid();
+        let active_job = with_pending_jobs(|q| q.iter().any(|j| j.player_uuid == Some(uid)));
+        if active_job {
+            return Err(BuildResponse {
+                ok: false,
+                blocks_changed: 0,
+                message: tr(
+                    lang,
+                    "Previous large build is still finishing. Please wait...",
+                    "Предыдущая крупная постройка ещё строится, подождите...",
+                )
+                .to_owned(),
+            });
+        }
+        let mut guard = LAST_BUILD_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        if let Some(&prev) = map.get(&uid)
+            && now.saturating_duration_since(prev) < MIN_NETWORK_BUILD_INTERVAL
+        {
+            return Err(BuildResponse {
+                ok: false,
+                blocks_changed: 0,
+                message: tr(
+                    lang,
+                    "Too many requests: wait a moment before next build.",
+                    "Слишком часто: подождите немного перед следующей постройкой.",
+                )
+                .to_owned(),
+            });
+        }
+        map.insert(uid, now);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn clear_rate_limit_for_test() {
+    if let Ok(mut guard) = LAST_BUILD_AT.lock()
+        && let Some(map) = guard.as_mut()
+    {
+        map.clear();
+    }
+}
+
+pub(crate) fn sanitize_build_request(mut req: BuildRequest) -> BuildRequest {
+    req.width = req.width.clamp(7, 96);
+    req.depth = req.depth.clamp(7, 96);
+    req.height = req.height.clamp(5, 48);
+    req.origin_x = req.origin_x.clamp(-29_999_900, 29_999_900);
+    req.origin_y = req.origin_y.clamp(-2048, 2048);
+    req.origin_z = req.origin_z.clamp(-29_999_900, 29_999_900);
+    if req.dimension.chars().count() > 128 || req.dimension.trim().is_empty() {
+        req.dimension = "minecraft:overworld".into();
+    }
+    req.description = req.description.chars().take(512).collect();
+    req.palette.name = req.palette.name.chars().take(64).collect();
+    let max_extra = MaterialPalette::MAX_BLOCKS_PER_SLOT.saturating_sub(1);
+    req.palette
+        .extra_lists
+        .retain(|e| usize::from(e.slot) < MaterialPalette::SLOT_COUNT);
+    req.palette.extra_lists.truncate(MaterialPalette::SLOT_COUNT);
+    for entry in &mut req.palette.extra_lists {
+        entry
+            .blocks
+            .retain(|b| !b.is_empty() && b.len() <= 128);
+        entry.blocks.truncate(max_extra);
+    }
+    req.palette.extra_lists.retain(|e| !e.blocks.is_empty());
+    req
 }
 
 pub fn player_lang(player: Option<PlayerRef>) -> UiLang {
@@ -254,12 +371,65 @@ pub fn blueprint_to_runs(
     Ok((palette, phase1))
 }
 
-fn capture_undo_snapshot(
+fn collect_air_keys(host: &dyn ServerHost) -> Vec<BlockKey> {
+    let mut keys = Vec::with_capacity(3);
+    for id in ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"] {
+        if let Some(k) = host.block_key(id) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+fn retain_complete_doors(blocks: &mut std::collections::BTreeMap<[i32; 3], PlannedBlock>) {
+    let drop_coords: Vec<[i32; 3]> = blocks
+        .iter()
+        .filter_map(|(&[x, y, z], blk)| {
+            if !blk.block_id.ends_with("_door") {
+                return None;
+            }
+            let is_upper = blk.props.iter().any(|&(k, v)| k == "half" && v == "upper");
+            let partner = if is_upper { [x, y - 1, z] } else { [x, y + 1, z] };
+            if blocks
+                .get(&partner)
+                .is_some_and(|p| p.block_id.ends_with("_door"))
+            {
+                None
+            } else {
+                Some([x, y, z])
+            }
+        })
+        .collect();
+    for pos in drop_coords {
+        blocks.remove(&pos);
+    }
+}
+
+fn prepare_undo_and_filter_blueprint(
     host: &dyn ServerHost,
     dimension: &str,
-    bp: &GeneratedBlueprint,
+    bp: &mut GeneratedBlueprint,
+    air_only: bool,
 ) -> Option<UndoEntry> {
     let level = host.level(dimension)?;
+    if air_only {
+        let air_keys = collect_air_keys(host);
+        let orig = bp.origin;
+        bp.blocks.retain(|&[lx, ly, lz], planned| {
+            if matches!(
+                planned.block_id.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ) {
+                return false;
+            }
+            let pos = [orig[0] + lx, orig[1] + ly, orig[2] + lz];
+            level
+                .block_state(host, pos)
+                .is_some_and(|st| air_keys.contains(&st.block()))
+        });
+        retain_complete_doors(&mut bp.blocks);
+    }
+
     let mut previous_blocks = Vec::with_capacity(bp.blocks.len());
     for &[lx, ly, lz] in bp.blocks.keys() {
         let pos = [bp.origin[0] + lx, bp.origin[1] + ly, bp.origin[2] + lz];
@@ -275,6 +445,81 @@ fn capture_undo_snapshot(
             previous_blocks,
         })
     }
+}
+
+fn capture_positions_snapshot(
+    host: &dyn ServerHost,
+    dimension: &str,
+    entries: &[([i32; 3], BlockState)],
+) -> Option<UndoEntry> {
+    let level = host.level(dimension)?;
+    let mut current = Vec::with_capacity(entries.len());
+    for &(pos, _) in entries {
+        if let Some(st) = level.block_state(host, pos) {
+            current.push((pos, st));
+        }
+    }
+    if current.is_empty() {
+        None
+    } else {
+        Some(UndoEntry {
+            dimension: dimension.to_owned(),
+            previous_blocks: current,
+        })
+    }
+}
+
+fn apply_state_snapshot(
+    host: &mut dyn ServerHost,
+    dimension: &str,
+    entries: &[([i32; 3], BlockState)],
+) -> Result<u64, String> {
+    let mut palette: Vec<BlockState> = Vec::new();
+    let mut state_to_idx: HashMap<BlockState, u32> = HashMap::new();
+    let mut runs = Vec::with_capacity(entries.len());
+
+    for &(pos, state) in entries {
+        let idx = if let Some(&existing) = state_to_idx.get(&state) {
+            existing
+        } else {
+            let idx = palette.len() as u32;
+            palette.push(state);
+            state_to_idx.insert(state, idx);
+            idx
+        };
+        runs.push(BlockRun {
+            x: pos[0],
+            z: pos[2],
+            y: pos[1],
+            height: 1,
+            surface: None,
+            block: idx,
+            only: None,
+        });
+    }
+
+    let mut total_changed = 0u64;
+    for chunk in runs.chunks(MAX_RUNS_PER_BATCH) {
+        let edit = BlockEdit {
+            palette: palette.clone(),
+            filters: Vec::new(),
+            runs: chunk.to_vec(),
+        };
+        total_changed += host.edit_blocks(dimension, &edit)?;
+    }
+    Ok(total_changed)
+}
+
+fn push_history_entry(
+    stack_map: &mut HashMap<u128, Vec<UndoEntry>>,
+    owner_key: u128,
+    entry: UndoEntry,
+) {
+    let stack = stack_map.entry(owner_key).or_default();
+    if stack.len() >= MAX_UNDO_HISTORY_PER_PLAYER {
+        stack.remove(0);
+    }
+    stack.push(entry);
 }
 
 fn sample_terrain_info(
@@ -319,6 +564,10 @@ fn undo_depth(owner_key: u128) -> usize {
     with_undo_map(|map| map.get(&owner_key).map_or(0, Vec::len))
 }
 
+fn redo_depth(owner_key: u128) -> usize {
+    with_redo_map(|map| map.get(&owner_key).map_or(0, Vec::len))
+}
+
 /// Core server execution used by both typed payload requests and `/buildgen` chat commands.
 pub fn execute_build(
     host: &mut dyn ServerHost,
@@ -326,22 +575,46 @@ pub fn execute_build(
     req: BuildRequest,
 ) -> BuildResponse {
     let lang = player_lang(player);
+    if let Some(p) = player
+        && !player_has_build_permission(host, p)
+    {
+        return deny_permission_response(lang);
+    }
+
+    let req = sanitize_build_request(req);
+    if host.level(&req.dimension).is_none() {
+        return BuildResponse {
+            ok: false,
+            blocks_changed: 0,
+            message: match lang {
+                UiLang::En => format!("Unknown dimension: {}", req.dimension),
+                UiLang::Ru => format!("Неизвестное измерение: {}", req.dimension),
+            },
+        };
+    }
+
     let (terrain_offsets, water_depths) = sample_terrain_info(host, &req);
-    let bp = crate::generator::generate_blueprint_with_water(
+    let mut bp = crate::generator::generate_blueprint_with_water(
         &req,
         terrain_offsets.as_deref(),
         water_depths.as_deref(),
     );
 
     let owner_key = player.map_or(0, PlayerRef::uuid);
-    if let Some(snapshot) = capture_undo_snapshot(host, &req.dimension, &bp) {
-        with_undo_map(|map| {
-            let stack = map.entry(owner_key).or_default();
-            if stack.len() >= MAX_UNDO_HISTORY_PER_PLAYER {
-                stack.remove(0);
-            }
-            stack.push(snapshot);
-        });
+    let undo_snapshot =
+        prepare_undo_and_filter_blueprint(host, &req.dimension, &mut bp, req.air_only);
+
+    if req.air_only && bp.blocks.is_empty() {
+        return BuildResponse {
+            ok: false,
+            blocks_changed: 0,
+            message: tr(
+                lang,
+                "No air blocks available inside target area (Air Only).",
+                "В выбранной области нет воздушных блоков (режим «Только воздух»).",
+            )
+            .to_owned(),
+        };
     }
 
     let (palette, phase1_runs, phase2_runs) = match blueprint_to_phased_runs(host, &bp) {
@@ -370,6 +643,12 @@ pub fn execute_build(
         };
     }
 
+    if let Some(snapshot) = undo_snapshot {
+        with_undo_map(|map| push_history_entry(map, owner_key, snapshot));
+    }
+    with_redo_map(|map| {
+        map.remove(&owner_key);
+    });
     with_last_requests(|map| {
         map.insert(owner_key, req.clone());
     });
@@ -422,7 +701,7 @@ pub fn execute_build(
             blocks_changed: changed.min(i32::MAX as u64) as i32,
             message: match lang {
                 UiLang::En => format!(
-                    "Ready: {} ({}) {}x{}x{} (seed {}, blocks changed: {}) [undo: {}/{}].",
+                    "Ready: {} ({}) {}x{}x{} (seed {}, blocks changed: {}) [undo: {}/{} | redo: 0/{}].",
                     bp.spec.category.label(UiLang::En),
                     bp.spec.style.label(UiLang::En),
                     bp.width,
@@ -431,10 +710,11 @@ pub fn execute_build(
                     req.seed,
                     changed,
                     undo_count,
+                    MAX_UNDO_HISTORY_PER_PLAYER,
                     MAX_UNDO_HISTORY_PER_PLAYER
                 ),
                 UiLang::Ru => format!(
-                    "Готово: {} ({}) {}x{}x{} (сид {}, изменено блоков: {}) [отмен: {}/{}].",
+                    "Готово: {} ({}) {}x{}x{} (сид {}, изменено блоков: {}) [отмен: {}/{} | возврат: 0/{}].",
                     bp.spec.category.label_ru(),
                     bp.spec.style.label_ru(),
                     bp.width,
@@ -443,6 +723,7 @@ pub fn execute_build(
                     req.seed,
                     changed,
                     undo_count,
+                    MAX_UNDO_HISTORY_PER_PLAYER,
                     MAX_UNDO_HISTORY_PER_PLAYER
                 ),
             },
@@ -526,12 +807,12 @@ pub fn execute_build(
                     blocks_changed: first_changed.min(i32::MAX as u64) as i32,
                     message: match lang {
                         UiLang::En => format!(
-                            "Large build ({} blocks/segments) building per tick (seed {}) [undo: {}/{}].",
-                            total_runs, req.seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER
+                            "Large build ({} blocks/segments) building per tick (seed {}) [undo: {}/{} | redo: 0/{}].",
+                            total_runs, req.seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER, MAX_UNDO_HISTORY_PER_PLAYER
                         ),
                         UiLang::Ru => format!(
-                            "Крупная постройка ({} блоков/сегментов) строится по тикам (сид {}) [отмен: {}/{}].",
-                            total_runs, req.seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER
+                            "Крупная постройка ({} блоков/сегментов) строится по тикам (сид {}) [отмен: {}/{} | возврат: 0/{}].",
+                            total_runs, req.seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER, MAX_UNDO_HISTORY_PER_PLAYER
                         ),
                     },
                 }
@@ -674,21 +955,43 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
     }
 }
 
-pub fn execute_undo(
+fn execute_history_step(
     host: &mut dyn ServerHost,
     player: Option<PlayerRef>,
     dimension: &str,
+    is_redo: bool,
 ) -> BuildResponse {
     let lang = player_lang(player);
+    if let Some(p) = player
+        && !player_has_build_permission(host, p)
+    {
+        return deny_permission_response(lang);
+    }
+
     let owner_key = player.map_or(0, PlayerRef::uuid);
-    let popped = with_undo_map(|map| map.get_mut(&owner_key).and_then(Vec::pop));
+    let popped = if is_redo {
+        with_redo_map(|map| map.get_mut(&owner_key).and_then(Vec::pop))
+    } else {
+        with_undo_map(|map| map.get_mut(&owner_key).and_then(Vec::pop))
+    };
     let Some(entry) = popped else {
         return BuildResponse {
             ok: false,
             blocks_changed: 0,
-            message: match lang {
-                UiLang::En => "No saved builds to undo.".into(),
-                UiLang::Ru => "Нет сохранённых построек для отмены.".into(),
+            message: if is_redo {
+                tr(
+                    lang,
+                    "No undone builds to redo.",
+                    "Нет отменённых построек для возврата (Redo).",
+                )
+                .to_owned()
+            } else {
+                tr(
+                    lang,
+                    "No saved builds to undo.",
+                    "Нет сохранённых построек для отмены.",
+                )
+                .to_owned()
             },
         };
     };
@@ -699,65 +1002,72 @@ pub fn execute_undo(
         &entry.dimension
     };
 
-    let mut palette: Vec<BlockState> = Vec::new();
-    let mut state_to_idx: HashMap<BlockState, u32> = HashMap::new();
-    let mut runs = Vec::with_capacity(entry.previous_blocks.len());
-
-    for (pos, state) in entry.previous_blocks {
-        let idx = if let Some(&existing) = state_to_idx.get(&state) {
-            existing
-        } else {
-            let idx = palette.len() as u32;
-            palette.push(state);
-            state_to_idx.insert(state, idx);
-            idx
-        };
-        runs.push(BlockRun {
-            x: pos[0],
-            z: pos[2],
-            y: pos[1],
-            height: 1,
-            surface: None,
-            block: idx,
-            only: None,
-        });
-    }
-
-    let mut total_restored = 0u64;
-    for chunk in runs.chunks(MAX_RUNS_PER_BATCH) {
-        let edit = BlockEdit {
-            palette: palette.clone(),
-            filters: Vec::new(),
-            runs: chunk.to_vec(),
-        };
-        match host.edit_blocks(target_dim, &edit) {
-            Ok(changed) => total_restored += changed,
-            Err(err) => {
-                return BuildResponse {
-                    ok: false,
-                    blocks_changed: total_restored.min(i32::MAX as u64) as i32,
-                    message: match lang {
-                        UiLang::En => format!("Undo error: {err}"),
-                        UiLang::Ru => format!("Ошибка отката Undo: {err}"),
-                    },
-                };
+    let inverse = capture_positions_snapshot(host, target_dim, &entry.previous_blocks);
+    let total_changed = match apply_state_snapshot(host, target_dim, &entry.previous_blocks) {
+        Ok(c) => c,
+        Err(err) => {
+            if is_redo {
+                with_redo_map(|map| push_history_entry(map, owner_key, entry));
+            } else {
+                with_undo_map(|map| push_history_entry(map, owner_key, entry));
             }
+            return BuildResponse {
+                ok: false,
+                blocks_changed: 0,
+                message: match (lang, is_redo) {
+                    (UiLang::En, false) => format!("Undo error: {err}"),
+                    (UiLang::Ru, false) => format!("Ошибка отката Undo: {err}"),
+                    (UiLang::En, true) => format!("Redo error: {err}"),
+                    (UiLang::Ru, true) => format!("Ошибка повтора Redo: {err}"),
+                },
+            };
+        }
+    };
+
+    if let Some(inv) = inverse {
+        if is_redo {
+            with_undo_map(|map| push_history_entry(map, owner_key, inv));
+        } else {
+            with_redo_map(|map| push_history_entry(map, owner_key, inv));
         }
     }
 
-    let remaining_undo = undo_depth(owner_key);
+    let u = undo_depth(owner_key);
+    let r = redo_depth(owner_key);
     BuildResponse {
         ok: true,
-        blocks_changed: total_restored.min(i32::MAX as u64) as i32,
-        message: match lang {
-            UiLang::En => format!(
-                "Undo complete: restored {total_restored} blocks [undo: {remaining_undo}/{MAX_UNDO_HISTORY_PER_PLAYER}]."
+        blocks_changed: total_changed.min(i32::MAX as u64) as i32,
+        message: match (lang, is_redo) {
+            (UiLang::En, false) => format!(
+                "Undo complete: restored {total_changed} blocks [undo: {u}/{MAX_UNDO_HISTORY_PER_PLAYER} | redo: {r}/{MAX_UNDO_HISTORY_PER_PLAYER}]."
             ),
-            UiLang::Ru => format!(
-                "Откат выполнен: восстановлено блоков — {total_restored} [отмен: {remaining_undo}/{MAX_UNDO_HISTORY_PER_PLAYER}]."
+            (UiLang::Ru, false) => format!(
+                "Откат выполнен: восстановлено блоков — {total_changed} [отмен: {u}/{MAX_UNDO_HISTORY_PER_PLAYER} | возврат: {r}/{MAX_UNDO_HISTORY_PER_PLAYER}]."
+            ),
+            (UiLang::En, true) => format!(
+                "Redo complete: re-applied {total_changed} blocks [undo: {u}/{MAX_UNDO_HISTORY_PER_PLAYER} | redo: {r}/{MAX_UNDO_HISTORY_PER_PLAYER}]."
+            ),
+            (UiLang::Ru, true) => format!(
+                "Повтор выполнен: возвращено блоков — {total_changed} [отмен: {u}/{MAX_UNDO_HISTORY_PER_PLAYER} | возврат: {r}/{MAX_UNDO_HISTORY_PER_PLAYER}]."
             ),
         },
     }
+}
+
+pub fn execute_undo(
+    host: &mut dyn ServerHost,
+    player: Option<PlayerRef>,
+    dimension: &str,
+) -> BuildResponse {
+    execute_history_step(host, player, dimension, false)
+}
+
+pub fn execute_redo(
+    host: &mut dyn ServerHost,
+    player: Option<PlayerRef>,
+    dimension: &str,
+) -> BuildResponse {
+    execute_history_step(host, player, dimension, true)
 }
 
 pub fn execute_reroll(
@@ -766,6 +1076,12 @@ pub fn execute_reroll(
     dimension: &str,
 ) -> BuildResponse {
     let lang = player_lang(player);
+    if let Some(p) = player
+        && !player_has_build_permission(host, p)
+    {
+        return deny_permission_response(lang);
+    }
+
     let owner_key = player.map_or(0, PlayerRef::uuid);
     let prev_opt = with_last_requests(|map| map.get(&owner_key).cloned());
     let Some(mut next_req) = prev_opt else {
@@ -804,37 +1120,48 @@ pub fn execute_reroll(
     execute_build(host, player, next_req)
 }
 
-pub fn handle_build_payload(req: BuildRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
+fn run_network_action(
+    cx: &mut dyn IPayloadContext,
+    check_build_rate: bool,
+    op: impl FnOnce(&mut dyn ServerHost, PlayerRef) -> BuildResponse,
+) -> Result<(), String> {
     let player = cx.player().map_err(|e| format!("{e:?}"))?;
-    let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
-    let resp = execute_build(host, Some(player), req);
-    let _ = player.tell(host, Text::literal(format!("[Building Generator] {}", resp.message)));
+    let resp = {
+        let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
+        let lang = player_lang(Some(player));
+        let r = match check_network_action_allowed(host, player, lang, check_build_rate) {
+            Ok(()) => op(host, player),
+            Err(deny) => deny,
+        };
+        let _ = player.tell(host, Text::literal(format!("[Building Generator] {}", r.message)));
+        r
+    };
     if let Some(ch) = channels() {
         let _ = ch.to_client_reply.reply(cx, &resp);
     }
     Ok(())
+}
+
+pub fn handle_build_payload(req: BuildRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
+    run_network_action(cx, true, |host, player| execute_build(host, Some(player), req))
 }
 
 pub fn handle_undo_payload(req: UndoRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
-    let player = cx.player().map_err(|e| format!("{e:?}"))?;
-    let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
-    let resp = execute_undo(host, Some(player), &req.dimension);
-    let _ = player.tell(host, Text::literal(format!("[Building Generator] {}", resp.message)));
-    if let Some(ch) = channels() {
-        let _ = ch.to_client_reply.reply(cx, &resp);
-    }
-    Ok(())
+    run_network_action(cx, false, |host, player| {
+        execute_undo(host, Some(player), &req.dimension)
+    })
+}
+
+pub fn handle_redo_payload(req: RedoRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
+    run_network_action(cx, false, |host, player| {
+        execute_redo(host, Some(player), &req.dimension)
+    })
 }
 
 pub fn handle_reroll_payload(req: RerollRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
-    let player = cx.player().map_err(|e| format!("{e:?}"))?;
-    let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
-    let resp = execute_reroll(host, Some(player), &req.dimension);
-    let _ = player.tell(host, Text::literal(format!("[Building Generator] {}", resp.message)));
-    if let Some(ch) = channels() {
-        let _ = ch.to_client_reply.reply(cx, &resp);
-    }
-    Ok(())
+    run_network_action(cx, true, |host, player| {
+        execute_reroll(host, Some(player), &req.dimension)
+    })
 }
 
 pub fn handle_lang_payload(req: SetLangRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
@@ -1087,6 +1414,7 @@ fn spawn_command_build(
         seed,
         description: desc,
         adapt_terrain: true,
+        air_only: false,
         palette,
     };
     execute_build(host, player_opt, req)
@@ -1095,13 +1423,15 @@ fn spawn_command_build(
 pub fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event.commands.push(Command::new("buildgen"));
     event.commands.push(Command::new("buildgen help"));
-    event.commands.push(Command::new("buildgen undo"));
-    event.commands.push(Command::new("buildgen reroll"));
+    event.commands.push(Command::op("buildgen undo", 2));
+    event.commands.push(Command::op("buildgen redo", 2));
+    event.commands.push(Command::op("buildgen reroll", 2));
     event.commands.push(Command::new("buildgen lang <lang:text>"));
-    event.commands.push(Command::new("buildgen preset <preset:text>"));
-    event.commands.push(Command::new("buildgen generate <description:text>"));
-    event.commands.push(Command::new(
+    event.commands.push(Command::op("buildgen preset <preset:text>", 2));
+    event.commands.push(Command::op("buildgen generate <description:text>", 2));
+    event.commands.push(Command::op(
         "buildgen size <width:integer> <depth:integer> <height:integer> <description:text>",
+        2,
     ));
 }
 
@@ -1120,7 +1450,7 @@ pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
         } else {
             ""
         };
-        for sub in ["help", "undo", "reroll", "lang", "preset", "generate", "size"] {
+        for sub in ["help", "undo", "redo", "reroll", "lang", "preset", "generate", "size"] {
             if sub.starts_with(prefix) && !event.suggestions.iter().any(|s| s.text == sub) {
                 event.suggestions.push(mod_api::Suggestion::new(range, sub));
             }
@@ -1178,6 +1508,22 @@ pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
     }
 }
 
+fn require_command_op(
+    host: &mut dyn ServerHost,
+    event: &RunModCommandEvent<'_>,
+    player_opt: Option<PlayerRef>,
+    lang: UiLang,
+) -> bool {
+    let ok = event.source.permission().level() >= 2
+        && player_opt.is_none_or(|p| player_has_build_permission(host, p));
+    if !ok {
+        let _ = host
+            .commands()
+            .feedback(Text::literal(deny_permission_response(lang).message));
+    }
+    ok
+}
+
 pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
     let lits = &event.command.literals;
     if lits.first().map(String::as_str) != Some("buildgen") {
@@ -1214,8 +1560,8 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
                 );
             } else {
                 let _ = host.commands().feedback(Text::literal(match lang {
-                    UiLang::En => "Usage: /buildgen preset <name> | generate <description> | reroll | undo | lang <en|ru>",
-                    UiLang::Ru => "Использование: /buildgen preset <имя> | generate <описание> | reroll | undo | lang <en|ru>",
+                    UiLang::En => "Usage: /buildgen preset <name> | generate <description> | reroll | undo | redo | lang <en|ru>",
+                    UiLang::Ru => "Использование: /buildgen preset <имя> | generate <описание> | reroll | undo | redo | lang <en|ru>",
                 }));
             }
             Flow::Cancel
@@ -1223,11 +1569,11 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
         Some("help") => {
             let _ = host.commands().feedback(Text::literal(match lang {
                 UiLang::En => format!(
-                    "Building Generator v{}: F8 or /buildgen | /buildgen lang <en|ru> | /buildgen preset <name> | /buildgen generate <desc> | /buildgen size <w> <d> <h> <desc> | /buildgen reroll | /buildgen undo",
+                    "Building Generator v{}: F8 or /buildgen | /buildgen lang <en|ru> | /buildgen preset <name> | /buildgen generate <desc> | /buildgen size <w> <d> <h> <desc> | /buildgen reroll | /buildgen undo | /buildgen redo",
                     crate::model::MOD_VERSION
                 ),
                 UiLang::Ru => format!(
-                    "Building Generator v{}: F8 или /buildgen | /buildgen lang <en|ru> | /buildgen preset <имя> | /buildgen generate <описание> | /buildgen size <w> <d> <h> <описание> | /buildgen reroll | /buildgen undo",
+                    "Building Generator v{}: F8 или /buildgen | /buildgen lang <en|ru> | /buildgen preset <имя> | /buildgen generate <описание> | /buildgen size <w> <d> <h> <описание> | /buildgen reroll | /buildgen undo | /buildgen redo",
                     crate::model::MOD_VERSION
                 ),
             }));
@@ -1271,22 +1617,39 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
             Flow::Cancel
         }
         Some("undo") => {
-            let dim = player_opt
-                .and_then(|p| p.dimension(host))
-                .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
-            let resp = execute_undo(host, player_opt, &dim);
-            let _ = host.commands().feedback(Text::literal(resp.message));
+            if require_command_op(host, event, player_opt, lang) {
+                let dim = player_opt
+                    .and_then(|p| p.dimension(host))
+                    .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
+                let resp = execute_undo(host, player_opt, &dim);
+                let _ = host.commands().feedback(Text::literal(resp.message));
+            }
+            Flow::Cancel
+        }
+        Some("redo") => {
+            if require_command_op(host, event, player_opt, lang) {
+                let dim = player_opt
+                    .and_then(|p| p.dimension(host))
+                    .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
+                let resp = execute_redo(host, player_opt, &dim);
+                let _ = host.commands().feedback(Text::literal(resp.message));
+            }
             Flow::Cancel
         }
         Some("reroll") => {
-            let dim = player_opt
-                .and_then(|p| p.dimension(host))
-                .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
-            let resp = execute_reroll(host, player_opt, &dim);
-            let _ = host.commands().feedback(Text::literal(resp.message));
+            if require_command_op(host, event, player_opt, lang) {
+                let dim = player_opt
+                    .and_then(|p| p.dimension(host))
+                    .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
+                let resp = execute_reroll(host, player_opt, &dim);
+                let _ = host.commands().feedback(Text::literal(resp.message));
+            }
             Flow::Cancel
         }
         Some("preset") => {
+            if !require_command_op(host, event, player_opt, lang) {
+                return Flow::Cancel;
+            }
             let preset_name = event
                 .command
                 .arguments
@@ -1319,6 +1682,9 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
             Flow::Cancel
         }
         Some("generate") | Some("size") => {
+            if !require_command_op(host, event, player_opt, lang) {
+                return Flow::Cancel;
+            }
             let mut w = 13u16;
             let mut d = 11u16;
             let mut h = 12u16;

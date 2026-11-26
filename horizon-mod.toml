@@ -1,7 +1,7 @@
 id = "building_generator"
 name = "Building Generator"
-version = "0.2.1"
-description = "Bilingual (EN/RU) noise-driven procedural architectural generator with 61 structure themes, 72 catalog presets, 30-slot custom material lists, 3D hologram preview, and undo."
+version = "0.3.0"
+description = "Bilingual (EN/RU) noise-driven procedural architectural generator with 61 structure themes, 72 catalog presets, 30-slot custom material lists, 3D hologram preview, material estimate, air-only mode, undo/redo, and OP security."
 authors = ["Building Generator Contributors"]
 license = "MIT"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.

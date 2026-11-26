@@ -16,6 +16,7 @@ pub struct SavedPreset {
     pub toggles: [u8; 5],
     pub noise_level: NoiseLevel,
     pub adapt_terrain: bool,
+    pub air_only: bool,
     pub description: String,
     pub seed: u64,
     pub palette_manual: bool,
@@ -184,7 +185,9 @@ pub fn encode_share_code(p: &SavedPreset) -> String {
     buf.push(p.style.to_idx());
     buf.push(p.roof_raw);
     buf.push(p.noise_level.to_idx());
-    let flags = u8::from(p.adapt_terrain) | (u8::from(p.palette_manual) << 1);
+    let flags = u8::from(p.adapt_terrain)
+        | (u8::from(p.palette_manual) << 1)
+        | (u8::from(p.air_only) << 2);
     buf.push(flags);
     buf.extend_from_slice(&p.toggles);
     buf.extend_from_slice(&p.seed.to_le_bytes());
@@ -299,6 +302,7 @@ pub fn decode_share_code_lang(
     let flags = body[14];
     let adapt_terrain = (flags & 1) != 0;
     let palette_manual = (flags & 2) != 0;
+    let air_only = (flags & 4) != 0;
     let toggles = [
         body[15].min(2),
         body[16].min(2),
@@ -465,6 +469,7 @@ pub fn decode_share_code_lang(
         toggles,
         noise_level,
         adapt_terrain,
+        air_only,
         description,
         seed,
         palette_manual,

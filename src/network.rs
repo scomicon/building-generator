@@ -2,13 +2,16 @@ use std::sync::RwLock;
 
 use mod_api::{PayloadId, Registrar, ToClient, ToServer};
 
-use crate::model::{BuildRequest, BuildResponse, RerollRequest, SetLangRequest, UndoRequest};
+use crate::model::{
+    BuildRequest, BuildResponse, RedoRequest, RerollRequest, SetLangRequest, UndoRequest,
+};
 use crate::{client_ui, server_builder};
 
 #[derive(Clone)]
 pub struct PayloadChannels {
     pub to_server_build: ToServer<BuildRequest>,
     pub to_server_undo: ToServer<UndoRequest>,
+    pub to_server_redo: ToServer<RedoRequest>,
     pub to_server_reroll: ToServer<RerollRequest>,
     pub to_server_lang: ToServer<SetLangRequest>,
     pub to_client_reply: ToClient<BuildResponse>,
@@ -27,6 +30,10 @@ pub fn register_channels(registrar: &mut dyn Registrar) {
     let to_server_undo = reg.play_to_server_typed::<UndoRequest>(
         PayloadId("building_generator:undo".into()),
         |req, cx| server_builder::handle_undo_payload(req, cx),
+    );
+    let to_server_redo = reg.play_to_server_typed::<RedoRequest>(
+        PayloadId("building_generator:redo".into()),
+        |req, cx| server_builder::handle_redo_payload(req, cx),
     );
     let to_server_reroll = reg.play_to_server_typed::<RerollRequest>(
         PayloadId("building_generator:reroll".into()),
@@ -48,6 +55,7 @@ pub fn register_channels(registrar: &mut dyn Registrar) {
         *guard = Some(PayloadChannels {
             to_server_build,
             to_server_undo,
+            to_server_redo,
             to_server_reroll,
             to_server_lang,
             to_client_reply,

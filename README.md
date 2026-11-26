@@ -2,14 +2,14 @@
 
 **Building Generator** (`building_generator`) is an MIT-licensed bilingual (**English / Russian**) procedural architecture native mod for **Horizon** (Minecraft: Java Edition `26.3`, Horizon Native Mod API `0.2`).
 
-Generate detailed multi-room buildings, landmarks, bridges, airship docks, castles, temples, and canal villages from English or Russian text prompts, noise seeds, or the built-in 72-structure catalog — complete with an interactive in-game GUI (`F8`) featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), live 3D hologram preview with slice inspection, 30-slot material block lists, two-phase construction, and multi-step undo.
+Generate detailed multi-room buildings, landmarks, bridges, airship docks, castles, temples, and canal villages from English or Russian text prompts, noise seeds, or the built-in 72-structure catalog — complete with an interactive in-game GUI (`F8`) featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), live 3D hologram preview with slice inspection, **Material Estimate (BOM)** resource list, **Air Only** placement filter, 30-slot material block lists, two-phase construction, **5-step Undo/Redo**, and **server OP security**.
 
 ---
 
 ## Features
 
 - **Bilingual UI & Chat Commands (English & Russian):**
-  - Starts in **English** by default; click the **`Lang: EN` / `Язык: RU`** button in the top header bar (or run `/buildgen lang <en|ru>`) at any time to switch the entire GUI, catalog, material slots, HUD overlays, BossBar progress, and chat feedback between English and Russian.
+  - Starts in **English** by default; click the **`Lang: EN` / `Язык: RU`** button in the top header bar (or run `/buildgen lang <en|ru>`) at any time to switch the entire GUI, catalog, material slots, BOM estimate, HUD overlays, BossBar progress, and chat feedback between English and Russian.
   - Selected language persists locally in `.horizon-mod-data/building_generator/lang.txt`.
   - Prompt parser, Preset Catalog search, and Material Block search accept both English and Russian queries simultaneously.
 - **61 Architectural Themes & 72 Built-in Presets:**
@@ -20,10 +20,13 @@ Generate detailed multi-room buildings, landmarks, bridges, airship docks, castl
   - **Industrial, Modern & Fantasy:** glass curtain skyscrapers, saw-tooth steampunk factories, football stadiums, reinforced bunkers, rocket launchpads, offshore oil rigs, archmage towers, Hobbit holes, mushroom cottages, underground catacombs & mausoleums, dwarven halls, dragon bone sanctuaries, Stonehenge rune portals, Viking longhouses, alpine chalets, Moroccan kasbahs.
   - **Procedural Settlements (`gen_settlement`):** 5 city-planning modes up to `96×96×48`, including a Venetian **Floating Village** with water canals, stilt boardwalk piers, and stilt houses over water.
 - **Interactive In-Game UI (`F8`):**
-  - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, persistent disk favorites (`favorites.txt`), `BG2:...` share codes, and 3D wireframe + translucent quad hologram with vertical slicing (`[` / `]`).
+  - **Header Material Estimate (`Blocks: N` / `Смета: N`):** live block-count & stack breakdown (`xN (st+rem)`) across all required block types (with doors/beds counted per 2-block item) and one-click **Copy List** to clipboard.
+  - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, **Air Only** toggle (only replaces air blocks so existing builds & hillsides remain intact), persistent disk favorites (`favorites.txt`), `BG2:...` share codes (preserving `air_only`), and 3D wireframe + translucent quad hologram with vertical slicing (`[` / `]`).
   - **2. Style & Noise + 72-Preset Catalog:** category/style/roof overrides, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
   - **3. Materials (30 Architectural Slots):** scrollable slot inspector, per-slot ordered block lists (`Patches` / `Scatter` / `Stripes` / `Checker` mix modes), and a dedicated searchable block picker with item icons (`Rec.` / `All` world blocks).
-- **Safe Two-Phase Placement & Undo:** adapts foundations to terrain and detects water depth (`OceanFloor` vs `MotionBlockingNoLeaves`) for lakeside stilts; builds solid frames first and doors/beds/lanterns/decor second; supports `/buildgen reroll` and up to 5 levels of `/buildgen undo`.
+- **Safe Two-Phase Placement, Undo/Redo & Server Security:**
+  - Adapts foundations to terrain, detects water depth (`OceanFloor` vs `MotionBlockingNoLeaves`), builds solid frames first and doors/beds/lanterns/decor second, and supports `/buildgen reroll` plus up to 5 steps of **`/buildgen undo` & `/buildgen redo`** (also accessible from the GUI footer).
+  - Enforces **operator permission level 2+ (OP)** on all build/undo/redo/reroll commands and network payloads, sanitizes bounds/strings on the server, and rate-limits rapid GUI build requests.
 
 ---
 
@@ -33,11 +36,12 @@ Generate detailed multi-room buildings, landmarks, bridges, airship docks, castl
 |---|---|
 | `/buildgen` | Open the interactive mod menu (or press `F8`) |
 | `/buildgen lang <en\|ru>` | Switch GUI & chat feedback language between English (`en`) and Russian (`ru`) |
-| `/buildgen preset <name>` | Instantly build any of the 72 presets (supports Tab completion and EN/RU search) |
-| `/buildgen generate <text>` | Generate a building from an EN/RU description in front of you |
-| `/buildgen size <w> <d> <h> <text>` | Generate with explicit bounding dimensions (`7..96 × 7..96 × 5..48`) |
-| `/buildgen reroll` | Undo the last build and regenerate at the same spot with a fresh seed |
-| `/buildgen undo` | Revert your last build (up to 5 stored in history) |
+| `/buildgen preset <name>` | Instantly build any of the 72 presets (OP 2+, supports Tab completion and EN/RU search) |
+| `/buildgen generate <text>` | Generate a building from an EN/RU description in front of you (OP 2+) |
+| `/buildgen size <w> <d> <h> <text>` | Generate with explicit bounding dimensions (`7..96 × 7..96 × 5..48`, OP 2+) |
+| `/buildgen reroll` | Undo the last build and regenerate at the same spot with a fresh seed (OP 2+) |
+| `/buildgen undo` | Revert your last build (up to 5 stored in history, OP 2+) |
+| `/buildgen redo` | Re-apply the last undone build edit (up to 5 steps, OP 2+) |
 | `/buildgen help` | Show concise command and keybind help |
 
 ---
@@ -45,7 +49,7 @@ Generate detailed multi-room buildings, landmarks, bridges, airship docks, castl
 ## Installation
 
 ### From Release (`.hmod`)
-1. Download `building_generator-0.2.1.hmod` from the release artifacts.
+1. Download `building_generator-0.3.0.hmod` from the release artifacts.
 2. Place it in your Horizon instance's `horizon-mods/` (or `horizon-native-mods/`) folder, or add it via the Horizon Launcher Native Mods tab.
 3. Rebuild the instance with native code trusted (`--trust-native-code`) in Horizon Launcher.
 

@@ -11,7 +11,7 @@ use mod_api::{
 
 use crate::model::{
     BuildCategory, BuildRequest, BuildResponse, BuildStyle, CardinalFacing, MaterialPalette,
-    NoiseLevel, RerollRequest, SetLangRequest, UiLang, UndoRequest,
+    NoiseLevel, RedoRequest, RerollRequest, SetLangRequest, UiLang, UndoRequest,
 };
 use crate::network::channels;
 use crate::persist::{
@@ -86,6 +86,7 @@ fn current_saved_preset(st: &ClientUiState, name: String) -> SavedPreset {
         toggles: st.toggles.map(TriToggle::to_raw),
         noise_level: st.noise_level,
         adapt_terrain: st.adapt_terrain,
+        air_only: st.air_only,
         description: st.description.clone(),
         seed: st.seed,
         palette_manual: st.palette_manual,
@@ -105,6 +106,7 @@ fn apply_saved_preset(st: &mut ClientUiState, preset: SavedPreset) {
     }
     st.noise_level = preset.noise_level;
     st.adapt_terrain = preset.adapt_terrain;
+    st.air_only = preset.air_only;
     st.description = preset.description;
     st.seed = preset.seed;
     st.seed_text = preset.seed.to_string();
@@ -114,6 +116,7 @@ fn apply_saved_preset(st: &mut ClientUiState, preset: SavedPreset) {
     sync_palette_from_ui(st);
     st.mat_list_scroll = 0;
     st.picker_scroll = 0;
+    st.bom_scroll = 0;
     st.preview_key = None;
 }
 
@@ -222,9 +225,11 @@ enum PendingAction {
     PlaceInFront,
     CopyShareCode(SavedPreset),
     PasteShareCode,
+    CopyBomText(String),
     SendBuild(BuildRequest),
     SendReroll(String),
     SendUndo(String),
+    SendRedo(String),
 }
 
 #[derive(Clone, Copy)]
@@ -237,6 +242,7 @@ struct ScrollZone {
 }
 
 struct WidgetHandles {
+    bom_btn: WidgetId,
     lang_btn: WidgetId,
     tab_size: Option<WidgetId>,
     tab_desc: Option<WidgetId>,
@@ -260,6 +266,7 @@ struct WidgetHandles {
     y_inc_btn: Option<WidgetId>,
     terrain_btn: Option<WidgetId>,
     preview_btn: Option<WidgetId>,
+    air_only_btn: Option<WidgetId>,
     slice_toggle_btn: Option<WidgetId>,
     slice_dec_btn: Option<WidgetId>,
     slice_inc_btn: Option<WidgetId>,
@@ -294,6 +301,12 @@ struct WidgetHandles {
     preset_down_btn: Option<WidgetId>,
     preset_grid_btns: Vec<(WidgetId, usize)>,
 
+    // Dedicated Bill of Materials Modal (`bom_open == true`)
+    bom_back_btn: Option<WidgetId>,
+    bom_copy_btn: Option<WidgetId>,
+    bom_up_btn: Option<WidgetId>,
+    bom_down_btn: Option<WidgetId>,
+
     // Tab 3: Materials & Per-Slot Block Lists
     mat_preset_btn: Option<WidgetId>,
     mat_infer_btn: Option<WidgetId>,
@@ -326,6 +339,7 @@ struct WidgetHandles {
     generate_btn: WidgetId,
     reroll_btn: WidgetId,
     undo_btn: WidgetId,
+    redo_btn: WidgetId,
     close_btn: WidgetId,
 }
 
@@ -338,12 +352,14 @@ struct BuiltScreen {
     list_scroll_zone: Option<ScrollZone>,
     picker_scroll_zone: Option<ScrollZone>,
     preset_scroll_zone: Option<ScrollZone>,
+    bom_scroll_zone: Option<ScrollZone>,
     tab3_slot_rows: Vec<(usize, [f32; 4])>,
     tab3_list_rows: Vec<(usize, String, [f32; 4])>,
     tab3_header_pos: Option<[f32; 2]>,
     picker_tiles: Vec<(String, bool, [f32; 4])>,
     picker_chips: Vec<(usize, String, [f32; 4])>,
     picker_strip_pos: Option<[f32; 2]>,
+    bom_rows: Vec<(String, usize, [f32; 4])>,
 }
 
 type PreviewKey = (
@@ -374,6 +390,7 @@ struct ClientUiState {
     dimension: String,
     facing: CardinalFacing,
     adapt_terrain: bool,
+    air_only: bool,
     show_preview_box: bool,
     preview_slice_y: Option<i32>,
     category: BuildCategory,
@@ -390,6 +407,7 @@ struct ClientUiState {
     seed_history: Vec<u64>,
     auto_seed: bool,
     undo_count: usize,
+    redo_count: usize,
     build_seq: u64,
     noise_level: NoiseLevel,
     palette_preset_idx: usize,
@@ -407,6 +425,8 @@ struct ClientUiState {
     preset_scroll: usize,
     preset_search: String,
     preset_cat_filter: Option<BuildCategory>,
+    bom_open: bool,
+    bom_scroll: usize,
     world_blocks: Vec<String>,
     mat_filter: MatFilter,
     mat_search: String,
@@ -416,6 +436,8 @@ struct ClientUiState {
     preview_key: Option<PreviewKey>,
     preview_lines: Vec<([f64; 3], [f64; 3], u32)>,
     preview_quads: Vec<([[f64; 3]; 4], u32)>,
+    preview_bom: Vec<(String, usize)>,
+    preview_total_blocks: usize,
     build_progress: Option<(u8, usize, usize, String)>,
     status: String,
     pending: Option<PendingAction>,
@@ -439,6 +461,7 @@ impl Default for ClientUiState {
             dimension: "minecraft:overworld".into(),
             facing: CardinalFacing::South,
             adapt_terrain: true,
+            air_only: false,
             show_preview_box: true,
             preview_slice_y: None,
             category: BuildCategory::House,
@@ -455,6 +478,7 @@ impl Default for ClientUiState {
             seed_history: Vec::new(),
             auto_seed: true,
             undo_count: 0,
+            redo_count: 0,
             build_seq: 1,
             noise_level: NoiseLevel::Balanced,
             palette_preset_idx: 0,
@@ -472,6 +496,8 @@ impl Default for ClientUiState {
             preset_scroll: 0,
             preset_search: String::new(),
             preset_cat_filter: None,
+            bom_open: false,
+            bom_scroll: 0,
             world_blocks: Vec::new(),
             mat_filter: MatFilter::All,
             mat_search: String::new(),
@@ -481,6 +507,8 @@ impl Default for ClientUiState {
             preview_key: None,
             preview_lines: Vec::new(),
             preview_quads: Vec::new(),
+            preview_bom: Vec::new(),
+            preview_total_blocks: 0,
             build_progress: None,
             status: "F8 — toggle menu. Set size, area, description & materials.".into(),
             pending: None,
@@ -596,6 +624,20 @@ fn push_seed_history(st: &mut ClientUiState, old_seed: u64) {
     }
 }
 
+fn parse_counter_marker(msg: &str, keys: &[&str]) -> Option<usize> {
+    for &key in keys {
+        if let Some(pos) = msg.find(key) {
+            let tail = &msg[pos + key.len()..];
+            if let Some(slash) = tail.find('/')
+                && let Ok(n) = tail[..slash].trim().parse::<usize>()
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 pub fn on_server_response(resp: BuildResponse) {
     with_state(|st| {
         if resp.message == "__OPEN_GUI__" {
@@ -621,19 +663,16 @@ pub fn on_server_response(resp: BuildResponse) {
             };
         } else {
             st.build_progress = None;
-            let undo_marker = resp
-                .message
-                .find("[undo:")
-                .map(|p| (p, "[undo:".len()))
-                .or_else(|| resp.message.find("[отмен:").map(|p| (p, "[отмен:".len())));
-            if let Some((pos, mlen)) = undo_marker {
-                let tail = &resp.message[pos + mlen..];
-                if let Some(slash) = tail.find('/')
-                    && let Ok(n) = tail[..slash].trim().parse::<usize>()
-                {
-                    st.undo_count = n;
-                    st.dirty = true;
-                }
+            if let Some(u) = parse_counter_marker(&resp.message, &["[undo:", "[отмен:"]) {
+                st.undo_count = u;
+                st.dirty = true;
+            }
+            if let Some(r) = parse_counter_marker(&resp.message, &["redo:", "возврат:"]) {
+                st.redo_count = r;
+                st.dirty = true;
+            } else if resp.ok && (resp.message.starts_with("Ready:") || resp.message.starts_with("Готово:") || resp.message.contains("seed ")) {
+                st.redo_count = 0;
+                st.dirty = true;
             }
             st.status = resp.message;
         }
@@ -950,6 +989,14 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let pad = 10.0;
     let inner_w = pw - pad * 2.0;
 
+    let bom_lbl = match lang {
+        UiLang::En => format!("Blocks: {}", st.preview_total_blocks),
+        UiLang::Ru => format!("Смета: {}", st.preview_total_blocks),
+    };
+    let bom_btn = w.add_button(Button::new(
+        [px + pw - pad - 184.0, py + 2.0, 82.0, 16.0],
+        Text::literal(bom_lbl),
+    ));
     let lang_btn = w.add_button(Button::new(
         [px + pw - pad - 98.0, py + 2.0, 56.0, 16.0],
         Text::literal(lang.button_label()),
@@ -961,7 +1008,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let tab_y = py + 24.0;
     let body_y = tab_y + 24.0;
 
-    if !st.picker_open && !st.preset_picker_open {
+    if !st.picker_open && !st.preset_picker_open && !st.bom_open {
         let tab_w = ((inner_w - 8.0) / 3.0).floor();
         let mut b1 = Button::new(
             [px + pad, tab_y, tab_w, 18.0],
@@ -1002,6 +1049,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let mut y_inc_btn = None;
     let mut terrain_btn = None;
     let mut preview_btn = None;
+    let mut air_only_btn = None;
     let mut slice_toggle_btn = None;
     let mut slice_dec_btn = None;
     let mut slice_inc_btn = None;
@@ -1034,6 +1082,11 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let mut preset_down_btn = None;
     let mut preset_grid_btns = Vec::new();
 
+    let mut bom_back_btn = None;
+    let mut bom_copy_btn = None;
+    let mut bom_up_btn = None;
+    let mut bom_down_btn = None;
+
     let mut mat_preset_btn = None;
     let mut mat_infer_btn = None;
     let mut mat_sync_wood_btn = None;
@@ -1064,12 +1117,14 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let mut list_scroll_zone = None;
     let mut picker_scroll_zone = None;
     let mut preset_scroll_zone = None;
+    let mut bom_scroll_zone = None;
     let mut tab3_slot_rows = Vec::new();
     let mut tab3_list_rows = Vec::new();
     let mut tab3_header_pos = None;
     let mut picker_tiles = Vec::new();
     let mut picker_chips = Vec::new();
     let mut picker_strip_pos = None;
+    let mut bom_rows = Vec::new();
 
     let foot_y = py + ph - 30.0;
 
@@ -1327,6 +1382,59 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             vis_rows,
             scroll,
         });
+    } else if st.bom_open {
+        let lx = px + pad;
+        let r1_y = py + 23.0;
+        let back_w = 64.0;
+        let copy_w = 108.0;
+        bom_back_btn = Some(w.add_button(Button::new(
+            [lx, r1_y, back_w, 17.0],
+            Text::literal(tr(lang, "← Back", "← Назад")),
+        )));
+        bom_copy_btn = Some(w.add_button(Button::new(
+            [lx + inner_w - copy_w, r1_y, copy_w, 17.0],
+            Text::literal(tr(lang, "Copy List", "Копир. смету")),
+        )));
+
+        let grid_y = r1_y + 22.0;
+        let grid_avail_h = (foot_y - 26.0 - grid_y).max(90.0);
+        let row_h = 18.0;
+        let vis_rows = ((grid_avail_h / row_h).floor() as usize).clamp(5, 8);
+        let sb_w = 10.0;
+        let grid_inner_w = inner_w - sb_w - 3.0;
+        let col_gap = 6.0;
+        let col_w = ((grid_inner_w - col_gap) * 0.5).floor();
+
+        let total_rows = st.preview_bom.len().div_ceil(2).max(1);
+        let max_scroll = total_rows.saturating_sub(vis_rows);
+        let scroll = st.bom_scroll.min(max_scroll);
+
+        for r in 0..vis_rows {
+            for c in 0..2usize {
+                let idx = (scroll + r) * 2 + c;
+                if let Some((bid, cnt)) = st.preview_bom.get(idx) {
+                    let tx = lx + (c as f32) * (col_w + col_gap);
+                    let ty = grid_y + (r as f32) * row_h;
+                    bom_rows.push((bid.clone(), *cnt, [tx, ty, col_w, 16.5]));
+                }
+            }
+        }
+
+        let sb_x = lx + grid_inner_w + 3.0;
+        let sb_h = (vis_rows as f32) * row_h - 1.5;
+        let mut up_b = Button::new([sb_x, grid_y, sb_w, 12.0], Text::literal("▲"));
+        up_b.active = scroll > 0;
+        bom_up_btn = Some(w.add_button(up_b));
+        let mut dn_b = Button::new([sb_x, grid_y + sb_h - 12.0, sb_w, 12.0], Text::literal("▼"));
+        dn_b.active = scroll < max_scroll;
+        bom_down_btn = Some(w.add_button(dn_b));
+        bom_scroll_zone = Some(ScrollZone {
+            viewport: [lx, grid_y, inner_w, sb_h],
+            track: [sb_x, grid_y + 13.0, sb_w, (sb_h - 26.0).max(8.0)],
+            total_rows,
+            vis_rows,
+            scroll,
+        });
     } else {
     match st.tab {
         UiTab::SizeArea => {
@@ -1393,12 +1501,21 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                 }),
             )));
             preview_btn = Some(w.add_button(Button::new(
-                [rx, body_y + 81.0, col_w, 18.0],
+                [rx, body_y + 81.0, half_p, 18.0],
                 Text::literal(match (lang, st.show_preview_box) {
-                    (UiLang::En, true) => "3D Hologram: ON",
-                    (UiLang::En, false) => "3D Hologram: OFF",
-                    (UiLang::Ru, true) => "3D-голограмма: ВКЛ",
-                    (UiLang::Ru, false) => "3D-голограмма: ВЫКЛ",
+                    (UiLang::En, true) => "3D View: ON",
+                    (UiLang::En, false) => "3D View: OFF",
+                    (UiLang::Ru, true) => "3D-обзор: ВКЛ",
+                    (UiLang::Ru, false) => "3D-обзор: ВЫКЛ",
+                }),
+            )));
+            air_only_btn = Some(w.add_button(Button::new(
+                [rx + half_p + 4.0, body_y + 81.0, half_p, 18.0],
+                Text::literal(match (lang, st.air_only) {
+                    (UiLang::En, true) => "Air Only: ON",
+                    (UiLang::En, false) => "Air Only: OFF",
+                    (UiLang::Ru, true) => "Т.возд: ВКЛ",
+                    (UiLang::Ru, false) => "Т.возд: ВЫКЛ",
                 }),
             )));
 
@@ -1713,18 +1830,20 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     }
 
     // Persistent bottom footer
-    let gen_w = (inner_w * 0.34).floor();
-    let reroll_w = (inner_w * 0.25).floor();
-    let undo_w = (inner_w * 0.23).floor();
-    let close_w = inner_w - gen_w - reroll_w - undo_w - 12.0;
+    let gap = 3.0;
+    let gen_w = (inner_w * 0.29).floor();
+    let reroll_w = (inner_w * 0.17).floor();
+    let undo_w = (inner_w * 0.19).floor();
+    let redo_w = (inner_w * 0.19).floor();
+    let close_w = inner_w - gen_w - reroll_w - undo_w - redo_w - gap * 4.0;
 
     let generate_btn = w.add_button(Button::new(
         [px + pad, foot_y, gen_w, 20.0],
         Text::literal(tr(lang, "GENERATE", "СГЕНЕРИРОВАТЬ")),
     ));
     let reroll_btn = w.add_button(Button::new(
-        [px + pad + gen_w + 4.0, foot_y, reroll_w, 20.0],
-        Text::literal(tr(lang, "Reroll", "Заново (Reroll)")),
+        [px + pad + gen_w + gap, foot_y, reroll_w, 20.0],
+        Text::literal(tr(lang, "Reroll", "Заново")),
     ));
     let undo_label = if st.undo_count > 0 {
         match lang {
@@ -1735,12 +1854,24 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         tr(lang, "Undo", "Отмена").into()
     };
     let undo_btn = w.add_button(Button::new(
-        [px + pad + gen_w + reroll_w + 8.0, foot_y, undo_w, 20.0],
+        [px + pad + gen_w + reroll_w + gap * 2.0, foot_y, undo_w, 20.0],
         Text::literal(undo_label),
+    ));
+    let redo_label = if st.redo_count > 0 {
+        match lang {
+            UiLang::En => format!("Redo ({})", st.redo_count),
+            UiLang::Ru => format!("Возврат ({})", st.redo_count),
+        }
+    } else {
+        tr(lang, "Redo", "Возврат").into()
+    };
+    let redo_btn = w.add_button(Button::new(
+        [px + pad + gen_w + reroll_w + undo_w + gap * 3.0, foot_y, redo_w, 20.0],
+        Text::literal(redo_label),
     ));
     let close_btn = w.add_button(Button::new(
         [
-            px + pad + gen_w + reroll_w + undo_w + 12.0,
+            px + pad + gen_w + reroll_w + undo_w + redo_w + gap * 4.0,
             foot_y,
             close_w,
             20.0,
@@ -1753,6 +1884,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         panel,
         widgets: w,
         handles: WidgetHandles {
+            bom_btn,
             lang_btn,
             tab_size,
             tab_desc,
@@ -1774,6 +1906,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             y_inc_btn,
             terrain_btn,
             preview_btn,
+            air_only_btn,
             slice_toggle_btn,
             slice_dec_btn,
             slice_inc_btn,
@@ -1803,6 +1936,10 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             preset_up_btn,
             preset_down_btn,
             preset_grid_btns,
+            bom_back_btn,
+            bom_copy_btn,
+            bom_up_btn,
+            bom_down_btn,
             mat_preset_btn,
             mat_infer_btn,
             mat_sync_wood_btn,
@@ -1830,18 +1967,21 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             generate_btn,
             reroll_btn,
             undo_btn,
+            redo_btn,
             close_btn,
         },
         slot_scroll_zone,
         list_scroll_zone,
         picker_scroll_zone,
         preset_scroll_zone,
+        bom_scroll_zone,
         tab3_slot_rows,
         tab3_list_rows,
         tab3_header_pos,
         picker_tiles,
         picker_chips,
         picker_strip_pos,
+        bom_rows,
     }
 }
 
@@ -2129,6 +2269,28 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                 if id == h.lang_btn {
                     let next_lang = st.lang.toggle();
                     apply_ui_lang(st, next_lang, true);
+                } else if id == h.bom_btn {
+                    st.bom_open = !st.bom_open;
+                    st.picker_open = false;
+                    st.preset_picker_open = false;
+                    st.bom_scroll = 0;
+                    st.dirty = true;
+                } else if Some(id) == h.bom_back_btn {
+                    st.bom_open = false;
+                    st.bom_scroll = 0;
+                    st.dirty = true;
+                } else if Some(id) == h.bom_copy_btn {
+                    let txt = format_bom_clipboard(st);
+                    st.pending = Some(PendingAction::CopyBomText(txt));
+                } else if Some(id) == h.bom_up_btn {
+                    st.bom_scroll = st.bom_scroll.saturating_sub(2);
+                    st.dirty = true;
+                } else if Some(id) == h.bom_down_btn {
+                    let max_s = screen
+                        .bom_scroll_zone
+                        .map_or(0, |z| z.total_rows.saturating_sub(z.vis_rows));
+                    st.bom_scroll = (st.bom_scroll + 2).min(max_s);
+                    st.dirty = true;
                 } else if Some(id) == h.tab_size {
                     st.tab = UiTab::SizeArea;
                     st.dirty = true;
@@ -2200,6 +2362,9 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                     st.dirty = true;
                 } else if Some(id) == h.preview_btn {
                     st.show_preview_box = !st.show_preview_box;
+                    st.dirty = true;
+                } else if Some(id) == h.air_only_btn {
+                    st.air_only = !st.air_only;
                     st.dirty = true;
                 } else if Some(id) == h.slice_toggle_btn {
                     st.preview_slice_y = match st.preview_slice_y {
@@ -2652,6 +2817,7 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                         seed: st.seed as i64,
                         description: effective_description(st),
                         adapt_terrain: st.adapt_terrain,
+                        air_only: st.air_only,
                         palette: st.palette.clone(),
                     };
                     st.status = match st.lang {
@@ -2665,6 +2831,9 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                 } else if id == h.undo_btn {
                     st.status = tr(st.lang, "Undoing last build...", "Отмена последней постройки...").into();
                     st.pending = Some(PendingAction::SendUndo(st.dimension.clone()));
+                } else if id == h.redo_btn {
+                    st.status = tr(st.lang, "Redoing undone build...", "Возврат отменённой постройки...").into();
+                    st.pending = Some(PendingAction::SendRedo(st.dimension.clone()));
                 } else if id == h.close_btn {
                     st.pending = Some(PendingAction::CloseMenu);
                 }
@@ -3032,6 +3201,19 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
                 }
             }
         }
+        PendingAction::CopyBomText(txt) => {
+            let copied = host.set_clipboard_text(&txt);
+            with_state(|st| {
+                st.status = if copied {
+                    match st.lang {
+                        UiLang::En => format!("Material list copied ({} types, {} blocks).", st.preview_bom.len(), st.preview_total_blocks),
+                        UiLang::Ru => format!("Смета скопирована ({} видов, {} бл.).", st.preview_bom.len(), st.preview_total_blocks),
+                    }
+                } else {
+                    tr(st.lang, "Clipboard unavailable.", "Буфер обмена недоступен.").into()
+                };
+            });
+        }
         PendingAction::SendBuild(req) => {
             if let Some(ch) = channels() {
                 if let Err(e) = ch.to_server_build.send(host, &req) {
@@ -3068,7 +3250,63 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
                 }
             }
         }
+        PendingAction::SendRedo(dim) => {
+            if let Some(ch) = channels() {
+                if let Err(e) = ch.to_server_redo.send(host, &RedoRequest { dimension: dim }) {
+                    with_state(|st| {
+                        st.status = match st.lang {
+                            UiLang::En => format!("Network error: {e:?}"),
+                            UiLang::Ru => format!("Ошибка сети: {e:?}"),
+                        };
+                    });
+                }
+            }
+        }
     }
+}
+
+fn format_bom_stack(count: usize, lang: UiLang) -> String {
+    if count < 64 {
+        format!("x{count}")
+    } else {
+        let stacks = count / 64;
+        let rem = count % 64;
+        match (lang, rem) {
+            (UiLang::En, 0) => format!("x{count} ({stacks}st)"),
+            (UiLang::En, r) => format!("x{count} ({stacks}st+{r})"),
+            (UiLang::Ru, 0) => format!("x{count} ({stacks}ст)"),
+            (UiLang::Ru, r) => format!("x{count} ({stacks}ст+{r})"),
+        }
+    }
+}
+
+fn format_bom_clipboard(st: &ClientUiState) -> String {
+    let mut out = match st.lang {
+        UiLang::En => format!(
+            "Building Generator — {} ({}) {}x{}x{} ({} blocks, {} types):\n",
+            st.category.label(st.lang),
+            st.style.label(st.lang),
+            st.width,
+            st.depth,
+            st.height,
+            st.preview_total_blocks,
+            st.preview_bom.len()
+        ),
+        UiLang::Ru => format!(
+            "Building Generator — {} ({}) {}x{}x{} ({} блоков, {} видов):\n",
+            st.category.label(st.lang),
+            st.style.label(st.lang),
+            st.width,
+            st.depth,
+            st.height,
+            st.preview_total_blocks,
+            st.preview_bom.len()
+        ),
+    };
+    for (id, cnt) in &st.preview_bom {
+        out.push_str(&format!("- {id}: {}\n", format_bom_stack(*cnt, st.lang)));
+    }
+    out
 }
 
 fn draw_scrollbar(
@@ -3098,6 +3336,7 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
     let size = event.draw.size();
 
     with_state(|st| {
+        ensure_preview_cached(st);
         if st.dirty
             || st
                 .screen
@@ -3127,12 +3366,12 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
         let title = if st.picker_open {
             match lang {
                 UiLang::En => format!(
-                    "Pick Block: {} ({} in list)",
+                    "Pick: {} ({})",
                     slot_label(st.selected_mat_slot, lang),
                     st.palette.slot_blocks(st.selected_mat_slot).len()
                 ),
                 UiLang::Ru => format!(
-                    "Блоки: {} (в списке: {})",
+                    "Блоки: {} ({})",
                     slot_label(st.selected_mat_slot, lang),
                     st.palette.slot_blocks(st.selected_mat_slot).len()
                 ),
@@ -3140,13 +3379,18 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
         } else if st.preset_picker_open {
             let total = filtered_preset_indices(st.preset_cat_filter, &st.preset_search).len();
             match lang {
-                UiLang::En => format!("Structure Catalog: {} / {} (click)", total, CLI_PRESETS.len()),
-                UiLang::Ru => format!("Каталог: {} из {} (нажмите)", total, CLI_PRESETS.len()),
+                UiLang::En => format!("Catalog: {}/{}", total, CLI_PRESETS.len()),
+                UiLang::Ru => format!("Каталог: {}/{}", total, CLI_PRESETS.len()),
+            }
+        } else if st.bom_open {
+            match lang {
+                UiLang::En => format!("Material Estimate ({} types)", st.preview_bom.len()),
+                UiLang::Ru => format!("Смета блоков ({} видов)", st.preview_bom.len()),
             }
         } else {
             match lang {
                 UiLang::En => "Building Generator".to_owned(),
-                UiLang::Ru => "Building Generator | Генератор".to_owned(),
+                UiLang::Ru => "Генератор построек".to_owned(),
             }
         };
         event.draw.text(&title, [px + pad, py + 6.0], 0xFFF8_FAFC, true);
@@ -3227,6 +3471,38 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
                 0xFF94_A3B8,
                 false,
             );
+        } else if st.bom_open {
+            let hdr_txt = match (lang, st.air_only) {
+                (UiLang::En, false) => format!("Total: {} blocks ({} types)", st.preview_total_blocks, st.preview_bom.len()),
+                (UiLang::En, true) => format!("Total: {} blocks ({} types | Air Only)", st.preview_total_blocks, st.preview_bom.len()),
+                (UiLang::Ru, false) => format!("Всего: {} бл. ({} видов)", st.preview_total_blocks, st.preview_bom.len()),
+                (UiLang::Ru, true) => format!("Всего: {} бл. ({} видов | Т.возд)", st.preview_total_blocks, st.preview_bom.len()),
+            };
+            event.draw.text(&hdr_txt, [px + pad + 68.0, py + 27.5], 0xFFE2_E8F0, false);
+
+            for (bid, cnt, rect) in &screen.bom_rows {
+                event.draw.fill(*rect, 0x551E_293B);
+                if let Ok(ident) = Identifier::parse(bid)
+                    && let Some(item_key) = host.item_key(&ident)
+                {
+                    event.draw.item(item_key, [rect[0] + 2.0, rect[1] + 2.2], 12.0);
+                }
+                let short: String = short_block_name(bid).chars().take(16).collect();
+                event.draw.text(&short, [rect[0] + 17.0, rect[1] + 4.5], 0xFFE2_E8F0, false);
+                let qty = format_bom_stack(*cnt, lang);
+                let qw = event.draw.text_width(&qty);
+                event.draw.text(&qty, [rect[0] + rect[2] - qw - 3.0, rect[1] + 4.5], 0xFF38_BDF8, false);
+            }
+            if let Some(z) = screen.bom_scroll_zone {
+                draw_scrollbar(&mut *event.draw, z, event.screen.mouse);
+            }
+            let foot_y = py + ph - 30.0;
+            let foot_note = tr(
+                lang,
+                "Door/bed items count 1 per 2 blocks. Scroll wheel or drag bar.",
+                "Двери/кровати считаются 1 шт. за 2 блока. Колёсико/ползунок.",
+            );
+            event.draw.text(foot_note, [px + pad, foot_y - 23.0], 0xFF94_A3B8, false);
         } else {
             // Draw static labels & item icons over tabs.
             match st.tab {
@@ -3309,9 +3585,14 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
 
         // Summary + Status / Live Progress Bar above footer
         let foot_y = py + ph - 30.0;
-        if !st.picker_open && !st.preset_picker_open {
+        if !st.picker_open && !st.preset_picker_open && !st.bom_open {
+            let air_tag = if st.air_only {
+                tr(lang, " | AirOnly", " | Т.возд")
+            } else {
+                ""
+            };
             let summary = format!(
-                "{} ({}) {}x{}x{} | {} {} ({}) | {} [{}]",
+                "{} ({}) {}x{}x{} | {} {} ({}) | {} [{}]{air_tag}",
                 st.category.label(lang),
                 st.style.label(lang),
                 st.width,
@@ -3374,6 +3655,14 @@ fn handle_scrollbar_track_at(host: &dyn ClientHost, at: [f32; 2]) -> bool {
                 && point_in_rect(at, z.track)
             {
                 st.preset_scroll = map_scroll(z);
+                st.dirty = true;
+                return true;
+            }
+        } else if st.bom_open {
+            if let Some(z) = screen.bom_scroll_zone
+                && point_in_rect(at, z.track)
+            {
+                st.bom_scroll = map_scroll(z);
                 st.dirty = true;
                 return true;
             }
@@ -3482,6 +3771,23 @@ pub fn on_screen_mouse_scrolled(
             }
             return Flow::Cancel;
         }
+        if st.bom_open {
+            if let Some(z) = screen.bom_scroll_zone
+                && z.total_rows > z.vis_rows
+            {
+                let max_s = z.total_rows - z.vis_rows;
+                let next = if up {
+                    st.bom_scroll.saturating_sub(step)
+                } else {
+                    (st.bom_scroll + step).min(max_s)
+                };
+                if next != st.bom_scroll {
+                    st.bom_scroll = next;
+                    st.dirty = true;
+                }
+            }
+            return Flow::Cancel;
+        }
         if st.tab == UiTab::Materials {
             if let Some(z) = screen.slot_scroll_zone
                 && point_in_rect(at, z.viewport)
@@ -3539,6 +3845,11 @@ pub fn on_screen_key_pressed(
                 st.preset_picker_open = false;
                 st.preset_scroll = 0;
                 st.preset_search.clear();
+                st.dirty = true;
+                true
+            } else if st.bom_open {
+                st.bom_open = false;
+                st.bom_scroll = 0;
                 st.dirty = true;
                 true
             } else {
@@ -3641,6 +3952,11 @@ fn push_box_lines(lines: &mut Vec<WorldLine>, min: [f64; 3], max: [f64; 3], colo
 }
 
 fn ensure_preview_data(st: &mut ClientUiState) -> (Vec<([f64; 3], [f64; 3], u32)>, Vec<([[f64; 3]; 4], u32)>) {
+    ensure_preview_cached(st);
+    (st.preview_lines.clone(), st.preview_quads.clone())
+}
+
+fn ensure_preview_cached(st: &mut ClientUiState) {
     let eff_desc = effective_description(st);
     let key: PreviewKey = (
         st.width,
@@ -3657,7 +3973,7 @@ fn ensure_preview_data(st: &mut ClientUiState) -> (Vec<([f64; 3], [f64; 3], u32)
         palette_fingerprint(&st.palette),
     );
     if st.preview_key.as_ref() == Some(&key) {
-        return (st.preview_lines.clone(), st.preview_quads.clone());
+        return;
     }
 
     let req = BuildRequest {
@@ -3675,9 +3991,16 @@ fn ensure_preview_data(st: &mut ClientUiState) -> (Vec<([f64; 3], [f64; 3], u32)
         seed: st.seed as i64,
         description: eff_desc,
         adapt_terrain: false,
+        air_only: false,
         palette: st.palette.clone(),
     };
     let bp = crate::generator::generate_blueprint(&req, None);
+    let (bom_total, bom_list) = bp.material_breakdown();
+    if st.preview_total_blocks != bom_total || st.preview_bom != bom_list {
+        st.preview_total_blocks = bom_total;
+        st.preview_bom = bom_list;
+        st.dirty = true;
+    }
     let w = i32::from(bp.width);
     let d = i32::from(bp.depth);
     let clip_max_y = st.preview_slice_y.map(|sy| sy.clamp(0, i32::from(bp.height)));
@@ -3857,9 +4180,8 @@ fn ensure_preview_data(st: &mut ClientUiState) -> (Vec<([f64; 3], [f64; 3], u32)
     }
 
     st.preview_key = Some(key);
-    st.preview_lines = segs.clone();
-    st.preview_quads = pquads.clone();
-    (segs, pquads)
+    st.preview_lines = segs;
+    st.preview_quads = pquads;
 }
 
 pub fn on_submit_custom_geometry(

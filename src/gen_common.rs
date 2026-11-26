@@ -49,6 +49,33 @@ impl GeneratedBlueprint {
             .filter(|b| b.block_id != "minecraft:air")
             .count()
     }
+
+    /// Aggregates required non-air item counts sorted descending (`_door` and `_bed` count per 2-block item).
+    pub fn material_breakdown(&self) -> (usize, Vec<(String, usize)>) {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut total_blocks = 0usize;
+        for planned in self.blocks.values() {
+            let id = planned.block_id.as_str();
+            if id == "minecraft:air" || id == "minecraft:cave_air" || id == "minecraft:void_air" {
+                continue;
+            }
+            total_blocks += 1;
+            *counts.entry(id).or_insert(0) += 1;
+        }
+        let mut list: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(id, raw)| {
+                let adj = if id.ends_with("_door") || id.ends_with("_bed") {
+                    raw.div_ceil(2)
+                } else {
+                    raw
+                };
+                (id.to_owned(), adj)
+            })
+            .collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        (total_blocks, list)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
