@@ -2621,10 +2621,25 @@ fn generate_standard_structure(
             && is_fp(grid, &fp, du + 2, dv);
         let door_u1 = if is_wide { du + 1 } else { du };
         for door_u in du..=door_u1 {
-            for sv in (dv + 1)..=(dv + 2).min(grid.d - 1) {
+            for sv in (dv + 1)..=(dv + 3).min(grid.d - 1) {
                 if !is_fp(grid, &fp, door_u, sv) {
-                    for cy in door_y..=(door_y + 1) {
-                        set_uv(&mut blocks, grid, door_u, cy, sv, PlannedBlock::simple("minecraft:air"));
+                    if sv <= dv + 2 {
+                        for cy in door_y..=(door_y + 1) {
+                            let is_step = crate::gen_common::get_uv(&blocks, grid, door_u, cy, sv)
+                                .is_some_and(|b| b.block_id.ends_with("_stairs"));
+                            if !is_step {
+                                set_uv(&mut blocks, grid, door_u, cy, sv, PlannedBlock::simple("minecraft:air"));
+                            }
+                        }
+                    }
+                    if let Some(above_blk) = crate::gen_common::get_uv(&blocks, grid, door_u, door_y + 2, sv)
+                        && (above_blk.block_id.ends_with("_leaves")
+                            || above_blk.block_id == "minecraft:grass_block"
+                            || above_blk.block_id == "minecraft:dirt"
+                            || above_blk.block_id == "minecraft:coarse_dirt"
+                            || above_blk.block_id == "minecraft:moss_block")
+                    {
+                        set_uv(&mut blocks, grid, door_u, door_y + 2, sv, PlannedBlock::simple("minecraft:air"));
                     }
                 }
             }

@@ -636,7 +636,42 @@ pub(crate) fn build_interior_zoning(
         let cv = (b_v0 + b_v1) / 2;
         if floor_cells.contains(&(cu, cv)) && ceil_y > floor_y + 2 {
             let light_id = pal.pick(MaterialPalette::SLOT_LIGHT, seed, cu, ceil_y, cv);
-            if spec.floor_height >= 5 && is_lantern(&light_id) {
+            let wide_hall = (b_u1 - b_u0) >= 9 && (b_v1 - b_v0) >= 9 && ceil_y >= floor_y + 5;
+            if wide_hall && is_lantern(&light_id) && !stairwell_uv.contains(&(cu, cv)) {
+                set_uv(
+                    blocks,
+                    grid,
+                    cu,
+                    ceil_y,
+                    cv,
+                    PlannedBlock::with_props("minecraft:iron_chain", vec![("axis", "y")]),
+                );
+                set_uv(
+                    blocks,
+                    grid,
+                    cu,
+                    ceil_y - 1,
+                    cv,
+                    PlannedBlock::simple(pal.fence.clone()),
+                );
+                for &(du, dv) in &[(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let au = cu + du;
+                    let av = cv + dv;
+                    if floor_cells.contains(&(au, av))
+                        && !stairwell_uv.contains(&(au, av))
+                        && !is_solid_or_occupied(blocks, grid, au, ceil_y - 1, av)
+                    {
+                        set_uv(
+                            blocks,
+                            grid,
+                            au,
+                            ceil_y - 1,
+                            av,
+                            PlannedBlock::with_props(light_id.clone(), vec![("hanging", "true")]),
+                        );
+                    }
+                }
+            } else if spec.floor_height >= 5 && is_lantern(&light_id) {
                 set_uv(
                     blocks,
                     grid,
@@ -1382,7 +1417,15 @@ pub(crate) fn build_interior_zoning(
     }
 
     let prop_set: &[(&str, bool)] = match (spec.theme, spec.category) {
-        (StructureTheme::Library, _) => &[
+        (StructureTheme::MageTower | StructureTheme::Apothecary, _) => &[
+            ("minecraft:brewing_stand", false),
+            ("minecraft:enchanting_table", false),
+            ("minecraft:chiseled_bookshelf", true),
+            ("minecraft:water_cauldron", false),
+            ("minecraft:chest", true),
+            ("minecraft:barrel", true),
+        ],
+        (StructureTheme::Library | StructureTheme::Academy, _) => &[
             ("minecraft:bookshelf", false),
             ("minecraft:chiseled_bookshelf", true),
             ("minecraft:lectern", true),
@@ -1402,21 +1445,23 @@ pub(crate) fn build_interior_zoning(
             ("minecraft:blast_furnace", true),
             ("minecraft:anvil", true),
             ("minecraft:water_cauldron", false),
-            ("minecraft:barrel", true),
             ("minecraft:chest", true),
+            ("minecraft:barrel", true),
             ("minecraft:crafting_table", false),
         ],
         (_, BuildCategory::Barn) => &[
             ("minecraft:hay_block", false),
             ("minecraft:barrel", true),
             ("minecraft:composter", false),
-            ("minecraft:hay_block", false),
             ("minecraft:chest", true),
+            ("minecraft:hay_block", false),
+            ("minecraft:barrel", true),
         ],
         (_, BuildCategory::Temple) => &[
             ("minecraft:lectern", true),
             ("minecraft:enchanting_table", false),
             ("minecraft:bookshelf", false),
+            ("minecraft:chest", true),
             ("minecraft:decorated_pot", true),
         ],
         (_, BuildCategory::Castle) => &[
@@ -1425,6 +1470,7 @@ pub(crate) fn build_interior_zoning(
             ("minecraft:chiseled_bookshelf", true),
             ("minecraft:anvil", true),
             ("minecraft:barrel", true),
+            ("minecraft:chest", true),
         ],
         _ => &[
             ("minecraft:crafting_table", false),
@@ -1452,6 +1498,11 @@ pub(crate) fn build_interior_zoning(
             | "minecraft:anvil"
             | "minecraft:decorated_pot"
             | "minecraft:chiseled_bookshelf" => vec![("facing", face)],
+            "minecraft:brewing_stand" => vec![
+                ("has_bottle_0", "true"),
+                ("has_bottle_1", "true"),
+                ("has_bottle_2", "true"),
+            ],
             _ if needs_facing => vec![("facing", face)],
             _ => vec![],
         };

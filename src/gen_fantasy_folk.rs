@@ -83,11 +83,44 @@ pub(crate) fn generate_mage_tower(
         set_uv(&mut blocks, grid, cu, top_chamber + cone_h + 1, cv, PlannedBlock::simple("minecraft:end_rod"));
     }
 
-    // Enchanting Table + Bookshelves + Wall Ladder Access!
+    // Enchanting Table + Arcane Study Chest, Brewing Stand, Bookshelf & Wall Ladder Access!
     set_uv(&mut blocks, grid, cu, 2, cv, PlannedBlock::simple("minecraft:enchanting_table"));
+    set_uv(
+        &mut blocks,
+        grid,
+        cu + 1,
+        3,
+        cv,
+        PlannedBlock::with_props("minecraft:chest", vec![("facing", grid.dir_right()), ("type", "single")]),
+    );
+    set_uv(
+        &mut blocks,
+        grid,
+        cu + 1,
+        3,
+        cv - 1,
+        PlannedBlock::with_props(
+            "minecraft:brewing_stand",
+            vec![
+                ("has_bottle_0", "true"),
+                ("has_bottle_1", "true"),
+                ("has_bottle_2", "true"),
+            ],
+        ),
+    );
     for y in 2..=top_chamber {
         set_uv(&mut blocks, grid, cu - 1, y, cv - 1, PlannedBlock::simple("minecraft:purpur_pillar"));
         set_uv(&mut blocks, grid, cu - 1, y, cv, PlannedBlock::with_props("minecraft:ladder", vec![("facing", grid.dir_front())]));
+    }
+    if base_r >= 2 {
+        set_uv(
+            &mut blocks,
+            grid,
+            cu - 1,
+            3,
+            cv + 1,
+            PlannedBlock::simple("minecraft:bookshelf"),
+        );
     }
     let door_pos = Some(place_door_stack(&mut blocks, grid, pal, cu, 2, cv + base_r));
     finish_landmark(req, spec, grid, height, blocks, noise, door_pos)

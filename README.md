@@ -24,9 +24,15 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
   - **Wear / Ruin (`0–100%`) & Overgrowth (`0–100%`):** Applies masonry cracking, copper oxidation stages, shattered panes, structural skyline collapse, fallen rubble, cobwebs, biome flora/moss carpets, clinging leaves, and hanging directional vines across all 61 themes, landmarks, bridges, and cities (`BG2:...` share codes & `favorites.txt` compatible).
 - **Interactive In-Game UI (`F8`):**
   - **Header Material Estimate (`Blocks: N` / `Смета: N`):** live block-count & stack breakdown (`xN (st+rem)`) across all required block types (with doors/beds counted per 2-block item) and one-click **Copy List** to clipboard.
-  - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, **Air Only** toggle (only replaces air blocks so existing builds & hillsides remain intact), persistent disk favorites (`favorites.txt`), `BG2:...` share codes (preserving `air_only`, `wear_pct`, and `overgrowth_pct`), and a real-time **semi-transparent bluish 3D architectural hologram** (greedy-merged walls, roofs, stairs, slabs, windows, lanterns, terrain foundations & basement geometry, vertical slicing `[` / `]`, auto-updating on any change).
+  - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, **Air Only** toggle (replaces air blocks only — and accurately hides occluded blocks in the 3D hologram), persistent disk favorites (`favorites.txt`), `BG2:...` share codes (preserving `air_only`, `wear_pct`, and `overgrowth_pct`), plus a real-time **semi-transparent bluish 3D architectural hologram** featuring:
+    - **Independent Blue Frame & Post-Build Inspection (`Frame: ON/OFF`, `Hide@Build`, `[H]` / `[Shift+H]`):** hide only the outer blue wireframe box or toggle all overlays with one keypress (`H` in-world) to admire finished builds unobstructed.
+    - **Live Collision Highlighting (`Colls: ON/OFF`):** inspects existing world blocks around the target site and highlights intersecting obstacles in translucent warm amber-coral.
+    - **Free In-World `Move 3D` Mode:** nudge hologram `X/Z` (`Arrows`/`IJKL`, `+Shift` for `4` blocks), adjust height `Y` (`PgUp`/`PgDn`), rotate (`R`), slice (`[`/`]`), toggle collisions (`C`), snap with a click, and press `Enter` to build directly without reopening `F8`.
   - **2. Style & Noise + 72-Preset Catalog:** category/style/roof overrides, **Biome Auto**, **Wear %**, **Moss %**, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
   - **3. Materials (30 Architectural Slots):** scrollable slot inspector, per-slot ordered block lists (`Patches` / `Scatter` / `Stripes` / `Checker` mix modes), and a dedicated searchable block picker with item icons (`Rec.` / `All` world blocks).
+- **Living Interiors, Curated Container Supplies & Smart World Integration:**
+  - Automatically populates placed `chest`, `barrel`, `smoker`, `furnace`, `blast_furnace`, and `brewing_stand` block entities with themed item stacks & stylized bilingual container names tailored to the structure's category/theme and seed.
+  - Multi-arm hanging chandeliers in tall halls (`floor_height >= 5`), wizard/alchemy workstations (`MageTower` / `Apothecary`), automatic hillside entrance stairs when ground sits above doorway steps, flat threshold stone aprons, and stepped settlement walkways connecting entrances directly to roads.
 - **Safe Two-Phase Placement, Undo/Redo & Server Security:**
   - Adapts foundations to terrain, detects water depth (`OceanFloor` vs `MotionBlockingNoLeaves`), builds solid frames first and doors/beds/lanterns/decor second, and supports `/buildgen reroll` plus up to 5 steps of **`/buildgen undo` & `/buildgen redo`** (also accessible from the GUI footer).
   - Enforces **operator permission level 2+ (OP)** on all build/undo/redo/reroll commands and network payloads, sanitizes bounds/strings on the server, and rate-limits rapid GUI build requests.
@@ -52,7 +58,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
 ## Installation
 
 ### From Release (`.hmod`)
-1. Download `building_generator-0.4.3.hmod` from the release artifacts.
+1. Download `building_generator-0.5.0.hmod` from the release artifacts.
 2. Place it in your Horizon instance's `horizon-mods/` (or `horizon-native-mods/`) folder, or add it via the Horizon Launcher Native Mods tab.
 3. Rebuild the instance with native code trusted (`--trust-native-code`) in Horizon Launcher.
 

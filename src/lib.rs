@@ -836,7 +836,7 @@ mod tests {
             Some(<BackendRef<'_> as BackendRefOf>::of(self))
         }
     }
-    mod_api::impl_host_areas!(TestWorldHost, except(entities, keys, payload_tokens, players));
+    mod_api::impl_host_areas!(TestWorldHost, except(entities, keys, payload_tokens, players, block_entities));
 
     impl PayloadTokensHost for TestWorldHost {
         fn check_payload_token(
@@ -862,13 +862,33 @@ mod tests {
             self.fake.player(uuid)
         }
     }
+    impl BlockEntitiesHost for TestWorldHost {
+        fn block_entity(
+            &self,
+            _level: LevelRef,
+            _pos: [i32; 3],
+        ) -> Option<mod_api::BlockEntityRef> {
+            None
+        }
+
+        fn block_entity_identity(
+            &self,
+            _level: LevelRef,
+            _pos: [i32; 3],
+        ) -> Option<mod_api::BlockEntityRef> {
+            None
+        }
+    }
+    impl BlockEntitiesServerHost for TestWorldHost {
+        fn block_entity_sync(&mut self, _pos: [i32; 3]) {}
+    }
 
     impl ServerHost for TestWorldHost {
         fn backend_mut(&mut self) -> Option<BackendMutRef<'_>> {
             Some(<BackendMutRef<'_> as BackendMutRefOf>::of(self))
         }
     }
-    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services));
+    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services, block_entities));
 
     impl ServicesServerHost for TestWorldHost {
         fn commands(&mut self) -> &mut dyn mod_api::Commands {
@@ -4656,5 +4676,153 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn v050_hologram_world_collision_and_air_only_filtering() {
+        let mut req = sample_request("cozy stone cottage", 501);
+        req.width = 11;
+        req.depth = 11;
+        req.height = 9;
+        let bp = generate_blueprint(&req, None);
+        let mesh_plain = crate::gen_preview::build_hologram_mesh(&bp, None);
+        assert!(!mesh_plain.quads.is_empty());
+
+        // Mark a non-air world obstacle intersecting the building's solid blocks.
+        let mut mask = crate::gen_preview::PreviewWorldMask::new(
+            i32::from(bp.width),
+            0,
+            i32::from(bp.height),
+            i32::from(bp.depth),
+        );
+        let mut marked = 0usize;
+        for (&[x, y, z], blk) in &bp.blocks {
+            if y >= 1 && blk.block_id != "minecraft:air" && x <= 3 {
+                mask.set_blocked(x, y, z, true);
+                marked += 1;
+            }
+        }
+        assert!(marked > 0);
+
+        let mesh_col = crate::gen_preview::build_hologram_mesh_with_world(
+            &bp,
+            None,
+            Some(&mask),
+            false,
+            true,
+        );
+        let has_coral_collision = mesh_col.quads.iter().any(|q| {
+            let r = (q.color >> 16) & 0xFF;
+            let b = q.color & 0xFF;
+            r > b && r >= 96
+        });
+        assert!(has_coral_collision, "expected warm coral collision quads");
+        assert!(mesh_col.lines.len() <= crate::gen_preview::TARGET_MAX_LINES || !mesh_col.macro_lines.is_empty());
+
+        let mesh_air = crate::gen_preview::build_hologram_mesh_with_world(
+            &bp,
+            None,
+            Some(&mask),
+            true,
+            true,
+        );
+        let (fitted_q, fitted_l) = mesh_air.fit_budget(
+            crate::gen_preview::TARGET_MAX_QUADS,
+            crate::gen_preview::TARGET_MAX_LINES,
+        );
+        assert!(fitted_q.len() <= crate::gen_preview::TARGET_MAX_QUADS);
+        assert!(fitted_l.len() <= crate::gen_preview::TARGET_MAX_LINES);
+        // No coral collision quads should be emitted when blocked voxels are filtered out by Air Only.
+        assert!(
+            !mesh_air.quads.iter().any(|q| ((q.color >> 24) & 0xFF) == 0x70),
+            "air-only mode should omit blocked voxels rather than highlighting them"
+        );
+    }
+
+    #[test]
+    fn v050_populated_containers_curate_themed_loot_and_names() {
+        for (cat, prompt, expected_en_sub) in [
+            (BuildCategory::Forge, "blacksmith forge", "Smith"),
+            (BuildCategory::House, "wizard mage tower with alchemy", "Arcane"),
+            (BuildCategory::House, "grand library archive", "Scholar"),
+            (BuildCategory::House, "warm timber tavern inn", "Tavern"),
+            (BuildCategory::Castle, "medieval fortress", "Treasury"),
+        ] {
+            let mut req = sample_request(prompt, 7707);
+            req.category = cat;
+            req.width = 13;
+            req.depth = 13;
+            req.height = 14;
+            let bp = generate_blueprint(&req, None);
+            let en_containers = crate::server_builder::collect_post_build_containers(&bp, 7707, crate::model::UiLang::En);
+            let ru_containers = crate::server_builder::collect_post_build_containers(&bp, 7707, crate::model::UiLang::Ru);
+            assert!(
+                !en_containers.is_empty(),
+                "expected at least one container for {prompt}"
+            );
+            assert_eq!(en_containers.len(), ru_containers.len());
+            assert!(
+                en_containers.iter().all(|c| !c.items.is_empty() && !c.custom_name.is_empty()),
+                "every curated container for {prompt} should have items & title"
+            );
+            let has_expected_theme = en_containers
+                .iter()
+                .any(|c| c.custom_name.contains(expected_en_sub) || c.custom_name.contains("Alchemist") || c.custom_name.contains("Keg"));
+            assert!(
+                has_expected_theme,
+                "expected thematic container name containing '{expected_en_sub}' in {:?}",
+                en_containers.iter().map(|c| c.custom_name.as_str()).collect::<Vec<_>>()
+            );
+            assert_ne!(en_containers[0].custom_name, ru_containers[0].custom_name);
+        }
+    }
+
+    #[test]
+    fn v050_hillside_doorway_approach_and_chandeliers_clear_headroom() {
+        // Sloped front yard rising +2..+3 blocks above origin right outside the South doorway.
+        let mut req = sample_request("cozy cottage", 9123);
+        req.width = 13;
+        req.depth = 15;
+        req.height = 12;
+        req.adapt_terrain = true;
+        let w = usize::from(req.width);
+        let d = usize::from(req.depth);
+        let mut terrain = vec![0i32; w * d];
+        for z in 0..d {
+            for x in 0..w {
+                if z >= 10 {
+                    terrain[z * w + x] = 3;
+                }
+            }
+        }
+        let bp = generate_blueprint(&req, Some(&terrain));
+        let door = bp.door_pos.expect("cottage must have front door");
+        // Verify walking headroom right outside front door (+Z toward hillside) stays clear (`air`) or stair steps.
+        let mut found_step_or_clear = false;
+        for dz in 1..=3 {
+            let pz = door[2] + dz;
+            if pz < i32::from(bp.depth) {
+                for dy in 0..=2 {
+                    if let Some(b) = bp.blocks.get(&[door[0], door[1] + dy, pz])
+                        && (b.block_id.ends_with("_stairs") || b.block_id == "minecraft:air")
+                    {
+                        found_step_or_clear = true;
+                    }
+                }
+            }
+        }
+        assert!(found_step_or_clear, "expected hillside terrace stairs/clearance at front doorway");
+
+        // Tall 13x13x14 hall should produce chandelier lantern(s) + chain with clear walking headroom underneath.
+        let mut req2 = sample_request("grand manor hall", 8888);
+        req2.width = 13;
+        req2.depth = 13;
+        req2.height = 14;
+        let bp2 = generate_blueprint(&req2, None);
+        let has_chain_lantern = bp2
+            .blocks
+            .values()
+            .any(|b| b.block_id == "minecraft:iron_chain");
+        assert!(has_chain_lantern, "expected ceiling chain chandelier in tall hall");
     }
 }

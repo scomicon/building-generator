@@ -509,55 +509,119 @@ pub(crate) fn build_entrance_and_porch(
                 }
             }
         } else {
-            let mut sy = if spec.porch && step_y >= 2 { step_y - 1 } else { step_y };
-            let mut sv = stair_start_v;
-            while sv < grid.d && !is_fp(grid, fp, du, sv) {
-                let ground_rel = if adapt_terrain {
-                    terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-8, 4)
-                } else {
-                    0
-                };
-                if sy <= ground_rel {
-                    break;
-                }
-                for step_u in du..=door_u1 {
-                    if !grid.in_bounds(step_u, sv) || is_fp(grid, fp, step_u, sv) {
-                        continue;
+            let initial_ground = if adapt_terrain && stair_start_v < grid.d {
+                terrain_rel_at(terrain_offsets, grid, du, stair_start_v).clamp(-8, 4)
+            } else {
+                0
+            };
+            if initial_ground > step_y {
+                // Hillside above doorway floor: carve ascending terrace stairs up onto natural ground.
+                let mut cy = step_y + 1;
+                let mut sv = stair_start_v;
+                while sv < grid.d && !is_fp(grid, fp, du, sv) {
+                    let ground_rel = if adapt_terrain {
+                        terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-8, 4)
+                    } else {
+                        0
+                    };
+                    if cy > ground_rel.min(step_y + 4) {
+                        break;
                     }
-                    set_uv(
-                        blocks,
-                        grid,
-                        step_u,
-                        sy,
-                        sv,
-                        make_stair(&pal.pick_stair(MaterialPalette::SLOT_STAIR_BLOCK, seed, step_u, sy, sv), grid.dir_back(), "bottom"),
-                    );
-                    set_uv(blocks, grid, step_u, sy + 1, sv, PlannedBlock::simple("minecraft:air"));
-                    set_uv(blocks, grid, step_u, sy + 2, sv, PlannedBlock::simple("minecraft:air"));
-                    set_uv(blocks, grid, step_u, sy + 3, sv, PlannedBlock::simple("minecraft:air"));
-                    if sy - 1 > ground_rel {
-                        if spec.on_stilts {
-                            if (sv - stair_start_v) % 2 == 0 {
-                                for fill_y in (ground_rel.max(-8))..sy {
-                                    set_uv(blocks, grid, step_u, fill_y, sv, make_frame_block_at(pal, "y", seed, step_u, fill_y, sv));
-                                }
+                    for step_u in du..=door_u1 {
+                        if !grid.in_bounds(step_u, sv) || is_fp(grid, fp, step_u, sv) {
+                            continue;
+                        }
+                        set_uv(
+                            blocks,
+                            grid,
+                            step_u,
+                            cy - 1,
+                            sv,
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, step_u, cy - 1, sv)),
+                        );
+                        set_uv(
+                            blocks,
+                            grid,
+                            step_u,
+                            cy,
+                            sv,
+                            make_stair(&pal.pick_stair(MaterialPalette::SLOT_STAIR_BLOCK, seed, step_u, cy, sv), grid.dir_front(), "bottom"),
+                        );
+                        for ay in (cy + 1)..=(cy + 3) {
+                            set_uv(blocks, grid, step_u, ay, sv, PlannedBlock::simple("minecraft:air"));
+                        }
+                    }
+                    cy += 1;
+                    sv += 1;
+                }
+            } else {
+                let mut sy = if spec.porch && step_y >= 2 { step_y - 1 } else { step_y };
+                let mut sv = stair_start_v;
+                while sv < grid.d && !is_fp(grid, fp, du, sv) {
+                    let ground_rel = if adapt_terrain {
+                        terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-8, 4)
+                    } else {
+                        0
+                    };
+                    if sy <= ground_rel {
+                        // Flat stone threshold apron flushing stairs smoothly onto ground.
+                        for step_u in du..=door_u1 {
+                            if !grid.in_bounds(step_u, sv) || is_fp(grid, fp, step_u, sv) {
+                                continue;
                             }
-                        } else {
-                            for fill_y in (ground_rel.max(-8))..sy {
-                                set_uv(
-                                    blocks,
-                                    grid,
-                                    step_u,
-                                    fill_y,
-                                    sv,
-                                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, step_u, fill_y, sv)),
-                                );
+                            set_uv(
+                                blocks,
+                                grid,
+                                step_u,
+                                ground_rel,
+                                sv,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, step_u, ground_rel, sv)),
+                            );
+                            for ay in (ground_rel + 1)..=(ground_rel + 3) {
+                                set_uv(blocks, grid, step_u, ay, sv, PlannedBlock::simple("minecraft:air"));
+                            }
+                        }
+                        break;
+                    }
+                    for step_u in du..=door_u1 {
+                        if !grid.in_bounds(step_u, sv) || is_fp(grid, fp, step_u, sv) {
+                            continue;
+                        }
+                        set_uv(
+                            blocks,
+                            grid,
+                            step_u,
+                            sy,
+                            sv,
+                            make_stair(&pal.pick_stair(MaterialPalette::SLOT_STAIR_BLOCK, seed, step_u, sy, sv), grid.dir_back(), "bottom"),
+                        );
+                        set_uv(blocks, grid, step_u, sy + 1, sv, PlannedBlock::simple("minecraft:air"));
+                        set_uv(blocks, grid, step_u, sy + 2, sv, PlannedBlock::simple("minecraft:air"));
+                        set_uv(blocks, grid, step_u, sy + 3, sv, PlannedBlock::simple("minecraft:air"));
+                        if sy - 1 > ground_rel {
+                            if spec.on_stilts {
+                                if (sv - stair_start_v) % 2 == 0 {
+                                    for fill_y in (ground_rel.max(-8))..sy {
+                                        set_uv(blocks, grid, step_u, fill_y, sv, make_frame_block_at(pal, "y", seed, step_u, fill_y, sv));
+                                    }
+                                }
+                            } else {
+                                for fill_y in (ground_rel.max(-8))..sy {
+                                    set_uv(
+                                        blocks,
+                                        grid,
+                                        step_u,
+                                        fill_y,
+                                        sv,
+                                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, step_u, fill_y, sv)),
+                                    );
+                                }
                             }
                         }
                     }
+                    sy -= 1;
+                    sv += 1;
                 }
-                sy -= 1;
-                sv += 1;
             }
         }
     }

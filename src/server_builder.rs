@@ -9,7 +9,7 @@ use mod_api::{
     BlockEdit, BlockKey, BlockRun, BlockState, BossBarColor, BossBarRef, Command,
     CommandArgumentValue, CommandSource, Flow, Heightmap, HostBlockStates, IPayloadContext,
     PlayerRef, RegisterCommandsEvent, RunModCommandEvent, ScheduledTaskEvent, ServerHost,
-    StateConstraint, TabCompleteEvent, Text,
+    StateConstraint, TabCompleteEvent, Tag, Text,
 };
 
 use crate::generator::{GeneratedBlueprint, PlannedBlock};
@@ -18,6 +18,8 @@ use crate::model::{
     RedoRequest, RerollRequest, SetLangRequest, UiLang, UndoRequest,
 };
 use crate::network::channels;
+use crate::noise::SplitMix64;
+use crate::parser::StructureTheme;
 
 pub const BATCH_TASK_TOKEN: u64 = 0x4247_5F42_4154_4348; // "BG_BATCH"
 const MAX_RUNS_PER_BATCH: usize = 3000;
@@ -30,6 +32,20 @@ struct UndoEntry {
     previous_blocks: Vec<([i32; 3], BlockState)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContainerSlotItem {
+    pub slot: i8,
+    pub item_id: &'static str,
+    pub count: i8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PostBuildContainer {
+    pub pos: [i32; 3],
+    pub custom_name: String,
+    pub items: Vec<ContainerSlotItem>,
+}
+
 struct PendingBatchJob {
     dimension: String,
     palette: Vec<BlockState>,
@@ -40,6 +56,7 @@ struct PendingBatchJob {
     boss_bar: Option<BossBarRef>,
     label: String,
     lang: UiLang,
+    post_containers: Vec<PostBuildContainer>,
 }
 
 static UNDO_STACK: Mutex<Option<HashMap<u128, Vec<UndoEntry>>>> = Mutex::new(None);
@@ -408,6 +425,368 @@ fn retain_complete_doors(blocks: &mut std::collections::BTreeMap<[i32; 3], Plann
     }
 }
 
+/// Curates deterministic thematic supplies and names for placed chests, barrels, furnaces, smokers, and brewing stands.
+pub(crate) fn collect_post_build_containers(
+    bp: &GeneratedBlueprint,
+    seed: u64,
+    lang: UiLang,
+) -> Vec<PostBuildContainer> {
+    const MAX_CONTAINERS: usize = 256;
+    let mut out = Vec::new();
+    let upper_floor_y = i32::from(bp.spec.foundation_height) + i32::from(bp.spec.floor_height);
+
+    for (&[lx, ly, lz], blk) in &bp.blocks {
+        if out.len() >= MAX_CONTAINERS {
+            break;
+        }
+        let bid = blk.block_id.as_str();
+        if !matches!(
+            bid,
+            "minecraft:chest"
+                | "minecraft:barrel"
+                | "minecraft:smoker"
+                | "minecraft:furnace"
+                | "minecraft:blast_furnace"
+                | "minecraft:brewing_stand"
+        ) {
+            continue;
+        }
+        let pos = [bp.origin[0] + lx, bp.origin[1] + ly, bp.origin[2] + lz];
+        let pos_mix = ((lx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ ((ly as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+            ^ ((lz as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+        let mut rng = SplitMix64::new(seed ^ pos_mix ^ 0x517C_C1B7_2722_0A95);
+
+        let (custom_name, items) = match bid {
+            "minecraft:smoker" => {
+                let foods = [
+                    "minecraft:beef",
+                    "minecraft:porkchop",
+                    "minecraft:chicken",
+                    "minecraft:potato",
+                    "minecraft:cod",
+                ];
+                let f = foods[rng.range_i32(0, (foods.len() - 1) as i32) as usize];
+                let fc = rng.range_i32(4, 10) as i8;
+                let cc = rng.range_i32(2, 6) as i8;
+                (
+                    tr(lang, "Kitchen Smoker", "Коптильня").to_owned(),
+                    vec![
+                        ContainerSlotItem { slot: 0, item_id: f, count: fc },
+                        ContainerSlotItem { slot: 1, item_id: "minecraft:coal", count: cc },
+                    ],
+                )
+            }
+            "minecraft:furnace" | "minecraft:blast_furnace" => {
+                let ores = if bid == "minecraft:blast_furnace" || bp.spec.category == BuildCategory::Forge {
+                    &["minecraft:raw_iron", "minecraft:raw_copper", "minecraft:raw_gold"][..]
+                } else {
+                    &["minecraft:raw_iron", "minecraft:cobblestone", "minecraft:sand"][..]
+                };
+                let ore = ores[rng.range_i32(0, (ores.len() - 1) as i32) as usize];
+                let oc = rng.range_i32(6, 14) as i8;
+                let cc = rng.range_i32(4, 9) as i8;
+                let title = if bid == "minecraft:blast_furnace" {
+                    tr(lang, "Forge Blast Furnace", "Плавильня кузницы")
+                } else {
+                    tr(lang, "Stone Furnace", "Печь")
+                };
+                (
+                    title.to_owned(),
+                    vec![
+                        ContainerSlotItem { slot: 0, item_id: ore, count: oc },
+                        ContainerSlotItem { slot: 1, item_id: "minecraft:coal", count: cc },
+                    ],
+                )
+            }
+            "minecraft:brewing_stand" => {
+                let reagents = [
+                    "minecraft:nether_wart",
+                    "minecraft:glowstone_dust",
+                    "minecraft:sugar",
+                    "minecraft:spider_eye",
+                ];
+                let reagent = reagents[rng.range_i32(0, (reagents.len() - 1) as i32) as usize];
+                let fuel = rng.range_i32(1, 3) as i8;
+                (
+                    tr(lang, "Alchemist Stand", "Стойка алхимика").to_owned(),
+                    vec![
+                        ContainerSlotItem { slot: 0, item_id: "minecraft:glass_bottle", count: 1 },
+                        ContainerSlotItem { slot: 1, item_id: "minecraft:glass_bottle", count: 1 },
+                        ContainerSlotItem { slot: 2, item_id: "minecraft:glass_bottle", count: 1 },
+                        ContainerSlotItem { slot: 3, item_id: reagent, count: rng.range_i32(2, 4) as i8 },
+                        ContainerSlotItem { slot: 4, item_id: "minecraft:blaze_powder", count: fuel },
+                    ],
+                )
+            }
+            _ => {
+                // Chest or Barrel: contextual thematic pool.
+                let is_barrel = bid == "minecraft:barrel";
+                let (title, pool): (&str, &[(&str, i32, i32)]) = if bp.spec.theme == StructureTheme::MageTower
+                    || bp.spec.theme == StructureTheme::Apothecary
+                    || bp.spec.theme == StructureTheme::Observatory
+                {
+                    (
+                        if is_barrel {
+                            tr(lang, "Reagent Barrel", "Бочка реагентов")
+                        } else {
+                            tr(lang, "Arcane Archive", "Тайный архив")
+                        },
+                        &[
+                            ("minecraft:glass_bottle", 2, 5),
+                            ("minecraft:amethyst_shard", 2, 6),
+                            ("minecraft:glowstone_dust", 2, 6),
+                            ("minecraft:lapis_lazuli", 3, 8),
+                            ("minecraft:book", 1, 3),
+                            ("minecraft:blaze_powder", 1, 2),
+                            ("minecraft:ender_pearl", 1, 2),
+                        ],
+                    )
+                } else if bp.spec.theme == StructureTheme::Library || bp.spec.theme == StructureTheme::Academy {
+                    (
+                        if is_barrel {
+                            tr(lang, "Scroll Barrel", "Бочка со свитками")
+                        } else {
+                            tr(lang, "Scholar's Chest", "Сундук учёного")
+                        },
+                        &[
+                            ("minecraft:book", 2, 5),
+                            ("minecraft:paper", 4, 12),
+                            ("minecraft:writable_book", 1, 2),
+                            ("minecraft:lapis_lazuli", 2, 6),
+                            ("minecraft:compass", 1, 1),
+                            ("minecraft:candle", 2, 4),
+                            ("minecraft:emerald", 1, 3),
+                        ],
+                    )
+                } else if bp.spec.theme == StructureTheme::Tavern || bp.spec.theme == StructureTheme::WineryBakery {
+                    (
+                        if is_barrel {
+                            tr(lang, "Tavern Ale Keg", "Бочка таверны")
+                        } else {
+                            tr(lang, "Tavern Larder", "Кладовая таверны")
+                        },
+                        &[
+                            ("minecraft:bread", 3, 8),
+                            ("minecraft:cooked_beef", 2, 5),
+                            ("minecraft:pumpkin_pie", 1, 3),
+                            ("minecraft:honey_bottle", 1, 4),
+                            ("minecraft:apple", 3, 7),
+                            ("minecraft:baked_potato", 3, 8),
+                            ("minecraft:wheat", 4, 10),
+                        ],
+                    )
+                } else if bp.spec.theme == StructureTheme::SailingShip || bp.spec.theme == StructureTheme::ShipyardDock || bp.spec.category == BuildCategory::Bridge {
+                    (
+                        if is_barrel {
+                            tr(lang, "Harbor Cargo Keg", "Портовая бочка")
+                        } else {
+                            tr(lang, "Navigator's Chest", "Сундук морехода")
+                        },
+                        &[
+                            ("minecraft:cod", 3, 8),
+                            ("minecraft:salmon", 2, 6),
+                            ("minecraft:compass", 1, 1),
+                            ("minecraft:spyglass", 1, 1),
+                            ("minecraft:lantern", 1, 3),
+                            ("minecraft:emerald", 1, 4),
+                            ("minecraft:bread", 2, 6),
+                        ],
+                    )
+                } else if bp.spec.category == BuildCategory::Forge {
+                    (
+                        if is_barrel {
+                            tr(lang, "Coal & Oil Barrel", "Бочка угля и смазки")
+                        } else {
+                            tr(lang, "Master Smith's Chest", "Сундук кузнеца")
+                        },
+                        &[
+                            ("minecraft:iron_ingot", 3, 9),
+                            ("minecraft:coal", 6, 16),
+                            ("minecraft:copper_ingot", 3, 8),
+                            ("minecraft:raw_iron", 3, 8),
+                            ("minecraft:iron_pickaxe", 1, 1),
+                            ("minecraft:iron_sword", 1, 1),
+                            ("minecraft:shield", 1, 1),
+                        ],
+                    )
+                } else if bp.spec.category == BuildCategory::Castle || bp.spec.theme == StructureTheme::BankVault {
+                    (
+                        if is_barrel {
+                            tr(lang, "Garrison Provisions", "Припасы гарнизона")
+                        } else {
+                            tr(lang, "Citadel Treasury", "Сокровищница цитадели")
+                        },
+                        &[
+                            ("minecraft:iron_sword", 1, 1),
+                            ("minecraft:arrow", 6, 16),
+                            ("minecraft:bread", 3, 8),
+                            ("minecraft:gold_ingot", 2, 6),
+                            ("minecraft:emerald", 1, 4),
+                            ("minecraft:shield", 1, 1),
+                            ("minecraft:torch", 4, 10),
+                        ],
+                    )
+                } else if bp.spec.category == BuildCategory::Barn {
+                    (
+                        if is_barrel {
+                            tr(lang, "Grain Barrel", "Бочка с зерном")
+                        } else {
+                            tr(lang, "Stable Tack Chest", "Сундук конюшни")
+                        },
+                        &[
+                            ("minecraft:wheat", 5, 14),
+                            ("minecraft:carrot", 4, 10),
+                            ("minecraft:potato", 4, 10),
+                            ("minecraft:saddle", 1, 1),
+                            ("minecraft:lead", 1, 2),
+                            ("minecraft:leather", 2, 6),
+                            ("minecraft:apple", 3, 7),
+                        ],
+                    )
+                } else if bp.spec.category == BuildCategory::Temple {
+                    (
+                        if is_barrel {
+                            tr(lang, "Incense & Wax Barrel", "Бочка с воском")
+                        } else {
+                            tr(lang, "Sanctuary Reliquary", "Ларец святилища")
+                        },
+                        &[
+                            ("minecraft:gold_ingot", 2, 5),
+                            ("minecraft:lapis_lazuli", 3, 7),
+                            ("minecraft:candle", 2, 6),
+                            ("minecraft:amethyst_shard", 2, 5),
+                            ("minecraft:emerald", 1, 3),
+                            ("minecraft:honey_bottle", 1, 3),
+                            ("minecraft:book", 1, 3),
+                        ],
+                    )
+                } else if ly < 0 {
+                    (
+                        if is_barrel {
+                            tr(lang, "Cellar Cask", "Бочка погреба")
+                        } else {
+                            tr(lang, "Cellar Supplies", "Запасы погреба")
+                        },
+                        &[
+                            ("minecraft:potato", 4, 10),
+                            ("minecraft:bread", 2, 6),
+                            ("minecraft:honey_bottle", 1, 3),
+                            ("minecraft:apple", 2, 6),
+                            ("minecraft:coal", 4, 10),
+                            ("minecraft:sweet_berries", 3, 8),
+                        ],
+                    )
+                } else if ly >= upper_floor_y {
+                    (
+                        if is_barrel {
+                            tr(lang, "Study Keg", "Бочонок кабинета")
+                        } else {
+                            tr(lang, "Traveler's Trunk", "Дорожный сундук")
+                        },
+                        &[
+                            ("minecraft:book", 1, 3),
+                            ("minecraft:paper", 3, 8),
+                            ("minecraft:compass", 1, 1),
+                            ("minecraft:lantern", 1, 2),
+                            ("minecraft:emerald", 1, 3),
+                            ("minecraft:spyglass", 1, 1),
+                        ],
+                    )
+                } else {
+                    (
+                        if is_barrel {
+                            tr(lang, "Pantry Barrel", "Кладовая бочка")
+                        } else {
+                            tr(lang, "Homestead Chest", "Домашний сундук")
+                        },
+                        &[
+                            ("minecraft:bread", 2, 6),
+                            ("minecraft:apple", 2, 6),
+                            ("minecraft:baked_potato", 2, 6),
+                            ("minecraft:torch", 3, 8),
+                            ("minecraft:iron_ingot", 1, 4),
+                            ("minecraft:coal", 3, 8),
+                            ("minecraft:paper", 2, 6),
+                        ],
+                    )
+                };
+
+                let item_count = if is_barrel {
+                    rng.range_i32(3, 5) as usize
+                } else {
+                    rng.range_i32(4, 7) as usize
+                };
+                let mut used_slots = [false; 27];
+                let mut items = Vec::with_capacity(item_count);
+                for _ in 0..item_count {
+                    let &(item_id, min_c, max_c) = &pool[rng.range_i32(0, (pool.len() - 1) as i32) as usize];
+                    let mut slot = rng.range_i32(0, 26) as usize;
+                    for _ in 0..27 {
+                        if !used_slots[slot] {
+                            break;
+                        }
+                        slot = (slot + 5) % 27;
+                    }
+                    if used_slots[slot] {
+                        continue;
+                    }
+                    used_slots[slot] = true;
+                    let count = rng.range_i32(min_c, max_c).clamp(1, 64) as i8;
+                    items.push(ContainerSlotItem {
+                        slot: slot as i8,
+                        item_id,
+                        count,
+                    });
+                }
+                (title.to_owned(), items)
+            }
+        };
+
+        out.push(PostBuildContainer {
+            pos,
+            custom_name,
+            items,
+        });
+    }
+
+    out
+}
+
+fn apply_post_build_containers(
+    host: &mut dyn ServerHost,
+    dimension: &str,
+    containers: &[PostBuildContainer],
+) {
+    if containers.is_empty() {
+        return;
+    }
+    let Some(level) = host.level(dimension) else {
+        return;
+    };
+    for c in containers {
+        let Some(be) = host.block_entity(level, c.pos) else {
+            continue;
+        };
+        let list_tags: Vec<Tag> = c
+            .items
+            .iter()
+            .map(|it| {
+                Tag::compound([
+                    ("Slot", Tag::Byte(it.slot)),
+                    ("id", Tag::String(it.item_id.into())),
+                    ("count", Tag::Int(i32::from(it.count))),
+                ])
+            })
+            .collect();
+        let Tag::Compound(root) = Tag::compound([("Items", Tag::List(list_tags))]) else {
+            continue;
+        };
+        let _ = be.merge_data(host, root);
+        let _ = be.set_name(host, Some(&c.custom_name));
+    }
+}
+
 fn prepare_undo_and_filter_blueprint(
     host: &dyn ServerHost,
     dimension: &str,
@@ -625,6 +1004,7 @@ pub fn execute_build(
     let owner_key = player.map_or(0, PlayerRef::uuid);
     let undo_snapshot =
         prepare_undo_and_filter_blueprint(host, &req.dimension, &mut bp, req.air_only);
+    let post_containers = collect_post_build_containers(&bp, req.seed as u64, lang);
 
     if req.air_only && bp.blocks.is_empty() {
         return BuildResponse {
@@ -717,6 +1097,7 @@ pub fn execute_build(
                 }
             }
         }
+        apply_post_build_containers(host, &req.dimension, &post_containers);
         let undo_count = undo_depth(owner_key);
         BuildResponse {
             ok: true,
@@ -820,6 +1201,7 @@ pub fn execute_build(
                             boss_bar,
                             label,
                             lang,
+                            post_containers,
                         });
                     });
                     let _ = host.schedule_task(1, BATCH_TASK_TOKEN);
@@ -861,6 +1243,7 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
     let mut bar_updates: Vec<(BossBarRef, i32, String)> = Vec::new();
     let mut bars_to_remove: Vec<BossBarRef> = Vec::new();
     let mut finished_notifications: Vec<(Option<u128>, String)> = Vec::new();
+    let mut finished_containers: Vec<(String, Vec<PostBuildContainer>)> = Vec::new();
 
     with_pending_jobs(|q| {
         while let Some(job) = q.front_mut() {
@@ -870,6 +1253,9 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
             }
             let Some(chunk) = job.chunks.pop_front() else {
                 let completed = q.pop_front().unwrap();
+                if !completed.post_containers.is_empty() {
+                    finished_containers.push((completed.dimension, completed.post_containers));
+                }
                 if let Some(bar) = completed.boss_bar {
                     bars_to_remove.push(bar);
                 }
@@ -897,6 +1283,9 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
             let pct = ((job.completed_runs * 100) / job.total_runs.max(1)).min(100) as i32;
             if job.chunks.is_empty() {
                 let completed = q.pop_front().unwrap();
+                if !completed.post_containers.is_empty() {
+                    finished_containers.push((completed.dimension, completed.post_containers));
+                }
                 if let Some(bar) = completed.boss_bar {
                     bars_to_remove.push(bar);
                 }
@@ -925,6 +1314,10 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
             }
         }
     });
+
+    for (dim, containers) in finished_containers {
+        apply_post_build_containers(host, &dim, &containers);
+    }
 
     for (bar, pct, label) in bar_updates {
         let _ = bar.set_value(host, pct);

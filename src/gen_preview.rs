@@ -59,6 +59,57 @@ impl HologramMesh {
 
 /// Blueprint edge highlight color along active horizontal Y-slice planes.
 pub const SLICE_CAP_ARGB: u32 = 0x867D_E8FF;
+/// Subtle cyan highlight for exposed structural seams (roof/wall, beam/wall, glass/wall).
+pub const MATERIAL_SEAM_ARGB: u32 = 0x5867_E8F9;
+/// Warm coral/amber highlight for voxels colliding with existing solid world blocks.
+pub const COLLISION_CREASE_ARGB: u32 = 0xD8FF_8A4C;
+
+/// Client-sampled world collision occupancy grid aligned with a blueprint's local bounds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreviewWorldMask {
+    pub width: i32,
+    pub height: i32,
+    pub depth: i32,
+    pub min_y: i32,
+    /// `0` = air/replaceable/below-threshold ground, `1` = existing world obstacle.
+    pub blocked: Vec<u8>,
+}
+
+impl PreviewWorldMask {
+    pub fn new(width: i32, min_y: i32, height: i32, depth: i32) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let d = depth.max(1);
+        let total = (w * h * d) as usize;
+        Self {
+            width: w,
+            height: h,
+            depth: d,
+            min_y,
+            blocked: vec![0; total],
+        }
+    }
+
+    #[inline]
+    pub fn set_blocked(&mut self, x: i32, y: i32, z: i32, val: bool) {
+        let ly = y - self.min_y;
+        if x < 0 || x >= self.width || ly < 0 || ly >= self.height || z < 0 || z >= self.depth {
+            return;
+        }
+        let idx = ((ly * self.depth + z) * self.width + x) as usize;
+        self.blocked[idx] = u8::from(val);
+    }
+
+    #[inline]
+    pub fn is_blocked(&self, x: i32, y: i32, z: i32) -> bool {
+        let ly = y - self.min_y;
+        if x < 0 || x >= self.width || ly < 0 || ly >= self.height || z < 0 || z >= self.depth {
+            return false;
+        }
+        let idx = ((ly * self.depth + z) * self.width + x) as usize;
+        self.blocked[idx] != 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShapeKind {
@@ -74,7 +125,7 @@ enum ShapeKind {
     Water,
 }
 
-/// Material tint family controlling semi-transparent bluish hologram tone & draw priority.
+/// Material tint family controlling semi-transparent bluish (or collision amber) hologram tone & priority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoloGroup {
     Wall,
@@ -85,6 +136,7 @@ pub enum HoloGroup {
     Water,
     Glow,
     Decor,
+    Collision,
 }
 
 impl HoloGroup {
@@ -98,12 +150,13 @@ impl HoloGroup {
             Self::Water => 6,
             Self::Glow => 7,
             Self::Decor => 8,
+            Self::Collision => 9,
         }
     }
 
     fn priority(self) -> u8 {
         match self {
-            Self::Roof | Self::Beam | Self::Glow => 0,
+            Self::Roof | Self::Beam | Self::Glow | Self::Collision => 0,
             Self::Wall | Self::Glass | Self::Decor => 1,
             Self::Foliage | Self::Water => 2,
         }
@@ -382,6 +435,13 @@ pub fn to_holo_argb(rgb: [u8; 3], group: HoloGroup, face_dir: usize, is_slice_ca
         _ => 0.94,    // -X / +X
     };
 
+    if group == HoloGroup::Collision {
+        let rq = (((255.0 * shade).clamp(96.0, 255.0) as u32) & !7).min(248);
+        let gq = (((122.0 * shade).clamp(40.0, 180.0) as u32) & !7).min(176);
+        let bq = (((68.0 * shade).clamp(24.0, 112.0) as u32) & !3).min(108);
+        return (0x70u32 << 24) | (rq << 16) | (gq << 8) | bq;
+    }
+
     let (tint_r, tint_g, tint_b, mix_tint, base_alpha): (f32, f32, f32, f32, u8) = match group {
         HoloGroup::Wall => (68.0, 174.0, 255.0, 0.74, 0x56),
         HoloGroup::Beam => (42.0, 116.0, 218.0, 0.76, 0x64),
@@ -391,6 +451,7 @@ pub fn to_holo_argb(rgb: [u8; 3], group: HoloGroup, face_dir: usize, is_slice_ca
         HoloGroup::Water => (34.0, 118.0, 246.0, 0.84, 0x52),
         HoloGroup::Glow => (218.0, 248.0, 255.0, 0.72, 0x88),
         HoloGroup::Decor => (134.0, 198.0, 255.0, 0.76, 0x5C),
+        HoloGroup::Collision => (255.0, 118.0, 68.0, 0.85, 0x70),
     };
 
     let mr = f32::from(rgb[0]);
@@ -443,6 +504,19 @@ fn voxel_cell_from_block(planned: &PlannedBlock) -> VoxelCell {
 /// Builds a full 3D translucent bluish holographic preview mesh (plus a 2x2x2 macro fallback),
 /// including negative-Y basements, hillside terraces, and bridge pier footings.
 pub fn build_hologram_mesh(bp: &GeneratedBlueprint, clip_max_y: Option<i32>) -> HologramMesh {
+    build_hologram_mesh_with_world(bp, clip_max_y, None, false, false)
+}
+
+/// Builds a 3D translucent holographic preview aware of existing world obstacles:
+/// omits obstructed blocks in `air_only` mode, or tints conflicting voxels coral-orange when
+/// `highlight_collisions` is active.
+pub fn build_hologram_mesh_with_world(
+    bp: &GeneratedBlueprint,
+    clip_max_y: Option<i32>,
+    world_mask: Option<&PreviewWorldMask>,
+    air_only: bool,
+    highlight_collisions: bool,
+) -> HologramMesh {
     let w = i32::from(bp.width).max(1);
     let d = i32::from(bp.depth).max(1);
     let mut min_y = 0i32;
@@ -475,9 +549,19 @@ pub fn build_hologram_mesh(bp: &GeneratedBlueprint, clip_max_y: Option<i32>) -> 
         if x < 0 || x >= w || sy < 0 || sy >= h || z < 0 || z >= d {
             continue;
         }
-        let cell = voxel_cell_from_block(planned);
+        let world_blocked = world_mask.is_some_and(|m| m.is_blocked(x, y, z));
+        if air_only && world_blocked {
+            continue;
+        }
+        let mut cell = voxel_cell_from_block(planned);
         if !cell.visible {
             continue;
+        }
+        if !air_only && highlight_collisions && world_blocked {
+            cell.group = HoloGroup::Collision;
+            cell.group_id = HoloGroup::Collision.id();
+            cell.priority = HoloGroup::Collision.priority();
+            cell.base_rgb = [255, 118, 68];
         }
         let idx = ((sy * d + z) * w + x) as usize;
         grid[idx] = cell;
@@ -488,7 +572,7 @@ pub fn build_hologram_mesh(bp: &GeneratedBlueprint, clip_max_y: Option<i32>) -> 
 
     let (mut quads, mut lines) = build_detail_mesh(&grid, &extras, w, h, d, y_cap);
 
-    let (mut macro_quads, mut macro_lines) = if quads.len() > TARGET_MAX_QUADS {
+    let (mut macro_quads, mut macro_lines) = if quads.len() > TARGET_MAX_QUADS || lines.len() > TARGET_MAX_LINES {
         build_macro_mesh(&grid, w, h, d, y_cap)
     } else {
         (Vec::new(), Vec::new())
@@ -1114,9 +1198,10 @@ fn extract_crease_lines(
     }
 }
 
-/// Returns `Some((argb, width))` only for convex/concave corners, diagonal edges, and slice boundaries.
+/// Returns `Some((argb, width))` for convex/concave corners, collision highlights, exposed material seams, and slice boundaries.
 fn edge_line_color(tags: [u8; 4], is_slice_plane: bool, edge_col: u32, slice_col: u32) -> Option<(u32, f32)> {
     let occ = tags.iter().filter(|&&t| t != 0).count();
+    let has_collision = tags.contains(&HoloGroup::Collision.id());
     if occ == 0 || occ == 4 {
         return None;
     }
@@ -1124,14 +1209,35 @@ fn edge_line_color(tags: [u8; 4], is_slice_plane: bool, edge_col: u32, slice_col
         return Some((slice_col, 2.0));
     }
     match occ {
-        1 | 3 => Some((edge_col, 1.35)),
+        1 | 3 => {
+            if has_collision {
+                Some((COLLISION_CREASE_ARGB, 1.65))
+            } else {
+                Some((edge_col, 1.35))
+            }
+        }
         2 => {
             // Side-by-side flat surface vs diagonal touch ([0,3] or [1,2]).
             let diag = (tags[0] != 0 && tags[3] != 0) || (tags[1] != 0 && tags[2] != 0);
             if diag {
-                Some((edge_col, 1.35))
+                if has_collision {
+                    Some((COLLISION_CREASE_ARGB, 1.65))
+                } else {
+                    Some((edge_col, 1.35))
+                }
             } else {
-                None
+                // Exposed material transition on a flat outer surface (e.g., Wall vs Roof, Beam vs Wall, Collision vs Wall).
+                let first_non_zero = tags.iter().copied().find(|&t| t != 0).unwrap_or(0);
+                let distinct_groups = tags.iter().any(|&t| t != 0 && t != first_non_zero);
+                if distinct_groups {
+                    if has_collision {
+                        Some((COLLISION_CREASE_ARGB, 1.5))
+                    } else {
+                        Some((MATERIAL_SEAM_ARGB, 1.05))
+                    }
+                } else {
+                    None
+                }
             }
         }
         _ => None,

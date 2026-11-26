@@ -931,8 +931,8 @@ pub fn generate_settlement(
             }
         }
 
-        // Link building entrance cleanly to nearest street along facing axis.
-        if let Some([dlx, _, dlz]) = sub_bp.door_pos {
+        // Link building entrance smoothly to nearest street along facing axis (including gentle terrain steps).
+        if let Some([dlx, dl_y, dlz]) = sub_bp.door_pos {
             let dx = lot.x0 + dlx;
             let dz = lot.z0 + dlz;
             let (sx_step, sz_step) = match lot.facing {
@@ -941,6 +941,7 @@ pub fn generate_settlement(
                 CardinalFacing::East => (1, 0),
                 CardinalFacing::West => (-1, 0),
             };
+            let mut prev_y = lot_base_y + dl_y - 1;
             let mut px = dx + sx_step;
             let mut pz = dz + sz_step;
             let mut steps = 0;
@@ -949,12 +950,19 @@ pub fn generate_settlement(
                 && !is_road[(pz * w + px) as usize]
                 && steps < 18
             {
-                let sy = if is_floating {
+                let target_y = if is_floating {
                     1
                 } else if req.adapt_terrain {
                     terrain_at_wxz(terrain_offsets, w, px, pz).clamp(-4, 3)
                 } else {
                     0
+                };
+                let sy = if target_y > prev_y {
+                    prev_y + 1
+                } else if target_y < prev_y {
+                    prev_y - 1
+                } else {
+                    target_y
                 };
                 if blocks
                     .get(&[px, sy + 1, pz])
@@ -966,12 +974,21 @@ pub fn generate_settlement(
                         }
                         blocks.insert([px, sy, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, px, sy, pz)));
                     } else {
+                        if sy > target_y {
+                            for fy in target_y..sy {
+                                blocks.insert([px, fy, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, px, fy, pz)));
+                            }
+                        }
                         blocks.insert(
                             [px, sy, pz],
                             pave_block_for_style(spec.style, pal, seed, px, sy, pz, rng.next_f64(), false),
                         );
+                        for cy in (sy + 1)..=(sy + 3) {
+                            blocks.insert([px, cy, pz], PlannedBlock::simple("minecraft:air"));
+                        }
                     }
                 }
+                prev_y = sy;
                 px += sx_step;
                 pz += sz_step;
                 steps += 1;

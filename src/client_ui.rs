@@ -219,6 +219,7 @@ enum WorldSelectMode {
     Inactive,
     PickingCorner1,
     PickingCorner2 { c1: [i32; 3] },
+    MovePreview,
 }
 
 #[derive(Clone)]
@@ -226,6 +227,7 @@ enum PendingAction {
     OpenMenu,
     CloseMenu,
     StartWorldSelect,
+    StartMovePreview,
     PlaceInFront,
     CopyShareCode(SavedPreset),
     PasteShareCode,
@@ -274,6 +276,10 @@ struct WidgetHandles {
     slice_toggle_btn: Option<WidgetId>,
     slice_dec_btn: Option<WidgetId>,
     slice_inc_btn: Option<WidgetId>,
+    frame_btn: Option<WidgetId>,
+    collision_btn: Option<WidgetId>,
+    move_preview_btn: Option<WidgetId>,
+    auto_hide_btn: Option<WidgetId>,
     fav_save_btn: Option<WidgetId>,
     fav_load_btn: Option<WidgetId>,
     fav_del_btn: Option<WidgetId>,
@@ -374,7 +380,7 @@ struct BuiltScreen {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct PreviewKey {
+struct BpCacheKey {
     width: u16,
     depth: u16,
     height: u16,
@@ -388,11 +394,19 @@ struct PreviewKey {
     toggles_raw: [u8; 5],
     adapt_terrain: bool,
     terrain_fp: u64,
-    preview_slice_y: Option<i32>,
     palette_fp: u64,
     wear_pct: u8,
     overgrowth_pct: u8,
     biome_hint: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PreviewKey {
+    bp_fp: u64,
+    preview_slice_y: Option<i32>,
+    air_only: bool,
+    show_collisions: bool,
+    world_mask_fp: u64,
 }
 
 struct ClientUiState {
@@ -415,6 +429,11 @@ struct ClientUiState {
     detected_biome: String,
     last_biome_query: Option<(String, i32, i32, i32)>,
     show_preview_box: bool,
+    show_frame_box: bool,
+    show_collisions: bool,
+    auto_hide_on_build: bool,
+    saved_overlay_vis: Option<(bool, bool)>,
+    hud_toast: Option<(String, u64)>,
     preview_slice_y: Option<i32>,
     category: BuildCategory,
     style: BuildStyle,
@@ -461,6 +480,13 @@ struct ClientUiState {
     cached_water_depths: Option<Vec<i32>>,
     cached_terrain_fp: u64,
     last_terrain_sample_ms: u64,
+    bp_cache_key: Option<BpCacheKey>,
+    cached_bp: Option<crate::generator::GeneratedBlueprint>,
+    cached_bp_fp: u64,
+    world_mask_key: Option<(String, i32, i32, i32, u16, u16, u16, u64, bool, bool)>,
+    cached_world_mask: Option<crate::gen_preview::PreviewWorldMask>,
+    cached_world_mask_fp: u64,
+    last_world_mask_ms: u64,
     preview_key: Option<PreviewKey>,
     preview_mesh: crate::gen_preview::HologramMesh,
     preview_bom: Vec<(String, usize)>,
@@ -495,6 +521,11 @@ impl Default for ClientUiState {
             detected_biome: String::new(),
             last_biome_query: None,
             show_preview_box: true,
+            show_frame_box: true,
+            show_collisions: true,
+            auto_hide_on_build: false,
+            saved_overlay_vis: None,
+            hud_toast: None,
             preview_slice_y: None,
             category: BuildCategory::House,
             style: BuildStyle::Auto,
@@ -541,6 +572,13 @@ impl Default for ClientUiState {
             cached_water_depths: None,
             cached_terrain_fp: 0,
             last_terrain_sample_ms: 0,
+            bp_cache_key: None,
+            cached_bp: None,
+            cached_bp_fp: 0,
+            world_mask_key: None,
+            cached_world_mask: None,
+            cached_world_mask_fp: 0,
+            last_world_mask_ms: 0,
             preview_key: None,
             preview_mesh: crate::gen_preview::HologramMesh::default(),
             preview_bom: Vec::new(),
@@ -708,6 +746,19 @@ pub fn on_server_response(resp: BuildResponse) {
                 st.dirty = true;
             } else if resp.ok && (resp.message.starts_with("Ready:") || resp.message.starts_with("Готово:") || resp.message.contains("seed ")) {
                 st.redo_count = 0;
+                st.dirty = true;
+            }
+            let finished_build = resp.ok
+                && (resp.message.starts_with("Ready:")
+                    || resp.message.starts_with("Готово:")
+                    || resp.message.contains("Build complete")
+                    || resp.message.contains("Завершена постройка"))
+                && !resp.message.starts_with("Large build")
+                && !resp.message.starts_with("Крупная постройка");
+            if finished_build && st.auto_hide_on_build && (st.show_frame_box || st.show_preview_box) {
+                st.saved_overlay_vis = Some((st.show_frame_box, st.show_preview_box));
+                st.show_frame_box = false;
+                st.show_preview_box = false;
                 st.dirty = true;
             }
             st.status = resp.message;
@@ -1117,6 +1168,10 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
 
     let mut cat_btn = None;
     let mut style_btn = None;
+    let mut frame_btn = None;
+    let mut collision_btn = None;
+    let mut move_preview_btn = None;
+    let mut auto_hide_btn = None;
     let mut roof_btn = None;
     let mut desc_field = None;
     let mut seed_field = None;
@@ -1596,6 +1651,38 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let mut s_inc = Button::new([rx + slice_w + 26.0, body_y + 102.0, 22.0, 17.0], Text::literal("+"));
             s_inc.active = st.preview_slice_y.is_some();
             slice_inc_btn = Some(w.add_button(s_inc));
+
+            frame_btn = Some(w.add_button(Button::new(
+                [rx, body_y + 121.0, half_p, 16.0],
+                Text::literal(match (lang, st.show_frame_box) {
+                    (UiLang::En, true) => "Frame: ON",
+                    (UiLang::En, false) => "Frame: OFF",
+                    (UiLang::Ru, true) => "Рамка: ВКЛ",
+                    (UiLang::Ru, false) => "Рамка: ВЫКЛ",
+                }),
+            )));
+            collision_btn = Some(w.add_button(Button::new(
+                [rx + half_p + 4.0, body_y + 121.0, half_p, 16.0],
+                Text::literal(match (lang, st.show_collisions) {
+                    (UiLang::En, true) => "Colls: ON",
+                    (UiLang::En, false) => "Colls: OFF",
+                    (UiLang::Ru, true) => "Коллиз: ВКЛ",
+                    (UiLang::Ru, false) => "Коллиз: ВЫКЛ",
+                }),
+            )));
+            move_preview_btn = Some(w.add_button(Button::new(
+                [rx, body_y + 139.0, half_p, 16.0],
+                Text::literal(tr(lang, "Move 3D [World]", "Двигать 3D")),
+            )));
+            auto_hide_btn = Some(w.add_button(Button::new(
+                [rx + half_p + 4.0, body_y + 139.0, half_p, 16.0],
+                Text::literal(match (lang, st.auto_hide_on_build) {
+                    (UiLang::En, true) => "Hide@Build: ON",
+                    (UiLang::En, false) => "Hide@Build: OFF",
+                    (UiLang::Ru, true) => "Автоскрыт: ВКЛ",
+                    (UiLang::Ru, false) => "Автоскрыт: ВЫКЛ",
+                }),
+            )));
         }
         UiTab::DescNoise => {
             let b_gap = 3.0;
@@ -2016,6 +2103,10 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             slice_toggle_btn,
             slice_dec_btn,
             slice_inc_btn,
+            frame_btn,
+            collision_btn,
+            move_preview_btn,
+            auto_hide_btn,
             fav_save_btn,
             fav_load_btn,
             fav_del_btn,
@@ -2475,9 +2566,26 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                     st.dirty = true;
                 } else if Some(id) == h.preview_btn {
                     st.show_preview_box = !st.show_preview_box;
+                    st.saved_overlay_vis = None;
                     st.dirty = true;
                 } else if Some(id) == h.air_only_btn {
                     st.air_only = !st.air_only;
+                    st.world_mask_key = None;
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.frame_btn {
+                    st.show_frame_box = !st.show_frame_box;
+                    st.saved_overlay_vis = None;
+                    st.dirty = true;
+                } else if Some(id) == h.collision_btn {
+                    st.show_collisions = !st.show_collisions;
+                    st.world_mask_key = None;
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.move_preview_btn {
+                    st.pending = Some(PendingAction::StartMovePreview);
+                } else if Some(id) == h.auto_hide_btn {
+                    st.auto_hide_on_build = !st.auto_hide_on_build;
                     st.dirty = true;
                 } else if Some(id) == h.slice_toggle_btn {
                     st.preview_slice_y = match st.preview_slice_y {
@@ -2941,52 +3049,7 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                             st.seed_text = val;
                         }
                     }
-                    st.build_seq = st.build_seq.wrapping_add(1);
-                    if st.auto_seed {
-                        push_seed_history(st, st.seed);
-                        st.seed = crate::noise::fresh_entropy(st.build_seq, host.millis());
-                        st.seed_text = st.seed.to_string();
-                        st.dirty = true;
-                    }
-                    sync_palette_from_ui(st);
-                    st.preview_key = None;
-                    if let Some(cam) = host.camera() {
-                        st.dimension = cam.dimension.clone();
-                    }
-                    if st.origin.is_none() {
-                        compute_origin_in_front(host, st);
-                    }
-                    let origin = st.origin.unwrap_or([0, 64, 0]);
-                    let req = BuildRequest {
-                        dimension: st.dimension.clone(),
-                        origin_x: origin[0],
-                        origin_y: origin[1],
-                        origin_z: origin[2],
-                        width: st.width,
-                        depth: st.depth,
-                        height: st.height,
-                        category: st.category,
-                        style: st.style,
-                        facing: st.facing,
-                        noise_level: st.noise_level,
-                        seed: st.seed as i64,
-                        description: effective_description(st),
-                        adapt_terrain: st.adapt_terrain,
-                        air_only: st.air_only,
-                        wear_pct: st.wear_pct,
-                        overgrowth_pct: st.overgrowth_pct,
-                        biome_hint: if st.use_biome_auto {
-                            st.detected_biome.clone()
-                        } else {
-                            String::new()
-                        },
-                        palette: st.palette.clone(),
-                    };
-                    st.status = match st.lang {
-                        UiLang::En => format!("Build (seed {}) sent...", st.seed),
-                        UiLang::Ru => format!("Генерация (сид {}) отправлена...", st.seed),
-                    };
-                    st.pending = Some(PendingAction::SendBuild(req));
+                    queue_build_from_state(host, st);
                 } else if id == h.reroll_btn {
                     st.status = tr(st.lang, "Rerolling with a new seed...", "Перегенерация с новым шумом...").into();
                     st.pending = Some(PendingAction::SendReroll(st.dimension.clone()));
@@ -3009,6 +3072,64 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
             Flow::Continue
         }
     })
+}
+
+fn facing_forward_xz(f: CardinalFacing) -> [i32; 2] {
+    match f {
+        CardinalFacing::North => [0, -1],
+        CardinalFacing::South => [0, 1],
+        CardinalFacing::East => [1, 0],
+        CardinalFacing::West => [-1, 0],
+    }
+}
+
+fn queue_build_from_state(host: &dyn ClientHost, st: &mut ClientUiState) {
+    st.build_seq = st.build_seq.wrapping_add(1);
+    if st.auto_seed {
+        push_seed_history(st, st.seed);
+        st.seed = crate::noise::fresh_entropy(st.build_seq, host.millis());
+        st.seed_text = st.seed.to_string();
+        st.dirty = true;
+    }
+    sync_palette_from_ui(st);
+    st.preview_key = None;
+    if let Some(cam) = host.camera() {
+        st.dimension = cam.dimension.clone();
+    }
+    if st.origin.is_none() {
+        compute_origin_in_front(host, st);
+    }
+    let origin = st.origin.unwrap_or([0, 64, 0]);
+    let req = BuildRequest {
+        dimension: st.dimension.clone(),
+        origin_x: origin[0],
+        origin_y: origin[1],
+        origin_z: origin[2],
+        width: st.width,
+        depth: st.depth,
+        height: st.height,
+        category: st.category,
+        style: st.style,
+        facing: st.facing,
+        noise_level: st.noise_level,
+        seed: st.seed as i64,
+        description: effective_description(st),
+        adapt_terrain: st.adapt_terrain,
+        air_only: st.air_only,
+        wear_pct: st.wear_pct,
+        overgrowth_pct: st.overgrowth_pct,
+        biome_hint: if st.use_biome_auto {
+            st.detected_biome.clone()
+        } else {
+            String::new()
+        },
+        palette: st.palette.clone(),
+    };
+    st.status = match st.lang {
+        UiLang::En => format!("Build (seed {}) sent...", st.seed),
+        UiLang::Ru => format!("Генерация (сид {}) отправлена...", st.seed),
+    };
+    st.pending = Some(PendingAction::SendBuild(req));
 }
 
 pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
@@ -3038,9 +3159,118 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
         return;
     }
 
-    let in_select = with_state(|st| st.world_select != WorldSelectMode::Inactive);
-    if !in_select {
+    let shift_down = (event.modifiers & 1) != 0;
+
+    if event.key == "key.keyboard.h" && host.mod_screen().is_none() {
+        let now = host.millis();
+        with_state(|st| {
+            if shift_down {
+                st.show_frame_box = !st.show_frame_box;
+                st.hud_toast = Some((
+                    match (st.lang, st.show_frame_box) {
+                        (UiLang::En, true) => "Blue frame: ON".into(),
+                        (UiLang::En, false) => "Blue frame: OFF (3D View kept)".into(),
+                        (UiLang::Ru, true) => "Синяя рамка: ВКЛ".into(),
+                        (UiLang::Ru, false) => "Синяя рамка: ВЫКЛ (3D-обзор сохранён)".into(),
+                    },
+                    now + 2200,
+                ));
+            } else if st.show_frame_box || st.show_preview_box {
+                st.saved_overlay_vis = Some((st.show_frame_box, st.show_preview_box));
+                st.show_frame_box = false;
+                st.show_preview_box = false;
+                st.hud_toast = Some((
+                    tr(
+                        st.lang,
+                        "Frame & 3D hidden — [H] to restore",
+                        "Рамка и 3D скрыты — [H] вернуть",
+                    )
+                    .into(),
+                    now + 2200,
+                ));
+            } else {
+                let (rf, rp) = st.saved_overlay_vis.take().unwrap_or((true, true));
+                st.show_frame_box = if !rf && !rp { true } else { rf };
+                st.show_preview_box = rp;
+                if st.origin.is_none() {
+                    compute_origin_in_front(host, st);
+                }
+                st.hud_toast = Some((
+                    tr(
+                        st.lang,
+                        "Frame & 3D restored ([Shift+H] frame only)",
+                        "Рамка и 3D включены ([Shift+H] только рамка)",
+                    )
+                    .into(),
+                    now + 2200,
+                ));
+            }
+            st.dirty = true;
+        });
         return;
+    }
+
+    let mode = with_state(|st| st.world_select);
+    if mode == WorldSelectMode::Inactive {
+        return;
+    }
+
+    if mode == WorldSelectMode::MovePreview {
+        let cam_face = host
+            .camera()
+            .map(|c| CardinalFacing::from_yaw(c.yaw))
+            .unwrap_or(CardinalFacing::South);
+        let [fx, fz] = facing_forward_xz(cam_face);
+        let step = if shift_down { 4 } else { 1 };
+        let nudge: Option<[i32; 3]> = match event.key {
+            "key.keyboard.up" | "key.keyboard.i" => Some([fx * step, 0, fz * step]),
+            "key.keyboard.down" | "key.keyboard.k" => Some([-fx * step, 0, -fz * step]),
+            "key.keyboard.left" | "key.keyboard.j" => Some([fz * step, 0, -fx * step]),
+            "key.keyboard.right" | "key.keyboard.l" => Some([-fz * step, 0, fx * step]),
+            "key.keyboard.page.up" | "key.keyboard.page_up" | "key.keyboard.equal" => Some([0, step, 0]),
+            "key.keyboard.page.down" | "key.keyboard.page_down" | "key.keyboard.minus" => Some([0, -step, 0]),
+            _ => None,
+        };
+        if let Some([dx, dy, dz]) = nudge {
+            with_state(|st| {
+                if st.origin.is_none() {
+                    compute_origin_in_front(host, st);
+                }
+                if let Some(o) = &mut st.origin {
+                    o[0] += dx;
+                    o[1] += dy;
+                    o[2] += dz;
+                    st.world_mask_key = None;
+                    st.terrain_cache_key = None;
+                    st.status = format!("Pos: {}, {}, {}", o[0], o[1], o[2]);
+                }
+                st.dirty = true;
+            });
+            return;
+        }
+        if event.key == "key.keyboard.c" {
+            with_state(|st| {
+                st.show_collisions = !st.show_collisions;
+                st.world_mask_key = None;
+                st.preview_key = None;
+                st.status = tr(
+                    st.lang,
+                    if st.show_collisions { "Collisions: ON" } else { "Collisions: OFF" },
+                    if st.show_collisions { "Коллизии: ВКЛ" } else { "Коллизии: ВЫКЛ" },
+                )
+                .into();
+                st.dirty = true;
+            });
+            return;
+        }
+        if event.key == "key.keyboard.enter" || event.key == "key.keyboard.keypad.enter" {
+            with_state(|st| {
+                st.world_select = WorldSelectMode::Inactive;
+                queue_build_from_state(host, st);
+                st.dirty = true;
+            });
+            return;
+        }
     }
 
     if event.key == "key.keyboard.r" {
@@ -3051,7 +3281,7 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
                 UiLang::Ru => format!("Направление входа: {}", st.facing.label(st.lang)),
             };
         });
-    } else if event.key == "key.keyboard.page_up" {
+    } else if matches!(event.key, "key.keyboard.page.up" | "key.keyboard.page_up") {
         with_state(|st| {
             st.height = (st.height + 1).min(48);
             st.status = match st.lang {
@@ -3059,7 +3289,7 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
                 UiLang::Ru => format!("Высота области: {}", st.height),
             };
         });
-    } else if event.key == "key.keyboard.page_down" {
+    } else if matches!(event.key, "key.keyboard.page.down" | "key.keyboard.page_down") {
         with_state(|st| {
             st.height = st.height.saturating_sub(1).max(5);
             st.status = match st.lang {
@@ -3067,7 +3297,7 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
                 UiLang::Ru => format!("Высота области: {}", st.height),
             };
         });
-    } else if event.key == "key.keyboard.left_bracket" {
+    } else if matches!(event.key, "key.keyboard.left.bracket" | "key.keyboard.left_bracket") {
         with_state(|st| {
             let next = st.preview_slice_y.map_or(Some((i32::from(st.height) / 3).max(2)), |y| {
                 Some((y - 1).max(0))
@@ -3079,7 +3309,7 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
                 UiLang::Ru => format!("Срез 3D-голограммы: Y<={}", next.unwrap_or(0)),
             };
         });
-    } else if event.key == "key.keyboard.right_bracket" {
+    } else if matches!(event.key, "key.keyboard.right.bracket" | "key.keyboard.right_bracket") {
         with_state(|st| {
             let cur = st.preview_slice_y.unwrap_or(2) + 1;
             if cur >= i32::from(st.height) {
@@ -3092,6 +3322,14 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
                     UiLang::Ru => format!("Срез 3D-голограммы: Y<={cur}"),
                 };
             }
+            st.preview_key = None;
+        });
+    } else if event.key == "key.keyboard.slash" {
+        with_state(|st| {
+            st.preview_slice_y = match st.preview_slice_y {
+                None => Some((i32::from(st.height) / 3).clamp(2, 10)),
+                Some(_) => None,
+            };
             st.preview_key = None;
         });
     } else if event.key == "key.keyboard.escape" {
@@ -3165,6 +3403,19 @@ pub fn on_mouse_button_pre(host: &mut dyn ClientHost, event: &mut MouseButtonPre
                 } else {
                     false
                 }
+            }
+            WorldSelectMode::MovePreview => {
+                if event.button == 0 || event.button == 1 {
+                    st.origin = Some([
+                        hit_pos[0] - i32::from(st.width / 2),
+                        hit_pos[1],
+                        hit_pos[2] - i32::from(st.depth / 2),
+                    ]);
+                    st.world_mask_key = None;
+                    st.terrain_cache_key = None;
+                    st.dirty = true;
+                }
+                false
             }
         }
     });
@@ -3351,9 +3602,27 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
                 st.aimed_block = current_aim_block(host);
             });
         }
+        PendingAction::StartMovePreview => {
+            host.mod_screen_close(SCREEN_ID);
+            with_state(|st| {
+                if st.origin.is_none() {
+                    compute_origin_in_front(host, st);
+                }
+                if !st.show_preview_box {
+                    st.show_preview_box = true;
+                }
+                st.saved_overlay_vis = None;
+                st.world_select = WorldSelectMode::MovePreview;
+                st.aimed_block = current_aim_block(host);
+            });
+        }
         PendingAction::PlaceInFront => {
             with_state(|st| {
                 compute_origin_in_front(host, st);
+                if let Some((rf, rp)) = st.saved_overlay_vis.take() {
+                    st.show_frame_box = rf || !rp;
+                    st.show_preview_box = rp;
+                }
                 st.status = match st.lang {
                     UiLang::En => format!("Area in front of you: {:?}", st.origin.unwrap_or([0, 64, 0])),
                     UiLang::Ru => format!("Область перед вами: {:?}", st.origin.unwrap_or([0, 64, 0])),
@@ -4087,8 +4356,24 @@ pub fn on_screen_char_typed(
 }
 
 pub fn on_render_gui_post(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<'_>) {
-    let (lang, mode, facing, progress) =
-        with_state(|st| (st.lang, st.world_select, st.facing, st.build_progress.clone()));
+    let now = host.millis();
+    let (lang, mode, facing, origin, show_frame, show_preview, progress, toast) = with_state(|st| {
+        if let Some((_, exp)) = st.hud_toast
+            && now >= exp
+        {
+            st.hud_toast = None;
+        }
+        (
+            st.lang,
+            st.world_select,
+            st.facing,
+            st.origin,
+            st.show_frame_box,
+            st.show_preview_box,
+            st.build_progress.clone(),
+            st.hud_toast.as_ref().map(|(msg, _)| msg.clone()),
+        )
+    });
     if !host.playing() {
         return;
     }
@@ -4101,7 +4386,11 @@ pub fn on_render_gui_post(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<
         };
         let bw = 200.0_f32.max(event.draw.text_width(&txt) + 16.0);
         let bx = ((sw - bw) * 0.5).floor();
-        let by = if mode != WorldSelectMode::Inactive { 32.0 } else { 10.0 };
+        let by = if mode != WorldSelectMode::Inactive || toast.is_some() {
+            32.0
+        } else {
+            10.0
+        };
         event.draw.fill([bx, by, bw, 20.0], 0xC80F_172A);
         event.draw.fill([bx, by, bw, 1.0], 0xFF38_BDF8);
         event.draw.text(&txt, [bx + 8.0, by + 3.0], 0xFFE0_F2FE, true);
@@ -4112,30 +4401,66 @@ pub fn on_render_gui_post(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<
     }
 
     if mode == WorldSelectMode::Inactive {
+        if let Some(tmsg) = toast {
+            let tw = event.draw.text_width(&tmsg) + 16.0;
+            let bx = ((sw - tw) * 0.5).floor();
+            event.draw.fill([bx, 10.0, tw, 17.0], 0xC811_1827);
+            event.draw.fill([bx, 10.0, tw, 1.0], 0xFF34_D399);
+            event.draw.text(&tmsg, [bx + 8.0, 14.5], 0xFFD1_FAE5, true);
+        } else if host.mod_screen().is_none() && origin.is_some() && (show_frame || show_preview) {
+            let hint = match (lang, show_frame, show_preview) {
+                (UiLang::En, true, true) => "[F8] Menu | [H] Hide Frame & 3D | [Shift+H] Hide Frame Only",
+                (UiLang::En, false, true) => "[F8] Menu | [H] Hide 3D | [Shift+H] Show Frame",
+                (UiLang::En, true, false) => "[F8] Menu | [H] Hide Frame",
+                (UiLang::Ru, true, true) => "[F8] Меню | [H] Скрыть рамку и 3D | [Shift+H] Только рамку",
+                (UiLang::Ru, false, true) => "[F8] Меню | [H] Скрыть 3D | [Shift+H] Показать рамку",
+                (UiLang::Ru, true, false) => "[F8] Меню | [H] Скрыть рамку",
+                _ => "",
+            };
+            if !hint.is_empty() {
+                let hw = event.draw.text_width(hint) + 14.0;
+                let hx = ((sw - hw) * 0.5).floor();
+                event.draw.fill([hx, 8.0, hw, 14.0], 0x880F_172A);
+                event.draw.text(hint, [hx + 7.0, 11.0], 0xFFCB_D5E1, false);
+            }
+        }
         return;
     }
     let msg = match mode {
         WorldSelectMode::Inactive => return,
         WorldSelectMode::PickingCorner1 => match lang {
             UiLang::En => format!(
-                "Area: [RMB] center | [LMB] 1st corner | [R] front ({}) | [PgUp/Dn] height | [/] slice | [Esc]",
+                "Area: [RMB] center | [LMB] 1st corner | [R] front ({}) | [PgUp/Dn] height | [[/]] slice | [Esc]",
                 facing.label(lang)
             ),
             UiLang::Ru => format!(
-                "Область: [ПКМ] центр | [ЛКМ] 1-й угол | [R] вход ({}) | [PgUp/Dn] высота | [/] срез | [Esc]",
+                "Область: [ПКМ] центр | [ЛКМ] 1-й угол | [R] вход ({}) | [PgUp/Dn] высота | [[/]] срез | [Esc]",
                 facing.label(lang)
             ),
         },
         WorldSelectMode::PickingCorner2 { .. } => match lang {
             UiLang::En => format!(
-                "2nd corner: [LMB/RMB] done | [R] front ({}) | [PgUp/Dn] height | [/] slice | [Esc]",
+                "2nd corner: [LMB/RMB] done | [R] front ({}) | [PgUp/Dn] height | [[/]] slice | [Esc]",
                 facing.label(lang)
             ),
             UiLang::Ru => format!(
-                "2-й угол: [ЛКМ/ПКМ] готово | [R] вход ({}) | [PgUp/Dn] высота | [/] срез | [Esc]",
+                "2-й угол: [ЛКМ/ПКМ] готово | [R] вход ({}) | [PgUp/Dn] высота | [[/]] срез | [Esc]",
                 facing.label(lang)
             ),
         },
+        WorldSelectMode::MovePreview => {
+            let [ox, oy, oz] = origin.unwrap_or([0, 64, 0]);
+            match lang {
+                UiLang::En => format!(
+                    "Move 3D ({ox},{oy},{oz}) [{}]: [Arrows/IJKL] Move | [PgUp/Dn] Y | [R] Rot | [C] Colls | [H] Frame | [Click] Snap | [Enter] Build | [Esc]",
+                    facing.label(lang)
+                ),
+                UiLang::Ru => format!(
+                    "3D ({ox},{oy},{oz}) [{}]: [Стрелки/IJKL] Сдвиг | [PgUp/Dn] Y | [R] Вращ | [C] Колл | [H] Рамка | [Клик] Точка | [Enter] Строить | [Esc]",
+                    facing.label(lang)
+                ),
+            }
+        }
     };
     let tw = event.draw.text_width(&msg) + 16.0;
     let bx = ((sw - tw) * 0.5).floor();
@@ -4195,7 +4520,7 @@ fn effective_preview_box(
             let max = [min[0] + i32::from(w), min[1] + i32::from(h), min[2] + i32::from(d)];
             (min, max, w, d, h)
         }),
-        WorldSelectMode::Inactive => origin.map(|o| {
+        WorldSelectMode::Inactive | WorldSelectMode::MovePreview => origin.map(|o| {
             (o, [o[0] + i32::from(w), o[1] + i32::from(h), o[2] + i32::from(d)], w, d, h)
         }),
     }
@@ -4298,6 +4623,8 @@ fn sync_client_terrain_for_preview(
 }
 
 fn ensure_preview_data(
+    host: Option<&dyn ClientHost>,
+    bmin: Option<[i32; 3]>,
     st: &mut ClientUiState,
     eff_w: u16,
     eff_d: u16,
@@ -4305,12 +4632,197 @@ fn ensure_preview_data(
     max_quads: usize,
     max_lines: usize,
 ) -> (Vec<crate::gen_preview::PreviewQuad>, Vec<crate::gen_preview::PreviewLine>, Option<i32>) {
-    ensure_preview_cached(st, eff_w, eff_d, eff_h);
+    ensure_preview_cached_with_host(host, bmin, st, eff_w, eff_d, eff_h);
     let (qs, ls) = st.preview_mesh.fit_budget(max_quads, max_lines);
     (qs.to_vec(), ls.to_vec(), st.preview_slice_y)
 }
 
 fn ensure_preview_cached(st: &mut ClientUiState, eff_w: u16, eff_d: u16, eff_h: u16) {
+    ensure_preview_cached_with_host(None, None, st, eff_w, eff_d, eff_h);
+}
+
+fn blueprint_block_hash(bp: &crate::generator::GeneratedBlueprint) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for (&[x, y, z], planned) in &bp.blocks {
+        for v in [x, y, z] {
+            for b in v.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+        }
+        for b in planned.block_id.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    h
+}
+
+fn sample_world_collision_mask(
+    host: &dyn ClientHost,
+    st: &mut ClientUiState,
+    orig: [i32; 3],
+    eff_w: u16,
+    eff_d: u16,
+    eff_h: u16,
+) {
+    if !st.air_only && !st.show_collisions {
+        return;
+    }
+    let Some(bp) = st.cached_bp.as_ref() else {
+        return;
+    };
+    if !st.air_only && bp.blocks.len() > 45_000 {
+        st.cached_world_mask = None;
+        st.cached_world_mask_fp = 0;
+        st.world_mask_key = None;
+        return;
+    }
+    let wm_key = (
+        st.dimension.clone(),
+        orig[0],
+        orig[1],
+        orig[2],
+        eff_w,
+        eff_d,
+        eff_h,
+        st.cached_bp_fp,
+        st.air_only,
+        st.show_collisions,
+    );
+    if st.world_mask_key.as_ref() == Some(&wm_key) {
+        return;
+    }
+    let now = host.millis();
+    if st.world_mask_key.is_some()
+        && matches!(st.world_select, WorldSelectMode::PickingCorner1 | WorldSelectMode::PickingCorner2 { .. })
+        && now.saturating_sub(st.last_world_mask_ms) < 80
+    {
+        return;
+    }
+    let Some(level) = host.level(&st.dimension) else {
+        return;
+    };
+
+    let collect_keys = |names: &[&str]| -> Vec<mod_api::BlockKey> {
+        names.iter().filter_map(|n| host.block_key(n)).collect()
+    };
+    let air_keys = collect_keys(&["minecraft:air", "minecraft:cave_air", "minecraft:void_air"]);
+    let soft_keys = collect_keys(&[
+        "minecraft:water",
+        "minecraft:lava",
+        "minecraft:short_grass",
+        "minecraft:tall_grass",
+        "minecraft:fern",
+        "minecraft:large_fern",
+        "minecraft:dead_bush",
+        "minecraft:vine",
+        "minecraft:snow",
+        "minecraft:seagrass",
+        "minecraft:tall_seagrass",
+        "minecraft:kelp",
+        "minecraft:kelp_plant",
+        "minecraft:pink_petals",
+        "minecraft:wildflowers",
+        "minecraft:leaf_litter",
+        "minecraft:sugar_cane",
+        "minecraft:dandelion",
+        "minecraft:poppy",
+        "minecraft:azure_bluet",
+        "minecraft:oxeye_daisy",
+        "minecraft:cornflower",
+    ]);
+    let natural_ground = collect_keys(&[
+        "minecraft:grass_block",
+        "minecraft:dirt",
+        "minecraft:coarse_dirt",
+        "minecraft:podzol",
+        "minecraft:rooted_dirt",
+        "minecraft:sand",
+        "minecraft:red_sand",
+        "minecraft:gravel",
+        "minecraft:clay",
+        "minecraft:stone",
+        "minecraft:deepslate",
+        "minecraft:netherrack",
+        "minecraft:end_stone",
+        "minecraft:mud",
+        "minecraft:snow_block",
+        "minecraft:mycelium",
+        "minecraft:terracotta",
+        "minecraft:red_sandstone",
+        "minecraft:sandstone",
+        "minecraft:basalt",
+        "minecraft:blackstone",
+        "minecraft:soul_sand",
+        "minecraft:soul_soil",
+        "minecraft:tuff",
+        "minecraft:andesite",
+        "minecraft:diorite",
+        "minecraft:granite",
+    ]);
+
+    let min_y = bp.blocks.keys().map(|k| k[1]).min().unwrap_or(0).clamp(-24, 0);
+    let max_y = bp
+        .blocks
+        .keys()
+        .map(|k| k[1])
+        .max()
+        .unwrap_or(i32::from(bp.height).saturating_sub(1))
+        .max(i32::from(bp.height).saturating_sub(1));
+    let mask_h = (max_y - min_y + 1).clamp(1, 96);
+    let mut mask = crate::gen_preview::PreviewWorldMask::new(
+        i32::from(bp.width),
+        min_y,
+        mask_h,
+        i32::from(bp.depth),
+    );
+    let mut wm_hash = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(st.air_only) ^ (u64::from(st.show_collisions) << 1);
+
+    for (&[lx, ly, lz], planned) in &bp.blocks {
+        if matches!(
+            planned.block_id.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        ) {
+            continue;
+        }
+        let wpos = [orig[0] + lx, orig[1] + ly, orig[2] + lz];
+        let Some(bk) = level.block(host, wpos) else {
+            continue;
+        };
+        let is_air = air_keys.contains(&bk);
+        let blocked = if st.air_only {
+            !is_air
+        } else {
+            let is_soft = is_air || soft_keys.contains(&bk);
+            let natural_sub = ly <= 0 && natural_ground.contains(&bk);
+            !is_soft && !natural_sub
+        };
+        if blocked {
+            mask.set_blocked(lx, ly, lz, true);
+            for v in [lx, ly, lz] {
+                for b in v.to_le_bytes() {
+                    wm_hash ^= u64::from(b);
+                    wm_hash = wm_hash.wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+        }
+    }
+
+    st.cached_world_mask = Some(mask);
+    st.cached_world_mask_fp = wm_hash;
+    st.world_mask_key = Some(wm_key);
+    st.last_world_mask_ms = now;
+}
+
+fn ensure_preview_cached_with_host(
+    host: Option<&dyn ClientHost>,
+    bmin: Option<[i32; 3]>,
+    st: &mut ClientUiState,
+    eff_w: u16,
+    eff_d: u16,
+    eff_h: u16,
+) {
     let eff_desc = effective_description(st);
     let biome_key = if st.use_biome_auto {
         st.detected_biome.clone()
@@ -4318,7 +4830,7 @@ fn ensure_preview_cached(st: &mut ClientUiState, eff_w: u16, eff_d: u16, eff_h: 
         String::new()
     };
     let toggles_raw = st.toggles.map(|t| t as u8);
-    let key = PreviewKey {
+    let bp_key = BpCacheKey {
         width: eff_w,
         depth: eff_d,
         height: eff_h,
@@ -4332,56 +4844,92 @@ fn ensure_preview_cached(st: &mut ClientUiState, eff_w: u16, eff_d: u16, eff_h: 
         toggles_raw,
         adapt_terrain: st.adapt_terrain,
         terrain_fp: if st.adapt_terrain { st.cached_terrain_fp } else { 0 },
-        preview_slice_y: st.preview_slice_y,
         palette_fp: palette_fingerprint(&st.palette),
         wear_pct: st.wear_pct,
         overgrowth_pct: st.overgrowth_pct,
         biome_hint: biome_key.clone(),
     };
+    if st.bp_cache_key.as_ref() != Some(&bp_key) || st.cached_bp.is_none() {
+        let req = BuildRequest {
+            dimension: st.dimension.clone(),
+            origin_x: 0,
+            origin_y: 0,
+            origin_z: 0,
+            width: eff_w,
+            depth: eff_d,
+            height: eff_h,
+            category: st.category,
+            style: st.style,
+            facing: st.facing,
+            noise_level: st.noise_level,
+            seed: st.seed as i64,
+            description: eff_desc,
+            adapt_terrain: st.adapt_terrain,
+            air_only: false,
+            wear_pct: st.wear_pct,
+            overgrowth_pct: st.overgrowth_pct,
+            biome_hint: biome_key,
+            palette: st.palette.clone(),
+        };
+        let terrain_off = if st.adapt_terrain {
+            st.cached_terrain_offsets.as_deref()
+        } else {
+            None
+        };
+        let water_dep = if st.adapt_terrain {
+            st.cached_water_depths.as_deref()
+        } else {
+            None
+        };
+        let bp = crate::generator::generate_blueprint_with_water(&req, terrain_off, water_dep);
+        let (bom_total, bom_list) = bp.material_breakdown();
+        if st.preview_total_blocks != bom_total || st.preview_bom != bom_list {
+            st.preview_total_blocks = bom_total;
+            st.preview_bom = bom_list;
+            st.dirty = true;
+        }
+        st.cached_bp_fp = blueprint_block_hash(&bp);
+        st.cached_bp = Some(bp);
+        st.bp_cache_key = Some(bp_key);
+        st.world_mask_key = None;
+        st.preview_key = None;
+    }
+
+    if let (Some(h), Some(orig)) = (host, bmin) {
+        sample_world_collision_mask(h, st, orig, eff_w, eff_d, eff_h);
+    }
+
+    let wm_fp = if st.air_only || st.show_collisions {
+        st.cached_world_mask_fp
+    } else {
+        0
+    };
+    let key = PreviewKey {
+        bp_fp: st.cached_bp_fp,
+        preview_slice_y: st.preview_slice_y,
+        air_only: st.air_only,
+        show_collisions: st.show_collisions,
+        world_mask_fp: wm_fp,
+    };
     if st.preview_key.as_ref() == Some(&key) {
         return;
     }
 
-    let req = BuildRequest {
-        dimension: st.dimension.clone(),
-        origin_x: 0,
-        origin_y: 0,
-        origin_z: 0,
-        width: eff_w,
-        depth: eff_d,
-        height: eff_h,
-        category: st.category,
-        style: st.style,
-        facing: st.facing,
-        noise_level: st.noise_level,
-        seed: st.seed as i64,
-        description: eff_desc,
-        adapt_terrain: st.adapt_terrain,
-        air_only: false,
-        wear_pct: st.wear_pct,
-        overgrowth_pct: st.overgrowth_pct,
-        biome_hint: biome_key,
-        palette: st.palette.clone(),
-    };
-    let terrain_off = if st.adapt_terrain {
-        st.cached_terrain_offsets.as_deref()
-    } else {
-        None
-    };
-    let water_dep = if st.adapt_terrain {
-        st.cached_water_depths.as_deref()
-    } else {
-        None
-    };
-    let bp = crate::generator::generate_blueprint_with_water(&req, terrain_off, water_dep);
-    let (bom_total, bom_list) = bp.material_breakdown();
-    if st.preview_total_blocks != bom_total || st.preview_bom != bom_list {
-        st.preview_total_blocks = bom_total;
-        st.preview_bom = bom_list;
-        st.dirty = true;
+    if let Some(bp) = st.cached_bp.as_ref() {
+        let clip_max_y = st.preview_slice_y.map(|sy| sy.clamp(0, i32::from(bp.height)));
+        let wm_ref = if st.air_only || st.show_collisions {
+            st.cached_world_mask.as_ref()
+        } else {
+            None
+        };
+        st.preview_mesh = crate::gen_preview::build_hologram_mesh_with_world(
+            bp,
+            clip_max_y,
+            wm_ref,
+            st.air_only,
+            st.show_collisions,
+        );
     }
-    let clip_max_y = st.preview_slice_y.map(|sy| sy.clamp(0, i32::from(bp.height)));
-    st.preview_mesh = crate::gen_preview::build_hologram_mesh(&bp, clip_max_y);
     st.preview_key = Some(key);
 }
 
@@ -4399,11 +4947,12 @@ pub fn on_submit_custom_geometry(
             st.height,
             st.facing,
             st.show_preview_box,
+            st.show_frame_box,
         )
     });
 
-    let (mode, aimed, origin, w, d, h, facing, show_box) = snapshot;
-    if mode == WorldSelectMode::Inactive && (!show_box || origin.is_none()) {
+    let (mode, aimed, origin, w, d, h, facing, show_preview, show_frame) = snapshot;
+    if mode == WorldSelectMode::Inactive && ((!show_preview && !show_frame) || origin.is_none()) {
         return;
     }
 
@@ -4425,81 +4974,90 @@ pub fn on_submit_custom_geometry(
     let fmin = [bmin[0] as f64, bmin[1] as f64, bmin[2] as f64];
     let fmax = [bmax[0] as f64, bmax[1] as f64, bmax[2] as f64];
 
-    // Gentle living pulse on outer hologram frame so users clearly see live preview bounds.
-    let phase = ((host.millis() / 45) % 40) as i32;
-    let pulse = if phase <= 20 { phase } else { 40 - phase }; // 0..=20
-    let frame_col = if pulse > 10 { 0xE860_D5FF } else { 0xD038_BDF8 };
-    push_box_lines(&mut lines, fmin, fmax, frame_col, 2.2);
+    let draw_frame = show_frame || matches!(mode, WorldSelectMode::PickingCorner1 | WorldSelectMode::PickingCorner2 { .. });
+    let draw_mesh = show_preview || mode != WorldSelectMode::Inactive;
 
-    // Subtle translucent ground footprint highlight.
-    quads.push(WorldQuad::new(
-        [
-            [fmin[0], fmin[1] + 0.02, fmin[2]],
-            [fmin[0], fmin[1] + 0.02, fmax[2]],
-            [fmax[0], fmin[1] + 0.02, fmax[2]],
-            [fmax[0], fmin[1] + 0.02, fmin[2]],
-        ],
-        0x1C38_BDF8,
-        WorldDepth::Tested,
-    ));
+    if draw_frame {
+        // Gentle living pulse on outer hologram frame so users clearly see live preview bounds.
+        let phase = ((host.millis() / 45) % 40) as i32;
+        let pulse = if phase <= 20 { phase } else { 40 - phase }; // 0..=20
+        let frame_col = if pulse > 10 { 0xE860_D5FF } else { 0xD038_BDF8 };
+        push_box_lines(&mut lines, fmin, fmax, frame_col, 2.2);
 
-    let (preview_q, preview_l, slice_y) = with_state(|st| {
-        ensure_preview_data(st, eff_w, eff_d, eff_h, avail_quads, avail_lines)
-    });
-
-    for pq in preview_q {
+        // Subtle translucent ground footprint highlight.
         quads.push(WorldQuad::new(
             [
-                [fmin[0] + pq.corners[0][0], fmin[1] + pq.corners[0][1], fmin[2] + pq.corners[0][2]],
-                [fmin[0] + pq.corners[1][0], fmin[1] + pq.corners[1][1], fmin[2] + pq.corners[1][2]],
-                [fmin[0] + pq.corners[2][0], fmin[1] + pq.corners[2][1], fmin[2] + pq.corners[2][2]],
-                [fmin[0] + pq.corners[3][0], fmin[1] + pq.corners[3][1], fmin[2] + pq.corners[3][2]],
+                [fmin[0], fmin[1] + 0.02, fmin[2]],
+                [fmin[0], fmin[1] + 0.02, fmax[2]],
+                [fmax[0], fmin[1] + 0.02, fmax[2]],
+                [fmax[0], fmin[1] + 0.02, fmin[2]],
             ],
-            pq.color,
+            0x1C38_BDF8,
             WorldDepth::Tested,
         ));
     }
 
-    for pl in preview_l {
-        lines.push(WorldLine::new(
-            [fmin[0] + pl.a[0], fmin[1] + pl.a[1], fmin[2] + pl.a[2]],
-            [fmin[0] + pl.b[0], fmin[1] + pl.b[1], fmin[2] + pl.b[2]],
-            pl.color,
-            pl.width,
-            WorldDepth::Tested,
-        ));
-    }
+    if draw_mesh {
+        let (preview_q, preview_l, slice_y) = with_state(|st| {
+            ensure_preview_data(Some(host), Some(bmin), st, eff_w, eff_d, eff_h, avail_quads, avail_lines)
+        });
 
-    if let Some(sy) = slice_y {
-        let cut_y = fmin[1] + f64::from(sy.clamp(0, i32::from(eff_h)) + 1) + 0.03;
-        let scol = crate::gen_preview::SLICE_CAP_ARGB | 0xFF00_0000;
-        for (p0, p1) in [
-            ([fmin[0], cut_y, fmin[2]], [fmax[0], cut_y, fmin[2]]),
-            ([fmax[0], cut_y, fmin[2]], [fmax[0], cut_y, fmax[2]]),
-            ([fmax[0], cut_y, fmax[2]], [fmin[0], cut_y, fmax[2]]),
-            ([fmin[0], cut_y, fmax[2]], [fmin[0], cut_y, fmin[2]]),
-        ] {
-            lines.push(WorldLine::new(p0, p1, scol, 2.2, WorldDepth::Tested));
+        for pq in preview_q {
+            quads.push(WorldQuad::new(
+                [
+                    [fmin[0] + pq.corners[0][0], fmin[1] + pq.corners[0][1], fmin[2] + pq.corners[0][2]],
+                    [fmin[0] + pq.corners[1][0], fmin[1] + pq.corners[1][1], fmin[2] + pq.corners[1][2]],
+                    [fmin[0] + pq.corners[2][0], fmin[1] + pq.corners[2][1], fmin[2] + pq.corners[2][2]],
+                    [fmin[0] + pq.corners[3][0], fmin[1] + pq.corners[3][1], fmin[2] + pq.corners[3][2]],
+                ],
+                pq.color,
+                WorldDepth::Tested,
+            ));
+        }
+
+        for pl in preview_l {
+            lines.push(WorldLine::new(
+                [fmin[0] + pl.a[0], fmin[1] + pl.a[1], fmin[2] + pl.a[2]],
+                [fmin[0] + pl.b[0], fmin[1] + pl.b[1], fmin[2] + pl.b[2]],
+                pl.color,
+                pl.width,
+                WorldDepth::Tested,
+            ));
+        }
+
+        if let Some(sy) = slice_y {
+            let cut_y = fmin[1] + f64::from(sy.clamp(0, i32::from(eff_h)) + 1) + 0.03;
+            let scol = crate::gen_preview::SLICE_CAP_ARGB | 0xFF00_0000;
+            for (p0, p1) in [
+                ([fmin[0], cut_y, fmin[2]], [fmax[0], cut_y, fmin[2]]),
+                ([fmax[0], cut_y, fmin[2]], [fmax[0], cut_y, fmax[2]]),
+                ([fmax[0], cut_y, fmax[2]], [fmin[0], cut_y, fmax[2]]),
+                ([fmin[0], cut_y, fmax[2]], [fmin[0], cut_y, fmin[2]]),
+            ] {
+                lines.push(WorldLine::new(p0, p1, scol, 2.2, WorldDepth::Tested));
+            }
         }
     }
 
-    // Golden directional arrow on front entrance side!
-    let cx = (fmin[0] + fmax[0]) * 0.5;
-    let cz = (fmin[2] + fmax[2]) * 0.5;
-    let y = fmin[1] + 0.14;
-    let (ax, az, dx, dz) = match facing {
-        CardinalFacing::North => (cx, fmin[2], 0.0, -2.0),
-        CardinalFacing::South => (cx, fmax[2], 0.0, 2.0),
-        CardinalFacing::East => (fmax[0], cz, 2.0, 0.0),
-        CardinalFacing::West => (fmin[0], cz, -2.0, 0.0),
-    };
-    lines.push(WorldLine::new(
-        [ax, y, az],
-        [ax + dx, y, az + dz],
-        0xFFFBBF24,
-        3.5,
-        WorldDepth::ThroughWalls,
-    ));
+    if draw_frame {
+        // Golden directional arrow on front entrance side!
+        let cx = (fmin[0] + fmax[0]) * 0.5;
+        let cz = (fmin[2] + fmax[2]) * 0.5;
+        let y = fmin[1] + 0.14;
+        let (ax, az, dx, dz) = match facing {
+            CardinalFacing::North => (cx, fmin[2], 0.0, -2.0),
+            CardinalFacing::South => (cx, fmax[2], 0.0, 2.0),
+            CardinalFacing::East => (fmax[0], cz, 2.0, 0.0),
+            CardinalFacing::West => (fmin[0], cz, -2.0, 0.0),
+        };
+        lines.push(WorldLine::new(
+            [ax, y, az],
+            [ax + dx, y, az + dz],
+            0xFFFBBF24,
+            3.5,
+            WorldDepth::ThroughWalls,
+        ));
+    }
 
     if mode != WorldSelectMode::Inactive
         && let Some(p) = aimed
