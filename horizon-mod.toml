@@ -1,7 +1,7 @@
 id = "building_generator"
 name = "Building Generator"
-version = "0.3.0"
-description = "Bilingual (EN/RU) noise-driven procedural architectural generator with 61 structure themes, 72 catalog presets, 30-slot custom material lists, 3D hologram preview, material estimate, air-only mode, undo/redo, and OP security."
+version = "0.4.0"
+description = "Bilingual (EN/RU) procedural architecture generator: Settlement 2.0 walled cities & river bridges, Biome Auto-Style, 0-100% Wear/Ruin & Overgrowth, 61 themes, 72 presets, 3D hologram, BOM, air-only, undo/redo, and OP security."
 authors = ["Building Generator Contributors"]
 license = "MIT"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.

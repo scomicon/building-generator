@@ -87,6 +87,8 @@ fn current_saved_preset(st: &ClientUiState, name: String) -> SavedPreset {
         noise_level: st.noise_level,
         adapt_terrain: st.adapt_terrain,
         air_only: st.air_only,
+        wear_pct: st.wear_pct,
+        overgrowth_pct: st.overgrowth_pct,
         description: st.description.clone(),
         seed: st.seed,
         palette_manual: st.palette_manual,
@@ -107,6 +109,8 @@ fn apply_saved_preset(st: &mut ClientUiState, preset: SavedPreset) {
     st.noise_level = preset.noise_level;
     st.adapt_terrain = preset.adapt_terrain;
     st.air_only = preset.air_only;
+    st.wear_pct = preset.wear_pct.min(100);
+    st.overgrowth_pct = preset.overgrowth_pct.min(100);
     st.description = preset.description;
     st.seed = preset.seed;
     st.seed_text = preset.seed.to_string();
@@ -289,6 +293,13 @@ struct WidgetHandles {
     archetype_btn: Option<WidgetId>,
     archetype_next_btn: Option<WidgetId>,
     noise_btn: Option<WidgetId>,
+    biome_btn: Option<WidgetId>,
+    wear_dec_btn: Option<WidgetId>,
+    wear_btn: Option<WidgetId>,
+    wear_inc_btn: Option<WidgetId>,
+    over_dec_btn: Option<WidgetId>,
+    over_btn: Option<WidgetId>,
+    over_inc_btn: Option<WidgetId>,
     tag_buttons: Vec<(WidgetId, &'static str)>,
     feature_toggles: Vec<(WidgetId, usize)>,
 
@@ -362,20 +373,24 @@ struct BuiltScreen {
     bom_rows: Vec<(String, usize, [f32; 4])>,
 }
 
-type PreviewKey = (
-    u16,
-    u16,
-    u16,
-    BuildCategory,
-    BuildStyle,
-    CardinalFacing,
-    NoiseLevel,
-    String,
-    u64,
-    u8,
-    Option<i32>,
-    u64,
-);
+#[derive(Clone, PartialEq, Eq)]
+struct PreviewKey {
+    width: u16,
+    depth: u16,
+    height: u16,
+    category: BuildCategory,
+    style: BuildStyle,
+    facing: CardinalFacing,
+    noise_level: NoiseLevel,
+    eff_desc: String,
+    seed: u64,
+    roof_raw: u8,
+    preview_slice_y: Option<i32>,
+    palette_fp: u64,
+    wear_pct: u8,
+    overgrowth_pct: u8,
+    biome_hint: String,
+}
 
 struct ClientUiState {
     lang: UiLang,
@@ -391,6 +406,11 @@ struct ClientUiState {
     facing: CardinalFacing,
     adapt_terrain: bool,
     air_only: bool,
+    wear_pct: u8,
+    overgrowth_pct: u8,
+    use_biome_auto: bool,
+    detected_biome: String,
+    last_biome_query: Option<(String, i32, i32, i32)>,
     show_preview_box: bool,
     preview_slice_y: Option<i32>,
     category: BuildCategory,
@@ -462,6 +482,11 @@ impl Default for ClientUiState {
             facing: CardinalFacing::South,
             adapt_terrain: true,
             air_only: false,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            use_biome_auto: true,
+            detected_biome: String::new(),
+            last_biome_query: None,
             show_preview_box: true,
             preview_slice_y: None,
             category: BuildCategory::House,
@@ -679,6 +704,20 @@ pub fn on_server_response(resp: BuildResponse) {
     });
 }
 
+pub fn on_biome_response(resp: crate::model::BiomeQueryResponse) {
+    with_state(|st| {
+        let next = resp.biome.trim().to_owned();
+        if st.detected_biome != next {
+            st.detected_biome = next;
+            if st.use_biome_auto && !st.palette_manual {
+                sync_palette_from_ui(st);
+            }
+            st.preview_key = None;
+            st.dirty = true;
+        }
+    });
+}
+
 fn short_block_name(id: &str) -> &str {
     id.strip_prefix("minecraft:").unwrap_or(id)
 }
@@ -874,10 +913,16 @@ use crate::server_builder::{CLI_PRESETS, CLI_PRESET_DESCS_EN, cli_preset_desc};
 
 fn sync_palette_from_ui(st: &mut ClientUiState) {
     if !st.palette_manual {
-        st.palette = crate::parser::infer_palette_with_style_and_seed(
+        let biome = if st.use_biome_auto {
+            st.detected_biome.as_str()
+        } else {
+            ""
+        };
+        st.palette = crate::parser::infer_palette_with_biome(
             st.style,
             &effective_description(st),
             st.seed,
+            biome,
         );
     }
 }
@@ -1071,6 +1116,13 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let mut archetype_btn = None;
     let mut archetype_next_btn = None;
     let mut noise_btn = None;
+    let mut biome_btn = None;
+    let mut wear_dec_btn = None;
+    let mut wear_btn = None;
+    let mut wear_inc_btn = None;
+    let mut over_dec_btn = None;
+    let mut over_btn = None;
+    let mut over_inc_btn = None;
     let mut tag_buttons = Vec::new();
     let mut feature_toggles = Vec::new();
 
@@ -1656,6 +1708,49 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                 ));
                 feature_toggles.push((id, idx));
             }
+
+            // Row: [Biome Auto] + [-][Wear %][+] + [-][Moss %][+]
+            let row_y = body_y + 136.0;
+            let gap3 = 4.0;
+            let bw = (inner_w * 0.34).floor();
+            let ww = ((inner_w - bw - gap3 * 2.0) * 0.5).floor();
+            let ow = inner_w - bw - ww - gap3 * 2.0;
+
+            let biome_txt = if !st.use_biome_auto {
+                tr(lang, "Biome: OFF", "Биом: ВЫКЛ").to_owned()
+            } else {
+                let bname = crate::parser::biome_short_label(&st.detected_biome, lang);
+                match lang {
+                    UiLang::En => format!("Biome: {bname} ✓"),
+                    UiLang::Ru => format!("Биом: {bname} ✓"),
+                }
+            };
+            biome_btn = Some(w.add_button(Button::new([px + pad, row_y, bw, 17.0], Text::literal(biome_txt))));
+
+            let step_w = 15.0;
+            let wx = px + pad + bw + gap3;
+            wear_dec_btn = Some(w.add_button(Button::new([wx, row_y, step_w, 17.0], Text::literal("-"))));
+            let wear_lbl = match lang {
+                UiLang::En => format!("Wear: {}%", st.wear_pct),
+                UiLang::Ru => format!("Износ: {}%", st.wear_pct),
+            };
+            wear_btn = Some(w.add_button(Button::new(
+                [wx + step_w + 1.0, row_y, (ww - step_w * 2.0 - 2.0).max(40.0), 17.0],
+                Text::literal(wear_lbl),
+            )));
+            wear_inc_btn = Some(w.add_button(Button::new([wx + ww - step_w, row_y, step_w, 17.0], Text::literal("+"))));
+
+            let ox = wx + ww + gap3;
+            over_dec_btn = Some(w.add_button(Button::new([ox, row_y, step_w, 17.0], Text::literal("-"))));
+            let over_lbl = match lang {
+                UiLang::En => format!("Moss: {}%", st.overgrowth_pct),
+                UiLang::Ru => format!("Зелень: {}%", st.overgrowth_pct),
+            };
+            over_btn = Some(w.add_button(Button::new(
+                [ox + step_w + 1.0, row_y, (ow - step_w * 2.0 - 2.0).max(40.0), 17.0],
+                Text::literal(over_lbl),
+            )));
+            over_inc_btn = Some(w.add_button(Button::new([ox + ow - step_w, row_y, step_w, 17.0], Text::literal("+"))));
         }
         UiTab::Materials => {
             let lx = px + pad;
@@ -1927,6 +2022,13 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             archetype_btn,
             archetype_next_btn,
             noise_btn,
+            biome_btn,
+            wear_dec_btn,
+            wear_btn,
+            wear_inc_btn,
+            over_dec_btn,
+            over_btn,
+            over_inc_btn,
             tag_buttons,
             feature_toggles,
             preset_back_btn,
@@ -2479,6 +2581,48 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                 } else if Some(id) == h.noise_btn {
                     st.noise_level = st.noise_level.next();
                     st.dirty = true;
+                } else if Some(id) == h.biome_btn {
+                    st.use_biome_auto = !st.use_biome_auto;
+                    st.last_biome_query = None;
+                    sync_palette_from_ui(st);
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.wear_dec_btn {
+                    st.wear_pct = st.wear_pct.saturating_sub(15);
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.wear_inc_btn {
+                    st.wear_pct = (st.wear_pct + 15).min(100);
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.wear_btn {
+                    st.wear_pct = match st.wear_pct {
+                        0..=24 => 25,
+                        25..=49 => 50,
+                        50..=74 => 75,
+                        75..=99 => 100,
+                        _ => 0,
+                    };
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.over_dec_btn {
+                    st.overgrowth_pct = st.overgrowth_pct.saturating_sub(15);
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.over_inc_btn {
+                    st.overgrowth_pct = (st.overgrowth_pct + 15).min(100);
+                    st.preview_key = None;
+                    st.dirty = true;
+                } else if Some(id) == h.over_btn {
+                    st.overgrowth_pct = match st.overgrowth_pct {
+                        0..=24 => 25,
+                        25..=49 => 50,
+                        50..=74 => 75,
+                        75..=99 => 100,
+                        _ => 0,
+                    };
+                    st.preview_key = None;
+                    st.dirty = true;
                 } else if Some(id) == h.prev_seed_btn {
                     if let Some(prev) = st.seed_history.pop() {
                         st.seed = prev;
@@ -2818,6 +2962,13 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                         description: effective_description(st),
                         adapt_terrain: st.adapt_terrain,
                         air_only: st.air_only,
+                        wear_pct: st.wear_pct,
+                        overgrowth_pct: st.overgrowth_pct,
+                        biome_hint: if st.use_biome_auto {
+                            st.detected_biome.clone()
+                        } else {
+                            String::new()
+                        },
                         palette: st.palette.clone(),
                     };
                     st.status = match st.lang {
@@ -3116,6 +3267,45 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
                     }
                 });
             }
+        }
+
+        let biome_query = if host.mod_screen() == Some(SCREEN_ID) {
+            with_state(|st| {
+                if !st.use_biome_auto {
+                    return None;
+                }
+                let (dim, qx, qy, qz, sx, sy, sz) = if let Some(o) = st.origin {
+                    let cx = o[0] + i32::from(st.width / 2);
+                    let cz = o[2] + i32::from(st.depth / 2);
+                    (st.dimension.clone(), cx >> 4, o[1] >> 4, cz >> 4, cx, o[1], cz)
+                } else if let Some(cam) = host.camera() {
+                    let cx = cam.position[0].floor() as i32;
+                    let cy = cam.position[1].floor() as i32;
+                    let cz = cam.position[2].floor() as i32;
+                    (cam.dimension.clone(), cx >> 4, cy >> 4, cz >> 4, cx, cy, cz)
+                } else {
+                    return None;
+                };
+                let key = (dim.clone(), qx, qy, qz);
+                if st.last_biome_query.as_ref() == Some(&key) {
+                    None
+                } else {
+                    st.last_biome_query = Some(key);
+                    Some(crate::model::BiomeQueryRequest {
+                        dimension: dim,
+                        x: sx,
+                        y: sy,
+                        z: sz,
+                    })
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(bq) = biome_query
+            && let Some(ch) = channels()
+        {
+            let _ = ch.to_server_biome.send(host, &bq);
         }
     }
 
@@ -3591,8 +3781,14 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
             } else {
                 ""
             };
+            let aging_tag = match (st.wear_pct, st.overgrowth_pct) {
+                (0, 0) => String::new(),
+                (w, 0) => format!(" | {}:{w}%", tr(lang, "W", "И")),
+                (0, m) => format!(" | {}:{m}%", tr(lang, "M", "З")),
+                (w, m) => format!(" | {}:{w}% {}:{m}%", tr(lang, "W", "И"), tr(lang, "M", "З")),
+            };
             let summary = format!(
-                "{} ({}) {}x{}x{} | {} {} ({}) | {} [{}]{air_tag}",
+                "{} ({}) {}x{}x{} | {} {} ({}) | {} [{}]{air_tag}{aging_tag}",
                 st.category.label(lang),
                 st.style.label(lang),
                 st.width,
@@ -3958,20 +4154,28 @@ fn ensure_preview_data(st: &mut ClientUiState) -> (Vec<([f64; 3], [f64; 3], u32)
 
 fn ensure_preview_cached(st: &mut ClientUiState) {
     let eff_desc = effective_description(st);
-    let key: PreviewKey = (
-        st.width,
-        st.depth,
-        st.height,
-        st.category,
-        st.style,
-        st.facing,
-        st.noise_level,
-        eff_desc.clone(),
-        st.seed,
-        st.roof_choice as u8,
-        st.preview_slice_y,
-        palette_fingerprint(&st.palette),
-    );
+    let biome_key = if st.use_biome_auto {
+        st.detected_biome.clone()
+    } else {
+        String::new()
+    };
+    let key = PreviewKey {
+        width: st.width,
+        depth: st.depth,
+        height: st.height,
+        category: st.category,
+        style: st.style,
+        facing: st.facing,
+        noise_level: st.noise_level,
+        eff_desc: eff_desc.clone(),
+        seed: st.seed,
+        roof_raw: st.roof_choice as u8,
+        preview_slice_y: st.preview_slice_y,
+        palette_fp: palette_fingerprint(&st.palette),
+        wear_pct: st.wear_pct,
+        overgrowth_pct: st.overgrowth_pct,
+        biome_hint: biome_key,
+    };
     if st.preview_key.as_ref() == Some(&key) {
         return;
     }
@@ -3992,6 +4196,13 @@ fn ensure_preview_cached(st: &mut ClientUiState) {
         description: eff_desc,
         adapt_terrain: false,
         air_only: false,
+        wear_pct: st.wear_pct,
+        overgrowth_pct: st.overgrowth_pct,
+        biome_hint: if st.use_biome_auto {
+            st.detected_biome.clone()
+        } else {
+            String::new()
+        },
         palette: st.palette.clone(),
     };
     let bp = crate::generator::generate_blueprint(&req, None);

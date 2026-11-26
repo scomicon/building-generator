@@ -1,4 +1,4 @@
-use crate::model::{BuildCategory, BuildStyle, MaterialPalette, NoiseLevel, RoofStyle};
+use crate::model::{BuildCategory, BuildStyle, MaterialPalette, NoiseLevel, RoofStyle, UiLang};
 use crate::noise::SplitMix64;
 
 /// High-level functional theme modulating specialized roofs, facades, and architectural landmarks.
@@ -134,6 +134,7 @@ pub struct BlueprintSpec {
     pub on_stilts: bool,
     pub ground_wall: Option<String>,
     pub upper_wall: Option<String>,
+    pub biome_tag: String,
 }
 
 fn parse_material_from_clause(clause: &str) -> Option<String> {
@@ -513,38 +514,171 @@ pub fn infer_bridge_variant(
     }
 }
 
-/// Resolves an explicit or text-inferred architectural style; falls back to seed when Auto.
-pub fn infer_style_from_text(requested: BuildStyle, description: &str, seed: u64) -> BuildStyle {
+/// Normalizes a Minecraft biome identifier (lowercased, stripping optional `minecraft:` prefix).
+pub fn normalize_biome_id(biome: &str) -> String {
+    let trimmed = biome.trim().to_ascii_lowercase();
+    trimmed
+        .strip_prefix("minecraft:")
+        .unwrap_or(&trimmed)
+        .to_owned()
+}
+
+/// Returns a concise bilingual label for display in UI badges and build feedback.
+pub fn biome_short_label(biome: &str, lang: UiLang) -> String {
+    let id = normalize_biome_id(biome);
+    if id.is_empty() {
+        return match lang {
+            UiLang::En => "Auto".into(),
+            UiLang::Ru => "Авто".into(),
+        };
+    }
+    let known = match id.as_str() {
+        "plains" | "sunflower_plains" => Some(("Plains", "Равнины")),
+        "meadow" => Some(("Meadow", "Луг")),
+        "forest" | "flower_forest" => Some(("Forest", "Лес")),
+        "birch_forest" | "old_growth_birch_forest" => Some(("Birch", "Берёза")),
+        "dark_forest" => Some(("Dark Wood", "Тёмн.лес")),
+        "pale_garden" => Some(("Pale", "Бледн.сад")),
+        "cherry_grove" => Some(("Cherry", "Сакура")),
+        "taiga" | "old_growth_pine_taiga" | "old_growth_spruce_taiga" => Some(("Taiga", "Тайга")),
+        "snowy_taiga" | "snowy_plains" | "ice_spikes" | "grove" | "snowy_slopes" | "frozen_peaks" | "jagged_peaks" => Some(("Snowy", "Снег/Лёд")),
+        "desert" => Some(("Desert", "Пустыня")),
+        "badlands" | "eroded_badlands" | "wooded_badlands" => Some(("Badlands", "Пустоши")),
+        "savanna" | "savanna_plateau" | "windswept_savanna" => Some(("Savanna", "Саванна")),
+        "jungle" | "sparse_jungle" => Some(("Jungle", "Джунгли")),
+        "bamboo_jungle" => Some(("Bamboo", "Бамбук")),
+        "swamp" => Some(("Swamp", "Болото")),
+        "mangrove_swamp" => Some(("Mangrove", "Мангры")),
+        "mushroom_fields" => Some(("Mushroom", "Грибы")),
+        "ocean" | "deep_ocean" | "cold_ocean" | "deep_cold_ocean" | "lukewarm_ocean" | "deep_lukewarm_ocean" | "warm_ocean" | "frozen_ocean" | "deep_frozen_ocean" | "beach" | "stony_shore" => Some(("Coast", "Побережье")),
+        "river" | "frozen_river" => Some(("River", "Река")),
+        "windswept_hills" | "windswept_gravelly_hills" | "windswept_forest" | "stony_peaks" => Some(("Peaks", "Горы")),
+        "the_nether" | "nether_wastes" | "crimson_forest" | "warped_forest" | "basalt_deltas" | "soul_sand_valley" => Some(("Nether", "Незер")),
+        "the_end" | "end_highlands" | "end_midlands" | "small_end_islands" | "end_barrens" => Some(("The End", "Энд")),
+        _ => None,
+    };
+    if let Some((en, ru)) = known {
+        return match lang {
+            UiLang::En => en.to_owned(),
+            UiLang::Ru => ru.to_owned(),
+        };
+    }
+    let short = id.rsplit(':').next().unwrap_or(&id).replace('_', " ");
+    short.chars().take(12).collect()
+}
+
+/// Maps a biome identifier to a coherent default architectural style.
+pub fn biome_style_suggestion(biome: &str) -> Option<BuildStyle> {
+    let id = normalize_biome_id(biome);
+    if id.is_empty() {
+        return None;
+    }
+    if id.contains("cherry") || id.contains("bamboo") {
+        Some(BuildStyle::Japanese)
+    } else if id.contains("desert") || id.contains("badlands") || id.contains("savanna") {
+        Some(BuildStyle::Desert)
+    } else if id.contains("taiga")
+        || id.contains("snow")
+        || id.contains("ice")
+        || id.contains("frozen")
+        || id.contains("jagged")
+        || id.contains("grove")
+        || id.contains("windswept")
+        || id.contains("stony_peaks")
+    {
+        Some(BuildStyle::Nordic)
+    } else if id.contains("dark_forest")
+        || id.contains("pale_garden")
+        || id.contains("swamp")
+        || id.contains("deep_dark")
+        || id.contains("nether")
+        || id.contains("crimson")
+        || id.contains("warped")
+        || id.contains("basalt")
+        || id.contains("soul_sand")
+    {
+        if id.contains("mangrove") {
+            Some(BuildStyle::Cottage)
+        } else {
+            Some(BuildStyle::Gothic)
+        }
+    } else if id.contains("end") {
+        Some(BuildStyle::Classical)
+    } else if id.contains("ocean") || id.contains("shore") {
+        Some(BuildStyle::Medieval)
+    } else {
+        Some(BuildStyle::Cottage)
+    }
+}
+
+fn explicit_style_keyword(lower: &str) -> Option<BuildStyle> {
+    if contains_any(lower, &["стимпанк", "завод", "фабрик", "паро", "механизм", "часов башн", "часовая башн", "биг-бен", "биг бен", "дирижабл", "вокзал", "steampunk", "industrial", "factory", "airship"]) {
+        return Some(BuildStyle::Steampunk);
+    }
+    if contains_any(lower, &["античн", "римск", "греческ", "колизе", "амфитеатр", "парфенон", "пантеон", "акрополь", "триумф", "обелиск", "терм", "акведук", "ратуш", "музе", "опер", "classical", "roman", "greek", "antique", "colosseum", "coliseum", "amphitheater", "parthenon", "pantheon", "aqueduct"]) {
+        return Some(BuildStyle::Classical);
+    }
+    if contains_any(lower, &["япон", "пагод", "самура", "сакур", "бамбук", "энгава", "тоори", "тории", "онсэн", "тенсю", "тэнсю", "химэдзи", "тайко", "ицукусим", "фусими", "japanese", "pagoda", "oriental", "zen", "onsen", "tenshu", "himeji", "taiko"]) {
+        return Some(BuildStyle::Japanese);
+    }
+    if contains_any(lower, &["готич", "кафедрал", "собор", "вампир", "некро", "мрач", "темн", "тёмн", "сланец", "сланц", "склеп", "мавзоле", "катакомб", "башня мага", "архимаг", "дракон", "gothic", "cathedral", "dark", "crypt", "mausoleum", "mage tower", "wizard tower"]) {
+        return Some(BuildStyle::Gothic);
+    }
+    if contains_any(lower, &["модерн", "современ", "хайтек", "минимал", "бетон", "кварц", "вилла", "обсерватор", "небоскр", "стадион", "бункер", "космодром", "ракет", "буров", "нефтян", "плотин", "modern", "minimal", "villa", "concrete", "observatory", "skyscraper", "stadium", "bunker", "rocket", "oil rig"]) {
+        return Some(BuildStyle::Modern);
+    }
+    if contains_any(lower, &["викин", "сканд", "север", "сруб", "длинн", "шале", "альпийск", "nordic", "viking", "longhouse", "chalet", "alpine"]) {
+        return Some(BuildStyle::Nordic);
+    }
+    if contains_any(lower, &["пустын", "егип", "оазис", "песчан", "араб", "марок", "пирамид", "зиккурат", "базар", "хаммам", "сфинкс", "иштар", "мечет", "минарет", "касб", "риад", "висячие сад", "desert", "arabian", "oasis", "sandstone", "pyramid", "ziggurat", "bazaar", "mosque", "sphinx", "kasbah"]) {
+        return Some(BuildStyle::Desert);
+    }
+    if contains_any(lower, &["средневек", "тюдор", "фахверк", "рыцар", "бейли", "ристалищ", "барбакан", "монастыр", "аббатств", "верф", "корабл", "галеон", "таверн", "дварф", "medieval", "tudor", "monastery", "shipyard", "galleon", "joust"]) {
+        return Some(BuildStyle::Medieval);
+    }
+    if contains_any(lower, &["коттедж", "лесн", "сказоч", "сад", "цвет", "плющ", "хоббит", "гриб", "мухомор", "винодельн", "пекарн", "аптек", "cottage", "rustic", "garden", "hobbit", "mushroom", "bakery"]) {
+        return Some(BuildStyle::Cottage);
+    }
+    None
+}
+
+/// Returns `true` when the prompt text explicitly requests a material/palette rather than generic auto-selection.
+pub fn description_names_explicit_material(description: &str) -> bool {
+    let lower = description.to_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "бледн", "темн", "тёмн", "берёз", "берез", "елов", "ельн", "вишн", "сакур",
+            "акац", "джунгл", "мангр", "бамбук", "багров", "искаж", "дуб", "oak", "spruce",
+            "birch", "cherry", "sakura", "acacia", "jungle", "mangrove", "bamboo", "crimson",
+            "warped", "pale oak", "dark oak", "булыж", "сланц", "чернит", "туф", "кварц",
+            "мрамор", "кальцит", "бетон", "песчан", "смол", "кирпич", "саман", "терракот",
+            "медн", "медь", "cobble", "deepslate", "blackstone", "tuff", "quartz", "marble",
+            "calcite", "concrete", "sandstone", "resin", "brick", "terracotta", "copper",
+            "призмарин", "prismarine", "незер", "nether", "аметист", "amethyst", "снеж", "snow",
+        ],
+    )
+}
+
+/// Resolves an explicit, text-inferred, or biome-suggested architectural style; falls back to seed when Auto.
+pub fn infer_style_with_biome(
+    requested: BuildStyle,
+    description: &str,
+    seed: u64,
+    biome_hint: &str,
+) -> BuildStyle {
     if requested != BuildStyle::Auto {
         return requested;
     }
 
     let lower = description.to_lowercase();
-    if contains_any(&lower, &["стимпанк", "завод", "фабрик", "паро", "механизм", "часов башн", "часовая башн", "биг-бен", "биг бен", "дирижабл", "вокзал", "steampunk", "industrial", "factory", "airship"]) {
-        return BuildStyle::Steampunk;
+    if let Some(explicit) = explicit_style_keyword(&lower) {
+        return explicit;
     }
-    if contains_any(&lower, &["античн", "римск", "греческ", "колизе", "амфитеатр", "парфенон", "пантеон", "акрополь", "триумф", "обелиск", "терм", "акведук", "ратуш", "музе", "опер", "classical", "roman", "greek", "antique", "colosseum", "coliseum", "amphitheater", "parthenon", "pantheon", "aqueduct"]) {
-        return BuildStyle::Classical;
+    if let Some(biome_style) = biome_style_suggestion(biome_hint) {
+        return biome_style;
     }
-    if contains_any(&lower, &["япон", "пагод", "самура", "сакур", "бамбук", "энгава", "тоори", "тории", "онсэн", "тенсю", "тэнсю", "химэдзи", "тайко", "ицукусим", "фусими", "japanese", "pagoda", "oriental", "zen", "onsen", "tenshu", "himeji", "taiko"]) {
-        return BuildStyle::Japanese;
-    }
-    if contains_any(&lower, &["готич", "кафедрал", "собор", "вампир", "некро", "мрач", "темн", "тёмн", "сланец", "сланц", "склеп", "мавзоле", "катакомб", "башня мага", "архимаг", "дракон", "gothic", "cathedral", "dark", "crypt", "mausoleum", "mage tower", "wizard tower"]) {
-        return BuildStyle::Gothic;
-    }
-    if contains_any(&lower, &["модерн", "современ", "хайтек", "минимал", "бетон", "кварц", "вилла", "обсерватор", "небоскр", "стадион", "бункер", "космодром", "ракет", "буров", "нефтян", "плотин", "modern", "minimal", "villa", "concrete", "observatory", "skyscraper", "stadium", "bunker", "rocket", "oil rig"]) {
-        return BuildStyle::Modern;
-    }
-    if contains_any(&lower, &["викин", "сканд", "север", "сруб", "длинн", "шале", "альпийск", "nordic", "viking", "longhouse", "chalet", "alpine"]) {
-        return BuildStyle::Nordic;
-    }
-    if contains_any(&lower, &["пустын", "егип", "оазис", "песчан", "араб", "марок", "пирамид", "зиккурат", "базар", "хаммам", "сфинкс", "иштар", "мечет", "минарет", "касб", "риад", "висячие сад", "desert", "arabian", "oasis", "sandstone", "pyramid", "ziggurat", "bazaar", "mosque", "sphinx", "kasbah"]) {
-        return BuildStyle::Desert;
-    }
-    if contains_any(&lower, &["средневек", "тюдор", "фахверк", "рыцар", "бейли", "ристалищ", "барбакан", "монастыр", "аббатств", "верф", "корабл", "галеон", "таверн", "дварф", "medieval", "tudor", "monastery", "shipyard", "galleon", "joust"]) {
-        return BuildStyle::Medieval;
-    }
-    if contains_any(&lower, &["коттедж", "лесн", "сказоч", "сад", "цвет", "плющ", "уютн", "хоббит", "гриб", "мухомор", "винодельн", "пекарн", "аптек", "cottage", "rustic", "cozy", "garden", "hobbit", "mushroom", "bakery"]) {
+    if contains_any(&lower, &["уютн", "cozy"]) {
         return BuildStyle::Cottage;
     }
 
@@ -562,6 +696,11 @@ pub fn infer_style_from_text(requested: BuildStyle, description: &str, seed: u64
     }
 }
 
+/// Resolves an explicit or text-inferred architectural style; falls back to seed when Auto.
+pub fn infer_style_from_text(requested: BuildStyle, description: &str, seed: u64) -> BuildStyle {
+    infer_style_with_biome(requested, description, seed, "")
+}
+
 /// Parses a Russian or English building description into structured noise + grammar parameters.
 pub fn parse_description(
     category: BuildCategory,
@@ -572,6 +711,32 @@ pub fn parse_description(
     height: u16,
     noise_level: NoiseLevel,
     seed: u64,
+) -> BlueprintSpec {
+    parse_description_with_biome(
+        category,
+        requested_style,
+        description,
+        width,
+        depth,
+        height,
+        noise_level,
+        seed,
+        "",
+    )
+}
+
+/// Parses a Russian or English building description with an optional world biome hint.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_description_with_biome(
+    category: BuildCategory,
+    requested_style: BuildStyle,
+    description: &str,
+    width: u16,
+    depth: u16,
+    height: u16,
+    noise_level: NoiseLevel,
+    seed: u64,
+    biome_hint: &str,
 ) -> BlueprintSpec {
     let lower = description.to_lowercase();
     let mut rng = SplitMix64::new(seed ^ 0x1357_2468_9ABC_DEF0);
@@ -678,7 +843,7 @@ pub fn parse_description(
         category
     };
 
-    let effective_style = infer_style_from_text(requested_style, &lower, seed);
+    let effective_style = infer_style_with_biome(requested_style, &lower, seed, biome_hint);
     let theme = if theme == StructureTheme::Standard
         && effective_cat == BuildCategory::Castle
         && effective_style == BuildStyle::Japanese
@@ -1207,6 +1372,7 @@ pub fn parse_description(
         on_stilts,
         ground_wall,
         upper_wall,
+        biome_tag: normalize_biome_id(biome_hint),
     }
 }
 
@@ -1338,15 +1504,106 @@ fn apply_wood_palette(pal: &mut MaterialPalette, wood: &str) {
     pal.leaves = leaves.into();
 }
 
+fn infer_palette_for_biome(biome: &str, style: BuildStyle) -> Option<MaterialPalette> {
+    let id = normalize_biome_id(biome);
+    if id.is_empty() {
+        return None;
+    }
+    if id.contains("cherry") {
+        Some(MaterialPalette::preset(9))
+    } else if id.contains("pale_garden") {
+        Some(MaterialPalette::preset(14))
+    } else if id.contains("snow") || id.contains("ice") || id.contains("frozen") || id.contains("jagged") || id.contains("grove") {
+        Some(MaterialPalette::preset(15))
+    } else if id.contains("bamboo") || id.contains("jungle") {
+        Some(MaterialPalette::preset(11))
+    } else if id.contains("mangrove") || id == "swamp" {
+        let mut p = MaterialPalette::preset(0);
+        p.name = "Мангровое болото / Торф".into();
+        apply_wood_palette(&mut p, "mangrove");
+        p.foundation = "minecraft:mud_bricks".into();
+        p.trim_wall = "minecraft:mud_brick_wall".into();
+        p.wall_accent = "minecraft:mossy_cobblestone".into();
+        Some(p)
+    } else if id.contains("badlands") || id.contains("savanna") {
+        let mut p = MaterialPalette::preset(5);
+        p.name = "Саванна / Бедлендс".into();
+        apply_wood_palette(&mut p, "acacia");
+        if id.contains("badlands") {
+            p.foundation = "minecraft:cut_red_sandstone".into();
+            p.wall = "minecraft:terracotta".into();
+            p.wall_upper = "minecraft:red_sandstone".into();
+            p.trim_wall = "minecraft:red_sandstone_wall".into();
+        }
+        Some(p)
+    } else if id.contains("birch") {
+        Some(MaterialPalette::preset(8))
+    } else if id.contains("ocean") || id.contains("shore") {
+        if style == BuildStyle::Modern {
+            Some(MaterialPalette::preset(10))
+        } else {
+            let mut p = MaterialPalette::preset(1);
+            p.name = "Прибрежная гавань (ель и окисл. медь)".into();
+            apply_wood_palette(&mut p, "spruce");
+            p.roof_block = "minecraft:exposed_cut_copper".into();
+            p.roof_stairs = "minecraft:exposed_cut_copper_stairs".into();
+            p.roof_slab = "minecraft:exposed_cut_copper_slab".into();
+            p.light = "minecraft:sea_lantern".into();
+            Some(p)
+        }
+    } else if id.contains("mushroom") {
+        let mut p = MaterialPalette::preset(0);
+        p.name = "Грибные поля (мухомор и палеодуб)".into();
+        apply_wood_palette(&mut p, "pale_oak");
+        p.roof_block = "minecraft:red_mushroom_block".into();
+        p.light = "minecraft:shroomlight".into();
+        Some(p)
+    } else if id.contains("warped") {
+        let mut p = MaterialPalette::preset(13);
+        p.name = "Искажённый лес (чернит и лазурит)".into();
+        apply_wood_palette(&mut p, "warped");
+        p.light = "minecraft:soul_lantern".into();
+        Some(p)
+    } else if id.contains("nether") || id.contains("crimson") || id.contains("basalt") || id.contains("soul_sand") {
+        Some(MaterialPalette::preset(13))
+    } else if id.contains("end") {
+        let mut p = MaterialPalette::preset(12);
+        p.name = "Цитадель Энда (эндерняк и пурпур)".into();
+        p.foundation = "minecraft:end_stone_bricks".into();
+        p.wall = "minecraft:end_stone_bricks".into();
+        p.trim_wall = "minecraft:end_stone_brick_wall".into();
+        Some(p)
+    } else if id.contains("desert") {
+        Some(MaterialPalette::preset(5))
+    } else if id.contains("taiga") || id.contains("windswept") {
+        Some(MaterialPalette::preset(6))
+    } else if id.contains("dark_forest") || id.contains("deep_dark") {
+        Some(MaterialPalette::preset(3))
+    } else {
+        None
+    }
+}
+
 /// Suggests a fitting rich material palette synced to the exact architectural seed and text description.
 pub fn infer_palette_with_style_and_seed(
     requested_style: BuildStyle,
     description: &str,
     seed: u64,
 ) -> MaterialPalette {
+    infer_palette_with_biome(requested_style, description, seed, "")
+}
+
+/// Suggests a coherent material palette incorporating explicit style, text prompt, seed, and world biome.
+pub fn infer_palette_with_biome(
+    requested_style: BuildStyle,
+    description: &str,
+    seed: u64,
+    biome_hint: &str,
+) -> MaterialPalette {
     let lower = description.to_lowercase();
-    let style = infer_style_from_text(requested_style, &lower, seed);
+    let style = infer_style_with_biome(requested_style, &lower, seed, biome_hint);
     let theme = infer_theme_from_text(&lower);
+    let explicit_style_in_text = explicit_style_keyword(&lower).is_some();
 
     let mut pal = if contains_any(&lower, &["призмарин", "морск", "океан", "подвод", "prismarine", "ocean", "aquatic"]) {
         MaterialPalette::preset(10)
@@ -1518,6 +1775,9 @@ pub fn infer_palette_with_style_and_seed(
         && contains_any(&lower, &["берёз", "берез", "birch"])
     {
         MaterialPalette::preset(8)
+    } else if requested_style == BuildStyle::Auto && !explicit_style_in_text {
+        infer_palette_for_biome(biome_hint, style)
+            .unwrap_or_else(|| MaterialPalette::preset_for_style(style))
     } else {
         MaterialPalette::preset_for_style(style)
     };

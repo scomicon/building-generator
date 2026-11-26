@@ -20,7 +20,7 @@ use crate::gen_roof::{
 };
 use crate::model::{BuildCategory, BuildRequest, BuildStyle, MaterialPalette};
 use crate::noise::{NoiseField, SplitMix64};
-use crate::parser::{BlueprintSpec, StructureTheme, parse_description};
+use crate::parser::{BlueprintSpec, StructureTheme};
 
 fn ensure_valid_front_door_spot(
     grid: LocalGrid,
@@ -1541,42 +1541,6 @@ fn build_arcade_gallery(
     }
 }
 
-pub(crate) fn apply_ruin_erosion(
-    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
-    spec: &BlueprintSpec,
-    height: u16,
-    door_pos: Option<[i32; 3]>,
-    noise: NoiseField,
-) {
-    if spec.ruin_erosion <= 0.05 {
-        return;
-    }
-    let min_keep_y = i32::from(spec.foundation_height) + 1;
-    let to_erode: Vec<[i32; 3]> = blocks
-        .iter()
-        .filter_map(|(&pos, blk)| {
-            if blk.block_id == "minecraft:air" || pos[1] <= min_keep_y {
-                return None;
-            }
-            if let Some(dp) = door_pos
-                && (pos[0] - dp[0]).abs() <= 1
-                && (pos[2] - dp[2]).abs() <= 1
-                && pos[1] <= dp[1] + 1
-            {
-                return None;
-            }
-            let height_ratio = ((pos[1] - min_keep_y) as f64)
-                / ((i32::from(height) - min_keep_y).max(1) as f64);
-            let n = noise.fbm_3d(pos[0] as f64 * 0.38, pos[1] as f64 * 0.38, pos[2] as f64 * 0.38, 3);
-            let threshold = 0.78 - height_ratio * f64::from(spec.ruin_erosion) * 0.65;
-            if n > threshold { Some(pos) } else { None }
-        })
-        .collect();
-    for pos in to_erode {
-        blocks.insert(pos, PlannedBlock::simple("minecraft:air"));
-    }
-}
-
 /// Smooths jagged hillside cuts and braces slope terraces with masonry retaining walls around the footprint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blend_surrounding_terrain(
@@ -2252,7 +2216,6 @@ fn generate_colosseum(
             noise,
         );
     }
-    apply_ruin_erosion(&mut blocks, &spec, height, door_pos, noise);
     prune_unsupported_floating_blocks(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
 
@@ -2286,7 +2249,7 @@ pub fn generate_blueprint_with_water(
     let height = req.height.clamp(5, 48);
     let grid = LocalGrid::new(width, depth, req.facing);
 
-    let mut spec = parse_description(
+    let spec = crate::parser::parse_description_with_biome(
         req.category,
         req.style,
         &req.description,
@@ -2295,16 +2258,13 @@ pub fn generate_blueprint_with_water(
         height,
         req.noise_level,
         req.seed as u64,
+        &req.biome_hint,
     );
-    let seed = req.seed as u64;
-    let noise = NoiseField::new(seed);
-    let mut rng = SplitMix64::new(seed ^ 0xCAFE_BABE_1234_9876);
-    let pal = &req.palette;
+    let noise = NoiseField::new(req.seed as u64);
 
-    if spec.theme == StructureTheme::Colosseum {
-        return generate_colosseum(req, spec, grid, height, noise, terrain_offsets);
-    }
-    if let Some(landmark) = crate::gen_landmarks::try_generate_landmark(
+    let mut bp = if spec.theme == StructureTheme::Colosseum {
+        generate_colosseum(req, spec, grid, height, noise, terrain_offsets)
+    } else if let Some(landmark) = crate::gen_landmarks::try_generate_landmark(
         req,
         spec.clone(),
         grid,
@@ -2312,20 +2272,41 @@ pub fn generate_blueprint_with_water(
         noise,
         terrain_offsets,
     ) {
-        return landmark;
-    }
-    if spec.category == BuildCategory::Bridge {
-        return crate::gen_bridge::generate_bridge(req, spec, grid, height, noise, terrain_offsets);
-    }
-    if spec.category == BuildCategory::Settlement {
-        return crate::gen_settlement::generate_settlement(
+        landmark
+    } else if spec.category == BuildCategory::Bridge {
+        crate::gen_bridge::generate_bridge(req, spec, grid, height, noise, terrain_offsets)
+    } else if spec.category == BuildCategory::Settlement {
+        crate::gen_settlement::generate_settlement(
             req,
             spec,
             noise,
             terrain_offsets,
             water_depths,
-        );
+        )
+    } else {
+        generate_standard_structure(req, spec, grid, height, noise, terrain_offsets, water_depths)
+    };
+
+    if crate::gen_weathering::apply_weathering_and_overgrowth(&mut bp, req, noise) {
+        prune_unsupported_floating_blocks(&mut bp.blocks);
+        crate::gen_common::resolve_connections_and_shapes(&mut bp.blocks);
     }
+    bp
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_standard_structure(
+    req: &BuildRequest,
+    mut spec: BlueprintSpec,
+    grid: LocalGrid,
+    height: u16,
+    noise: NoiseField,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
+) -> GeneratedBlueprint {
+    let seed = req.seed as u64;
+    let mut rng = SplitMix64::new(seed ^ 0xCAFE_BABE_1234_9876);
+    let pal = &req.palette;
 
     let (fp, bounds) = build_footprint(grid, &spec, noise, terrain_offsets, &mut rng);
 
@@ -2676,8 +2657,7 @@ pub fn generate_blueprint_with_water(
         }
     }
 
-    // 12. Ruin Erosion & Structural Anti-Floating Sanitizer Pass.
-    apply_ruin_erosion(&mut blocks, &spec, height, door_pos, noise);
+    // 12. Structural Anti-Floating Sanitizer Pass.
     prune_unsupported_floating_blocks(&mut blocks);
 
     // 13. Connect glass panes, fences, stone walls, iron bars & miter stair corners cleanly.

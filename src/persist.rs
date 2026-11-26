@@ -17,6 +17,8 @@ pub struct SavedPreset {
     pub noise_level: NoiseLevel,
     pub adapt_terrain: bool,
     pub air_only: bool,
+    pub wear_pct: u8,
+    pub overgrowth_pct: u8,
     pub description: String,
     pub seed: u64,
     pub palette_manual: bool,
@@ -174,10 +176,10 @@ fn read_str(data: &[u8], cursor: &mut usize, lang: UiLang) -> Result<String, Str
     Ok(s)
 }
 
-/// Encodes a preset configuration into a compact `BG2:...` share code with FNV-1a checksum (`v3` includes per-slot lists & mix mode).
+/// Encodes a preset configuration into a compact `BG2:...` share code with FNV-1a checksum (`v4` includes wear & overgrowth %).
 pub fn encode_share_code(p: &SavedPreset) -> String {
-    let mut buf = Vec::with_capacity(224);
-    buf.extend_from_slice(b"BG2\x03");
+    let mut buf = Vec::with_capacity(228);
+    buf.extend_from_slice(b"BG2\x04");
     buf.extend_from_slice(&p.width.to_le_bytes());
     buf.extend_from_slice(&p.depth.to_le_bytes());
     buf.extend_from_slice(&p.height.to_le_bytes());
@@ -248,6 +250,8 @@ pub fn encode_share_code(p: &SavedPreset) -> String {
             }
         }
     }
+    buf.push(p.wear_pct.min(100));
+    buf.push(p.overgrowth_pct.min(100));
     let sum = fnv1a_32(&buf);
     buf.extend_from_slice(&sum.to_le_bytes());
     format!("BG2:{}", b64_encode(&buf))
@@ -273,12 +277,16 @@ pub fn decode_share_code_lang(
         .ok_or_else(|| err_msg(lang, "Share code must start with BG2:", "Код должен начинаться с BG2:"))?;
     let bytes = b64_decode(payload, lang)?;
     if bytes.len() < 4 + 24 + 4
-        || (&bytes[0..4] != b"BG2\x01" && &bytes[0..4] != b"BG2\x02" && &bytes[0..4] != b"BG2\x03")
+        || (&bytes[0..4] != b"BG2\x01"
+            && &bytes[0..4] != b"BG2\x02"
+            && &bytes[0..4] != b"BG2\x03"
+            && &bytes[0..4] != b"BG2\x04")
     {
         return Err(err_msg(lang, "Unsupported Share code version", "Неподдерживаемая версия Share-кода"));
     }
     let is_v2 = &bytes[0..4] == b"BG2\x02";
-    let is_v3 = &bytes[0..4] == b"BG2\x03";
+    let is_v3_or_v4 = &bytes[0..4] == b"BG2\x03" || &bytes[0..4] == b"BG2\x04";
+    let is_v4 = &bytes[0..4] == b"BG2\x04";
     let body_len = bytes.len() - 4;
     let stored_sum = u32::from_le_bytes([
         bytes[body_len],
@@ -334,7 +342,7 @@ pub fn decode_share_code_lang(
         let leaves = read_str(body, &mut cur, lang)?;
         let light = read_str(body, &mut cur, lang)?;
         let chimney_block = read_str(body, &mut cur, lang)?;
-        if is_v2 || is_v3 {
+        if is_v2 || is_v3_or_v4 {
             let mut pal = MaterialPalette {
                 name: pal_name,
                 foundation,
@@ -372,7 +380,7 @@ pub fn decode_share_code_lang(
                 mix_mode: MixMode::Patches,
                 extra_lists: Vec::new(),
             };
-            if is_v3 && cur < body.len() {
+            if is_v3_or_v4 && cur < body.len() {
                 pal.mix_mode = MixMode::from_idx(body[cur]);
                 cur += 1;
                 if cur < body.len() {
@@ -454,6 +462,12 @@ pub fn decode_share_code_lang(
         inferred
     };
 
+    let (wear_pct, overgrowth_pct) = if is_v4 && cur + 2 <= body.len() {
+        (body[cur].min(100), body[cur + 1].min(100))
+    } else {
+        (0, 0)
+    };
+
     let name = name_override
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{} ({})", category.label_ru(), style.label_ru()));
@@ -470,6 +484,8 @@ pub fn decode_share_code_lang(
         noise_level,
         adapt_terrain,
         air_only,
+        wear_pct,
+        overgrowth_pct,
         description,
         seed,
         palette_manual,

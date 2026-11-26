@@ -3,7 +3,8 @@ use std::sync::RwLock;
 use mod_api::{PayloadId, Registrar, ToClient, ToServer};
 
 use crate::model::{
-    BuildRequest, BuildResponse, RedoRequest, RerollRequest, SetLangRequest, UndoRequest,
+    BiomeQueryRequest, BiomeQueryResponse, BuildRequest, BuildResponse, RedoRequest, RerollRequest,
+    SetLangRequest, UndoRequest,
 };
 use crate::{client_ui, server_builder};
 
@@ -14,7 +15,9 @@ pub struct PayloadChannels {
     pub to_server_redo: ToServer<RedoRequest>,
     pub to_server_reroll: ToServer<RerollRequest>,
     pub to_server_lang: ToServer<SetLangRequest>,
+    pub to_server_biome: ToServer<BiomeQueryRequest>,
     pub to_client_reply: ToClient<BuildResponse>,
+    pub to_client_biome: ToClient<BiomeQueryResponse>,
 }
 
 static CHANNELS: RwLock<Option<PayloadChannels>> = RwLock::new(None);
@@ -43,10 +46,21 @@ pub fn register_channels(registrar: &mut dyn Registrar) {
         PayloadId("building_generator:lang".into()),
         |req, cx| server_builder::handle_lang_payload(req, cx),
     );
+    let to_server_biome = reg.play_to_server_typed::<BiomeQueryRequest>(
+        PayloadId("building_generator:biome_query".into()),
+        |req, cx| server_builder::handle_biome_payload(req, cx),
+    );
     let to_client_reply = reg.play_to_client_typed::<BuildResponse>(
         PayloadId("building_generator:reply".into()),
         |resp, _| {
             client_ui::on_server_response(resp);
+            Ok(())
+        },
+    );
+    let to_client_biome = reg.play_to_client_typed::<BiomeQueryResponse>(
+        PayloadId("building_generator:biome_reply".into()),
+        |resp, _| {
+            client_ui::on_biome_response(resp);
             Ok(())
         },
     );
@@ -58,7 +72,9 @@ pub fn register_channels(registrar: &mut dyn Registrar) {
             to_server_redo,
             to_server_reroll,
             to_server_lang,
+            to_server_biome,
             to_client_reply,
+            to_client_biome,
         });
     }
 }

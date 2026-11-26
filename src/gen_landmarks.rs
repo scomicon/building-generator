@@ -261,10 +261,9 @@ pub(crate) fn finish_landmark(
     grid: LocalGrid,
     height: u16,
     mut blocks: BTreeMap<[i32; 3], PlannedBlock>,
-    noise: NoiseField,
+    _noise: NoiseField,
     door_pos: Option<[i32; 3]>,
 ) -> GeneratedBlueprint {
-    crate::generator::apply_ruin_erosion(&mut blocks, &spec, height, door_pos, noise);
     prune_map_unsupported(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
     GeneratedBlueprint {

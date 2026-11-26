@@ -3,7 +3,7 @@ use mod_api::PayloadCodec;
 /// Mod version string, falling back when Horizon's prebuilt-api rustc compiles without Cargo env vars.
 pub const MOD_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(ver) => ver,
-    None => "0.3.0",
+    None => "0.4.0",
 };
 
 /// UI and chat feedback language supported by the mod (`En` default, switchable to `Ru`).
@@ -2308,7 +2308,25 @@ pub struct BuildRequest {
     pub description: String,
     pub adapt_terrain: bool,
     pub air_only: bool,
+    pub wear_pct: u8,
+    pub overgrowth_pct: u8,
+    pub biome_hint: String,
     pub palette: MaterialPalette,
+}
+
+/// Client-to-server biome lookup request for live GUI Auto-Biome style/palette inference.
+#[derive(Clone, Debug, PartialEq, Eq, PayloadCodec)]
+pub struct BiomeQueryRequest {
+    pub dimension: String,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+/// Server-to-client biome lookup response (canonical biome identifier, e.g. `minecraft:cherry_grove`).
+#[derive(Clone, Debug, PartialEq, Eq, PayloadCodec)]
+pub struct BiomeQueryResponse {
+    pub biome: String,
 }
 
 /// Client-to-server undo request.

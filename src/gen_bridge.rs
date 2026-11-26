@@ -1586,7 +1586,6 @@ pub(crate) fn generate_bridge(
         }
     }
 
-    crate::generator::apply_ruin_erosion(&mut blocks, &spec, height, None, noise);
     prune_map_unsupported(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
 

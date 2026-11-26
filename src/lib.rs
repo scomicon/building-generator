@@ -12,6 +12,7 @@ mod gen_exterior;
 mod gen_interior;
 mod gen_roof;
 mod gen_settlement;
+mod gen_weathering;
 pub mod generator;
 pub mod model;
 pub mod network;
@@ -177,6 +178,9 @@ mod tests {
             description: desc.into(),
             adapt_terrain: true,
             air_only: false,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            biome_hint: String::new(),
             palette: MaterialPalette::preset(0),
         }
     }
@@ -707,6 +711,26 @@ mod tests {
         "minecraft:birch_shelf",
         "minecraft:pale_oak_shelf",
         "minecraft:sand",
+        "minecraft:red_sand",
+        "minecraft:cobweb",
+        "minecraft:cracked_deepslate_bricks",
+        "minecraft:cracked_nether_bricks",
+        "minecraft:cracked_polished_blackstone_bricks",
+        "minecraft:mossy_stone_brick_stairs",
+        "minecraft:mossy_stone_brick_slab",
+        "minecraft:mossy_cobblestone_stairs",
+        "minecraft:mossy_cobblestone_slab",
+        "minecraft:stone_brick_slab",
+        "minecraft:cobblestone_stairs",
+        "minecraft:cobblestone_slab",
+        "minecraft:packed_mud",
+        "minecraft:dead_bush",
+        "minecraft:pale_moss_carpet",
+        "minecraft:pale_moss_block",
+        "minecraft:red_mushroom_block",
+        "minecraft:brown_mushroom_block",
+        "minecraft:cobbled_deepslate_slab",
+        "minecraft:chiseled_sandstone",
     ];
 
     static REGISTERED_KEYS: OnceLock<Mutex<HashMap<String, BlockKey>>> = OnceLock::new();
@@ -732,6 +756,7 @@ mod tests {
         air_key: BlockKey,
         sent_payloads: Vec<(String, Vec<u8>)>,
         player_perms: HashMap<u128, u8>,
+        biome_id: Option<String>,
     }
 
     impl TestWorldHost {
@@ -750,6 +775,7 @@ mod tests {
                 air_key,
                 sent_payloads: Vec::new(),
                 player_perms: HashMap::new(),
+                biome_id: None,
             };
             let grass = BlockStateRecord::new(grass_key, 0).into();
             for x in 0..40 {
@@ -762,6 +788,10 @@ mod tests {
 
         fn set_player_perm(&mut self, uuid: u128, level: u8) {
             self.player_perms.insert(uuid, level);
+        }
+
+        fn set_biome(&mut self, biome: Option<&str>) {
+            self.biome_id = biome.map(str::to_owned);
         }
     }
 
@@ -931,6 +961,10 @@ mod tests {
                     .copied()
                     .unwrap_or_else(|| BlockStateRecord::new(self.air_key, 0).into()),
             )
+        }
+
+        fn level_biome_at(&self, _level: LevelRef, _pos: [i32; 3]) -> Option<String> {
+            self.biome_id.clone()
         }
     }
     impl PlayersBackend for TestWorldHost {
@@ -1411,6 +1445,9 @@ mod tests {
                     description: desc.into(),
                     adapt_terrain: true,
                     air_only: false,
+                    wear_pct: 0,
+                    overgrowth_pct: 0,
+                    biome_hint: String::new(),
                     palette: pal,
                 };
                 let pbp = generate_blueprint(&preq, None);
@@ -2693,6 +2730,8 @@ mod tests {
             noise_level: NoiseLevel::Wild,
             adapt_terrain: true,
             air_only: true,
+            wear_pct: 25,
+            overgrowth_pct: 40,
             description: "квартал античный с колоннами и садом".into(),
             seed: 987_654_321,
             palette_manual: true,
@@ -2867,6 +2906,8 @@ mod tests {
             noise_level: NoiseLevel::Balanced,
             adapt_terrain: true,
             air_only: false,
+            wear_pct: 0,
+            overgrowth_pct: 0,
             description: "двухэтажная уютная таверна лавка с крыльцом и садом".into(),
             seed: 4242,
             palette_manual: true,
@@ -3183,6 +3224,8 @@ mod tests {
             noise_level: NoiseLevel::Balanced,
             adapt_terrain: true,
             air_only: false,
+            wear_pct: 0,
+            overgrowth_pct: 0,
             description: "дом с разными блоками".into(),
             seed: 987654,
             palette_manual: true,
@@ -3746,6 +3789,51 @@ mod tests {
         });
     }
 
+    struct TestPayloadContext<'a> {
+        host: &'a mut TestWorldHost,
+        player: mod_api::PlayerRef,
+        replies: Vec<(String, Vec<u8>)>,
+    }
+
+    impl mod_api::IPayloadContext for TestPayloadContext<'_> {
+        fn player(&self) -> Result<mod_api::PlayerRef, mod_api::PayloadContextError> {
+            Ok(self.player)
+        }
+        fn flow(&self) -> mod_api::PayloadDirection {
+            mod_api::PayloadDirection::ToServer
+        }
+        fn protocol(&self) -> mod_api::PayloadProtocol {
+            mod_api::PayloadProtocol::Play
+        }
+        fn server_host(&mut self) -> Result<&mut dyn ServerHost, mod_api::PayloadContextError> {
+            Ok(self.host)
+        }
+        fn client_host(&mut self) -> Result<&mut dyn ClientHost, mod_api::PayloadContextError> {
+            Err(mod_api::PayloadContextError::WrongSide)
+        }
+        fn reply(
+            &mut self,
+            id: &mod_api::PayloadId,
+            bytes: mod_api::PayloadBytes,
+        ) -> Result<mod_api::PayloadAccepted, mod_api::PayloadSendError> {
+            self.replies.push((id.0.clone(), bytes.0));
+            Ok(mod_api::PayloadAccepted::Queued)
+        }
+        fn check_payload_token(
+            &self,
+            _: &mod_api::PayloadToken,
+        ) -> Result<(), mod_api::PayloadSendError> {
+            Ok(())
+        }
+        fn disconnect(&mut self, _: mod_api::Text) {}
+        fn enqueue_work(
+            &mut self,
+            _: std::sync::Arc<dyn mod_api::PayloadWork>,
+        ) -> Result<mod_api::PayloadWorkStatus, mod_api::PayloadContextError> {
+            Ok(mod_api::PayloadWorkStatus::Complete)
+        }
+    }
+
     #[test]
     fn v030_redo_air_only_bom_and_server_security_work() {
         use crate::model::{RedoRequest, SetLangRequest, UiLang, UndoRequest};
@@ -3753,52 +3841,6 @@ mod tests {
             clear_rate_limit_for_test, handle_build_payload, handle_redo_payload,
             handle_reroll_payload, handle_undo_payload, player_lang, set_player_lang,
         };
-        use std::sync::Arc;
-
-        struct TestPayloadContext<'a> {
-            host: &'a mut TestWorldHost,
-            player: mod_api::PlayerRef,
-            replies: Vec<(String, Vec<u8>)>,
-        }
-
-        impl mod_api::IPayloadContext for TestPayloadContext<'_> {
-            fn player(&self) -> Result<mod_api::PlayerRef, mod_api::PayloadContextError> {
-                Ok(self.player)
-            }
-            fn flow(&self) -> mod_api::PayloadDirection {
-                mod_api::PayloadDirection::ToServer
-            }
-            fn protocol(&self) -> mod_api::PayloadProtocol {
-                mod_api::PayloadProtocol::Play
-            }
-            fn server_host(&mut self) -> Result<&mut dyn ServerHost, mod_api::PayloadContextError> {
-                Ok(self.host)
-            }
-            fn client_host(&mut self) -> Result<&mut dyn ClientHost, mod_api::PayloadContextError> {
-                Err(mod_api::PayloadContextError::WrongSide)
-            }
-            fn reply(
-                &mut self,
-                id: &mod_api::PayloadId,
-                bytes: mod_api::PayloadBytes,
-            ) -> Result<mod_api::PayloadAccepted, mod_api::PayloadSendError> {
-                self.replies.push((id.0.clone(), bytes.0));
-                Ok(mod_api::PayloadAccepted::Queued)
-            }
-            fn check_payload_token(
-                &self,
-                _: &mod_api::PayloadToken,
-            ) -> Result<(), mod_api::PayloadSendError> {
-                Ok(())
-            }
-            fn disconnect(&mut self, _: mod_api::Text) {}
-            fn enqueue_work(
-                &mut self,
-                _: Arc<dyn mod_api::PayloadWork>,
-            ) -> Result<mod_api::PayloadWorkStatus, mod_api::PayloadContextError> {
-                Ok(mod_api::PayloadWorkStatus::Complete)
-            }
-        }
 
         // 1. RedoRequest + BuildRequest(air_only=true) codec roundtrip + BOM check.
         let redo_req = RedoRequest {
@@ -4008,6 +4050,220 @@ mod tests {
             }
             assert_eq!(host.world_blocks, after_net, "Redo payload must re-apply build");
             let _ = SetLangRequest { lang: UiLang::En };
+        });
+    }
+
+    #[test]
+    fn v040_settlement2_biome_autostyle_and_weathering_work() {
+        use crate::model::{BiomeQueryRequest, BiomeQueryResponse, UiLang};
+        use crate::parser::{
+            biome_short_label, infer_palette_with_biome, infer_style_with_biome,
+        };
+        use crate::persist::{
+            SavedPreset, decode_share_code, encode_share_code, parse_favorites,
+            serialize_favorites,
+        };
+        use crate::server_builder::handle_biome_payload;
+
+        // 1. BiomeQuery codec roundtrip & Biome Auto-Style / Palette inference.
+        let bq = BiomeQueryRequest {
+            dimension: "minecraft:overworld".into(),
+            x: 120,
+            y: 64,
+            z: -80,
+        };
+        let bq_bytes = encode_payload(&bq, 1024).unwrap();
+        assert_eq!(decode_payload::<BiomeQueryRequest>(&bq_bytes).unwrap(), bq);
+        let br = BiomeQueryResponse {
+            biome: "minecraft:cherry_grove".into(),
+        };
+        let br_bytes = encode_payload(&br, 1024).unwrap();
+        assert_eq!(decode_payload::<BiomeQueryResponse>(&br_bytes).unwrap(), br);
+
+        assert_eq!(
+            biome_short_label("minecraft:cherry_grove", UiLang::En),
+            "Cherry"
+        );
+        assert_eq!(
+            biome_short_label("minecraft:cherry_grove", UiLang::Ru),
+            "Сакура"
+        );
+        assert_eq!(
+            infer_style_with_biome(BuildStyle::Auto, "cozy house", 42, "minecraft:cherry_grove"),
+            BuildStyle::Japanese
+        );
+        assert_eq!(
+            infer_style_with_biome(BuildStyle::Auto, "cozy house", 42, "minecraft:desert"),
+            BuildStyle::Desert
+        );
+        assert_eq!(
+            infer_style_with_biome(BuildStyle::Auto, "cozy house", 42, "minecraft:snowy_taiga"),
+            BuildStyle::Nordic
+        );
+        assert_eq!(
+            infer_style_with_biome(BuildStyle::Auto, "cozy house", 42, "minecraft:pale_garden"),
+            BuildStyle::Gothic
+        );
+        // Explicit prompt style overrides world biome!
+        assert_eq!(
+            infer_style_with_biome(
+                BuildStyle::Auto,
+                "готический замок",
+                42,
+                "minecraft:cherry_grove"
+            ),
+            BuildStyle::Gothic
+        );
+        let cherry_pal =
+            infer_palette_with_biome(BuildStyle::Auto, "cozy house", 42, "minecraft:cherry_grove");
+        assert!(
+            cherry_pal.wall.contains("cherry") || cherry_pal.leaves.contains("cherry"),
+            "cherry_grove biome should drive cherry palette: {:?}",
+            cherry_pal.wall
+        );
+
+        // 2. BG2 v4 Share-Code preserves wear_pct & overgrowth_pct cleanly.
+        let preset_v4 = SavedPreset {
+            name: "Ruined Keep".into(),
+            width: 21,
+            depth: 19,
+            height: 18,
+            category: BuildCategory::Castle,
+            style: BuildStyle::Gothic,
+            roof_raw: 2,
+            toggles: [1, 1, 1, 0, 1],
+            noise_level: NoiseLevel::Balanced,
+            adapt_terrain: true,
+            air_only: true,
+            wear_pct: 65,
+            overgrowth_pct: 45,
+            description: "gothic castle keep".into(),
+            seed: 123_456,
+            palette_manual: false,
+            palette: infer_palette_with_biome(BuildStyle::Gothic, "gothic castle keep", 123_456, ""),
+        };
+        let v4_code = encode_share_code(&preset_v4);
+        assert_eq!(
+            decode_share_code(&v4_code, Some("Ruined Keep")).unwrap(),
+            preset_v4
+        );
+        assert_eq!(parse_favorites(&serialize_favorites(&[preset_v4.clone()])), vec![preset_v4]);
+
+        // 3. Weathering (Wear + Overgrowth) & Copper Oxidation + Biome Flora + Server Biome Lookup.
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(301, 100);
+            let player = host.player(301).unwrap();
+            host.set_biome(Some("minecraft:cherry_grove"));
+
+            {
+                let mut cx = TestPayloadContext {
+                    host: &mut host,
+                    player,
+                    replies: Vec::new(),
+                };
+                handle_biome_payload(bq, &mut cx).unwrap();
+            }
+
+            // Server execute_build with Auto style samples cherry_grove from TestWorldHost!
+            let mut cherry_build = sample_request("cozy house", 8888);
+            cherry_build.origin_x = 12;
+            cherry_build.origin_z = 12;
+            let resp = execute_build(&mut host, Some(player), cherry_build);
+            assert!(resp.ok, "cherry biome auto-build failed: {}", resp.message);
+            let cherry_planks_key = host.id_to_key["minecraft:cherry_planks"];
+            assert!(
+                host.world_blocks
+                    .values()
+                    .any(|st| st.block() == cherry_planks_key),
+                "Auto biome build in cherry_grove should place cherry_planks"
+            );
+
+            // Universal Wear + Overgrowth on stone + copper castle.
+            let mut intact = sample_request("steampunk castle with copper roof", 54321);
+            intact.width = 21;
+            intact.depth = 19;
+            intact.height = 18;
+            intact.category = BuildCategory::Castle;
+            intact.style = BuildStyle::Steampunk;
+            intact.palette = MaterialPalette::preset(7);
+            let mut aged = intact.clone();
+            aged.wear_pct = 75;
+            aged.overgrowth_pct = 80;
+            aged.biome_hint = "minecraft:pale_garden".into();
+            let intact_bp = generate_blueprint(&intact, None);
+            let aged_bp = generate_blueprint(&aged, None);
+            assert_ne!(intact_bp.non_air_count(), aged_bp.non_air_count());
+            assert!(
+                aged_bp.blocks.values().any(|b| b.block_id.contains("exposed_cut_copper")
+                    || b.block_id.contains("weathered_cut_copper")
+                    || b.block_id.contains("oxidized_cut_copper")
+                    || b.block_id == "minecraft:cracked_stone_bricks"),
+                "75% wear must oxidize copper and crack stone bricks"
+            );
+            assert!(
+                aged_bp.blocks.values().any(|b| b.block_id == "minecraft:vine"),
+                "80% overgrowth must drape directional vines"
+            );
+            assert!(
+                aged_bp.blocks.values().any(|b| b.block_id == "minecraft:pale_moss_carpet"
+                    || b.block_id == "minecraft:pale_oak_leaves"),
+                "Pale garden overgrowth must use pale flora"
+            );
+            assert!(
+                blueprint_to_phased_runs(&host, &aged_bp).is_ok(),
+                "All weathered/overgrown blocks must resolve in world registry"
+            );
+
+            // 4. Settlement 2.0: 72x72 fortified town with natural river crossing bridge + multi-district entrances.
+            let mut river_wd = vec![0i32; 72 * 72];
+            for lz in 18..=22 {
+                for lx in 0..72 {
+                    river_wd[lz * 72 + lx] = 3;
+                }
+            }
+            let mut town_req = sample_request("большой средневековый город с площадью", 77777);
+            town_req.width = 72;
+            town_req.depth = 72;
+            town_req.height = 24;
+            town_req.category = BuildCategory::Settlement;
+            town_req.style = BuildStyle::Medieval;
+            town_req.palette = MaterialPalette::preset(1);
+            let town_bp =
+                crate::generator::generate_blueprint_with_water(&town_req, None, Some(&river_wd));
+            assert!(
+                blueprint_to_phased_runs(&host, &town_bp).is_ok(),
+                "Settlement 2.0 must emit only valid block IDs"
+            );
+            let door_cols: std::collections::HashSet<[i32; 2]> = town_bp
+                .blocks
+                .iter()
+                .filter(|(_, b)| b.block_id.ends_with("_door"))
+                .map(|(&[x, _, z], _)| [x, z])
+                .collect();
+            assert!(
+                door_cols.len() >= 4,
+                "Settlement 2.0 72x72 town should build at least 4 distinct building entrances, got {}",
+                door_cols.len()
+            );
+            assert!(
+                town_bp.blocks.iter().any(|(&[x, y, z], b)| {
+                    (33..=39).contains(&x) && (18..=22).contains(&z) && y >= 1 && b.block_id != "minecraft:air" && b.block_id != "minecraft:water"
+                }),
+                "Settlement 2.0 should span a bridge across natural river water at z=18..22"
+            );
         });
     }
 }

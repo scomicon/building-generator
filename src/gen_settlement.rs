@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::gen_common::{
-    GeneratedBlueprint, PlannedBlock, make_leaves, make_slab, prune_map_unsupported,
-    resolve_connections_and_shapes,
+    GeneratedBlueprint, PlannedBlock, make_leaves, make_slab, make_stair,
+    prune_map_unsupported, resolve_connections_and_shapes,
 };
 use crate::model::{BuildCategory, BuildRequest, BuildStyle, CardinalFacing, MaterialPalette};
 use crate::noise::{NoiseField, SplitMix64};
@@ -96,12 +96,18 @@ fn sanitize_sub_description(desc: &str) -> String {
         "поселок",
         "усадьб",
         "городок",
+        "город",
+        "руин",
+        "заброш",
+        "разруш",
         "village",
         "town",
         "hamlet",
         "settlement",
         "district",
         "compound",
+        "ruin",
+        "abandoned",
     ];
     let filtered: Vec<&str> = desc
         .split_whitespace()
@@ -113,8 +119,141 @@ fn sanitize_sub_description(desc: &str) -> String {
     filtered.join(" ")
 }
 
-/// Generates a cohesive multi-building village / town district / estate (`<= 96x96`)
-/// with paved street axes, central fountain/well plaza, streetlights, shops/houses, and perimeter walling.
+fn district_role_pool(style: BuildStyle) -> &'static [(BuildCategory, &'static str)] {
+    match style {
+        BuildStyle::Classical => &[
+            (BuildCategory::House, "торжественная ратуша с колоннами"),
+            (BuildCategory::Temple, "античный малый храм колоннада"),
+            (BuildCategory::Pavilion, "оперный павильон с портиком"),
+            (BuildCategory::House, "мраморный банк с арками"),
+            (BuildCategory::House, "музей античная библиотека с балконом"),
+            (BuildCategory::Pavilion, "базар торговая площадь с навесами"),
+            (BuildCategory::Forge, "ремесленная мастерская с горном"),
+            (BuildCategory::House, "особняк с садом и галереей"),
+        ],
+        BuildStyle::Japanese => &[
+            (BuildCategory::House, "чайный дом с террасой энгава"),
+            (BuildCategory::Temple, "святилище пагода с тории"),
+            (BuildCategory::Pavilion, "горячий источник онсэн баня"),
+            (BuildCategory::Tower, "многоярусная деревянная пагода"),
+            (BuildCategory::Forge, "мастерская ремесленника кузница"),
+            (BuildCategory::House, "традиционный дом самурая с садом"),
+            (BuildCategory::Pavilion, "рынок фонарей с цветным навесом"),
+            (BuildCategory::Barn, "деревянный склад с навесом"),
+        ],
+        BuildStyle::Desert => &[
+            (BuildCategory::Pavilion, "восточный базар с цветными шатрами"),
+            (BuildCategory::Temple, "купольный храм минарет"),
+            (BuildCategory::House, "глинобитная касба с террасой"),
+            (BuildCategory::Forge, "оазис мастерская с печью"),
+            (BuildCategory::House, "торговый дом риад с садом"),
+            (BuildCategory::Tower, "дозорная башня с арками"),
+            (BuildCategory::House, "пекарня лавка с навесом"),
+            (BuildCategory::Barn, "караван сарай склад"),
+        ],
+        _ => &[
+            (BuildCategory::House, "таверна с крыльцом и камином"),
+            (BuildCategory::Forge, "кузница с горном и наковальней"),
+            (BuildCategory::House, "уютная пекарня лавка с навесом"),
+            (BuildCategory::House, "аптека алхимика с оранжереей"),
+            (BuildCategory::Temple, "городской соборный храм с колоколом"),
+            (BuildCategory::Tower, "ветряная мельница с лопастями"),
+            (BuildCategory::House, "двухэтажный особняк с мансардной крышей"),
+            (BuildCategory::Pavilion, "стеклянная теплица оранжерея с цветами"),
+            (BuildCategory::Barn, "фермерский амбар со стогами"),
+            (BuildCategory::Forge, "водяная мельница мастерская с колесом"),
+            (BuildCategory::Tower, "обсерватория с куполом и башней"),
+        ],
+    }
+}
+
+fn find_water_runs(
+    water_depths: Option<&[i32]>,
+    w: i32,
+    d: i32,
+    fixed_coord: i32,
+    along_z: bool,
+    min_len: i32,
+) -> Vec<(i32, i32)> {
+    let Some(wd) = water_depths else {
+        return Vec::new();
+    };
+    let max_i = if along_z { d } else { w };
+    let mut out = Vec::new();
+    let mut run_start: Option<i32> = None;
+    for i in 2..(max_i - 2) {
+        let (x, z) = if along_z { (fixed_coord, i) } else { (i, fixed_coord) };
+        let depth = wd.get((z * w + x) as usize).copied().unwrap_or(0);
+        if depth > 0 {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if let Some(s) = run_start.take()
+            && i - s >= min_len
+        {
+            out.push((s, i - 1));
+        }
+    }
+    if let Some(s) = run_start
+        && (max_i - 2) - s >= min_len
+    {
+        out.push((s, max_i - 3));
+    }
+    out
+}
+
+fn build_town_tree(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    pal: &MaterialPalette,
+    biome_tag: &str,
+    seed: u64,
+    tx: i32,
+    ty: i32,
+    tz: i32,
+    tall: bool,
+) {
+    let (trunk, leaves) = if biome_tag.contains("cherry") {
+        ("minecraft:cherry_log".to_owned(), "minecraft:cherry_leaves".to_owned())
+    } else if biome_tag.contains("taiga") || biome_tag.contains("snow") || biome_tag.contains("frozen") {
+        ("minecraft:spruce_log".to_owned(), "minecraft:spruce_leaves".to_owned())
+    } else if biome_tag.contains("birch") {
+        ("minecraft:birch_log".to_owned(), "minecraft:birch_leaves".to_owned())
+    } else if biome_tag.contains("desert") || biome_tag.contains("savanna") || biome_tag.contains("badlands") {
+        ("minecraft:acacia_log".to_owned(), "minecraft:acacia_leaves".to_owned())
+    } else if biome_tag.contains("dark_forest") || biome_tag.contains("pale_garden") {
+        ("minecraft:dark_oak_log".to_owned(), "minecraft:dark_oak_leaves".to_owned())
+    } else {
+        (
+            pal.pick(MaterialPalette::SLOT_FRAME, seed, tx, ty, tz),
+            pal.pick(MaterialPalette::SLOT_LEAVES, seed, tx, ty, tz),
+        )
+    };
+
+    blocks.insert([tx, ty + 1, tz], PlannedBlock::simple(trunk.clone()));
+    blocks.insert([tx, ty + 2, tz], PlannedBlock::simple(trunk.clone()));
+    if tall {
+        blocks.insert([tx, ty + 3, tz], PlannedBlock::simple(trunk));
+    }
+    let crown_base = if tall { ty + 3 } else { ty + 2 };
+    for dy in 0..=2 {
+        let rad: i32 = if dy == 2 { 0 } else if dy == 1 { 1 } else { 2 };
+        for dz in -rad..=rad {
+            for dx in -rad..=rad {
+                if rad == 2 && dx.abs() == 2 && dz.abs() == 2 {
+                    continue;
+                }
+                let pos = [tx + dx, crown_base + dy, tz + dz];
+                if blocks.get(&pos).is_none_or(|b| b.block_id == "minecraft:air") {
+                    blocks.insert(pos, make_leaves(&leaves));
+                }
+            }
+        }
+    }
+}
+
+/// Generates a multi-district town / walled city / village (`<= 96x96`) with secondary ring avenues,
+/// smooth sloped streets, automatic bridges over natural rivers, corner bastions & gatehouses,
+/// up to 8 oriented building lots, pocket gardens, and lakeside mooring piers.
 pub fn generate_settlement(
     req: &BuildRequest,
     spec: BlueprintSpec,
@@ -133,23 +272,73 @@ pub fn generate_settlement(
     let cx = w / 2;
     let cz = d / 2;
     let is_floating = spec.theme == crate::parser::StructureTheme::FloatingVillage;
+    let lower_desc = req.description.to_lowercase();
+    let wants_plaza_fountain = lower_desc.contains("площад")
+        || lower_desc.contains("фонтан")
+        || lower_desc.contains("fountain");
     let town_mode = if is_floating {
-        4 // 4 = Floating Stilt Canal City / Venetian Water Quarter
+        4 // Floating Stilt Canal City
+    } else if wants_plaza_fountain
+        && !lower_desc.contains("канал")
+        && !lower_desc.contains("рынок")
+        && !lower_desc.contains("базар")
+    {
+        0
     } else if w >= 32 && d >= 32 {
-        rng.range_i32(0, 3) // 0=fountain crossroads, 1=canal + arched stone bridge, 2=landmark clocktower/arch plaza, 3=bazaar boulevard
+        rng.range_i32(0, 3) // 0=fountain crossroads, 1=canal+bridge, 2=monument/obelisk/clocktower, 3=bazaar plaza
     } else {
         0
     };
-    let plaza_r = if w >= 52 && d >= 52 { 4 } else if w >= 29 && d >= 29 { 3 } else { 2 };
+    let fortified_walls = !is_floating
+        && w >= 36
+        && d >= 36
+        && (matches!(
+            spec.style,
+            BuildStyle::Medieval
+                | BuildStyle::Gothic
+                | BuildStyle::Classical
+                | BuildStyle::Steampunk
+                | BuildStyle::Desert
+                | BuildStyle::Japanese
+        ) || lower_desc.contains("стена")
+            || lower_desc.contains("крепост")
+            || lower_desc.contains("walled")
+            || lower_desc.contains("fortified")
+            || lower_desc.contains("город"));
+
+    let plaza_r = if w >= 52 && d >= 52 {
+        4
+    } else if w >= 29 && d >= 29 {
+        3
+    } else {
+        2
+    };
     let road_half = if w >= 48 && d >= 48 { 2 } else { 1 };
+    let wall_margin = if fortified_walls { 3 } else if w >= 32 && d >= 32 { 2 } else { 1 };
+
+    // Secondary ring/district avenues on larger settlements (`>= 56x56`).
+    let ring_xs: Vec<i32> = if !is_floating && w >= 60 {
+        vec![(wall_margin + cx - plaza_r) / 2, (cx + plaza_r + w - wall_margin) / 2]
+    } else {
+        Vec::new()
+    };
+    let ring_zs: Vec<i32> = if !is_floating && d >= 60 {
+        vec![(wall_margin + cz - plaza_r) / 2, (cz + plaza_r + d - wall_margin) / 2]
+    } else {
+        Vec::new()
+    };
 
     let mut is_road = vec![false; (w * d) as usize];
     let mut is_plaza = vec![false; (w * d) as usize];
     let mut is_canal = vec![false; (w * d) as usize];
+    let mut is_nat_bridge_road = vec![false; (w * d) as usize];
+
     for lz in 1..(d - 1) {
         for lx in 1..(w - 1) {
             let on_main_x = (lx - cx).abs() <= road_half;
             let on_main_z = (lz - cz).abs() <= road_half;
+            let on_sec_x = ring_xs.iter().any(|&rx| (lx - rx).abs() <= 1);
+            let on_sec_z = ring_zs.iter().any(|&rz| (lz - rz).abs() <= 1);
             let in_plaza = (lx - cx).abs() <= plaza_r && (lz - cz).abs() <= plaza_r;
             if is_floating && (lz - cz).abs() > road_half && (lx - cx).abs() > road_half {
                 is_canal[(lz * w + lx) as usize] = true;
@@ -158,8 +347,82 @@ pub fn generate_settlement(
             } else if in_plaza {
                 is_plaza[(lz * w + lx) as usize] = true;
                 is_road[(lz * w + lx) as usize] = true;
-            } else if on_main_x || on_main_z {
+            } else if on_main_x || on_main_z || on_sec_x || on_sec_z {
                 is_road[(lz * w + lx) as usize] = true;
+            }
+        }
+    }
+
+    // Detect contiguous natural water crossings along main road axes so bridges span rivers instead of burying them.
+    let mut water_bridges: Vec<(bool, i32, i32, i32)> = Vec::new(); // (along_z, fixed_coord, start, end)
+    if !is_floating && town_mode != 1 {
+        for (s, e) in find_water_runs(water_depths, w, d, cx, true, 3) {
+            for z in s..=e {
+                for dx in -road_half..=road_half {
+                    let x = cx + dx;
+                    if (1..(w - 1)).contains(&x) && (z - cz).abs() > plaza_r {
+                        is_nat_bridge_road[(z * w + x) as usize] = true;
+                    }
+                }
+            }
+            if (s - cz).abs() > plaza_r && (e - cz).abs() > plaza_r {
+                water_bridges.push((true, cx, s, e));
+            }
+        }
+        for (s, e) in find_water_runs(water_depths, w, d, cz, false, 3) {
+            for x in s..=e {
+                for dz in -road_half..=road_half {
+                    let z = cz + dz;
+                    if (1..(d - 1)).contains(&z) && (x - cx).abs() > plaza_r {
+                        is_nat_bridge_road[(z * w + x) as usize] = true;
+                    }
+                }
+            }
+            if (s - cx).abs() > plaza_r && (e - cx).abs() > plaza_r {
+                water_bridges.push((false, cz, s, e));
+            }
+        }
+    }
+
+    // Compute and relax smooth road heights so slopes never step sharply (>1 vertical block per step).
+    let mut road_y_grid = vec![0i32; (w * d) as usize];
+    for lz in 0..d {
+        for lx in 0..w {
+            let idx = (lz * w + lx) as usize;
+            if is_floating {
+                road_y_grid[idx] = 1;
+            } else if is_road[idx] {
+                let wd = terrain_at_wxz(water_depths, w, lx, lz);
+                let sy = if req.adapt_terrain {
+                    terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 4)
+                } else {
+                    0
+                };
+                road_y_grid[idx] = if wd > 0 { 1 } else { sy };
+            }
+        }
+    }
+    if !is_floating && req.adapt_terrain {
+        for _pass in 0..3 {
+            let prev = road_y_grid.clone();
+            for lz in 1..(d - 1) {
+                for lx in 1..(w - 1) {
+                    let idx = (lz * w + lx) as usize;
+                    if !is_road[idx] || is_plaza[idx] || is_nat_bridge_road[idx] {
+                        continue;
+                    }
+                    let mut sum = prev[idx] * 2;
+                    let mut cnt = 2;
+                    for (nx, nz) in [(lx + 1, lz), (lx - 1, lz), (lx, lz + 1), (lx, lz - 1)] {
+                        let nidx = (nz * w + nx) as usize;
+                        if is_road[nidx] {
+                            sum += prev[nidx];
+                            cnt += 1;
+                        }
+                    }
+                    let avg = (sum as f64 / cnt as f64).round() as i32;
+                    road_y_grid[idx] = avg.clamp(prev[idx] - 1, prev[idx] + 1);
+                }
             }
         }
     }
@@ -181,24 +444,22 @@ pub fn generate_settlement(
                 }
                 continue;
             }
-            if !is_road[idx] {
+            if !is_road[idx] || is_nat_bridge_road[idx] {
                 continue;
             }
             let surf_y = if req.adapt_terrain {
-                terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
+                terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 4)
             } else {
                 0
             };
             let wd = terrain_at_wxz(water_depths, w, lx, lz);
             let h = noise.cell_hash(lx, 0, lz);
-            let is_border = (lx - cx).abs() == road_half || (lz - cz).abs() == road_half;
-            let road_y = if is_floating {
-                1
-            } else if wd > 0 {
-                1
-            } else {
-                surf_y
-            };
+            let is_border = (lx - cx).abs() == road_half
+                || (lz - cz).abs() == road_half
+                || ring_xs.iter().any(|&rx| (lx - rx).abs() == 1)
+                || ring_zs.iter().any(|&rz| (lz - rz).abs() == 1);
+            let road_y = road_y_grid[idx];
+
             if is_floating {
                 let bed_y = (surf_y - wd).clamp(-10, 0) - 1;
                 blocks.insert(
@@ -236,7 +497,10 @@ pub fn generate_settlement(
                         );
                     }
                 }
-                blocks.insert([lx, road_y, lz], pave_block_for_style(spec.style, pal, seed, lx, road_y, lz, h, is_border));
+                blocks.insert(
+                    [lx, road_y, lz],
+                    pave_block_for_style(spec.style, pal, seed, lx, road_y, lz, h, is_border),
+                );
             }
             for cy in (road_y + 1)..=(road_y + 5) {
                 blocks.insert([lx, cy, lz], PlannedBlock::simple("minecraft:air"));
@@ -244,7 +508,66 @@ pub fn generate_settlement(
         }
     }
 
-    // Central Town Plaza Monument: Canal Stone Bridge (mode 1), Monumental Pillar (mode 2), Market Kiosk (mode 3), Floating Pier Plaza (mode 4), or Fountain/Well!
+    // Place arched bridges across natural water channels intersected by avenues!
+    for (bi, &(along_z, fixed_coord, s, e)) in water_bridges.iter().enumerate() {
+        let span_len = ((e - s + 5) as u16).clamp(9, 32);
+        let bw = ((road_half * 2) + 3).clamp(7, 11) as u16;
+        let bridge_desc = match spec.style {
+            BuildStyle::Japanese => "японский горбатый лунный мост",
+            BuildStyle::Cottage | BuildStyle::Nordic => "деревянный крытый мост",
+            _ => "арочный каменный мост",
+        };
+        let (rw, rd, facing) = if along_z {
+            (bw, span_len, CardinalFacing::South)
+        } else {
+            (span_len, bw, CardinalFacing::East)
+        };
+        let bridge_req = BuildRequest {
+            dimension: req.dimension.clone(),
+            origin_x: 0,
+            origin_y: 0,
+            origin_z: 0,
+            width: rw,
+            depth: rd,
+            height: height.clamp(9, 14),
+            category: BuildCategory::Bridge,
+            style: spec.style,
+            facing,
+            noise_level: req.noise_level,
+            seed: (req.seed as u64 ^ (0xA91E_5500 + bi as u64)).cast_signed(),
+            description: bridge_desc.into(),
+            adapt_terrain: false,
+            air_only: req.air_only,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            biome_hint: req.biome_hint.clone(),
+            palette: pal.clone(),
+        };
+        let bbp = crate::generator::generate_blueprint_with_water(&bridge_req, None, None);
+        let mid = (s + e) / 2;
+        let bx0 = if along_z {
+            fixed_coord - i32::from(rw) / 2
+        } else {
+            mid - i32::from(rw) / 2
+        };
+        let bz0 = if along_z {
+            mid - i32::from(rd) / 2
+        } else {
+            fixed_coord - i32::from(rd) / 2
+        };
+        for ([bx, by, bz], blk) in bbp.blocks {
+            if blk.block_id == "minecraft:air" && by <= 0 {
+                continue;
+            }
+            let wx = bx0 + bx;
+            let wz = bz0 + bz;
+            if (1..(w - 1)).contains(&wx) && (1..(d - 1)).contains(&wz) {
+                blocks.insert([wx, by - 1, wz], blk);
+            }
+        }
+    }
+
+    // Central Town Plaza Monument: Canal Stone Bridge (mode 1), Monumental Pillar (mode 2), Market Kiosk (mode 3), or Fountain/Well!
     let plaza_y = if is_floating {
         1
     } else if req.adapt_terrain {
@@ -253,7 +576,6 @@ pub fn generate_settlement(
         0
     };
     if town_mode == 1 {
-        // Canal embankment kerbs + central arched stone footbridge at `(cx, cz)`.
         for lx in 1..(w - 1) {
             if (lx - cx).abs() <= road_half + 1 {
                 continue;
@@ -279,6 +601,9 @@ pub fn generate_settlement(
             description: "арочный каменный мост через канал".into(),
             adapt_terrain: req.adapt_terrain,
             air_only: req.air_only,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
         };
         let bridge_bp = crate::generator::generate_blueprint_with_water(&bridge_req, None, None);
@@ -292,7 +617,6 @@ pub fn generate_settlement(
             }
         }
     } else if town_mode == 2 {
-        // Monumental Central Clock / Obelisk Statue Spire towering over plaza!
         let tower_h = height.clamp(11, 18);
         let mon_desc = if spec.style == BuildStyle::Classical || spec.style == BuildStyle::Desert {
             "монументальный обелиск с аркой и золотом"
@@ -315,6 +639,9 @@ pub fn generate_settlement(
             description: mon_desc.into(),
             adapt_terrain: false,
             air_only: false,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
         };
         let mon_bp = crate::generator::generate_blueprint_with_water(&mon_req, None, None);
@@ -330,8 +657,12 @@ pub fn generate_settlement(
             }
         }
     } else if town_mode == 3 {
-        // Open-air Festive Market Stalls framing the central avenue!
-        let tent_colors = ["minecraft:red_wool", "minecraft:yellow_wool", "minecraft:blue_wool", "minecraft:white_wool"];
+        let tent_colors = [
+            "minecraft:red_wool",
+            "minecraft:yellow_wool",
+            "minecraft:blue_wool",
+            "minecraft:white_wool",
+        ];
         for (idx, &(sx, sz)) in [
             (cx - plaza_r + 1, cz - plaza_r + 1),
             (cx + plaza_r - 1, cz - plaza_r + 1),
@@ -405,72 +736,76 @@ pub fn generate_settlement(
         }
     }
 
-    // Build varied quadrant sub-lots facing the main avenues according to seed.
+    // Build X & Z zone bands bounded by perimeter wall margin, main streets, and secondary ring avenues.
     let gap = road_half + 2;
-    let margin = if w >= 32 && d >= 32 { 2 } else { 1 };
-    let nw_w = (cx - gap - margin).max(0);
-    let ne_w = ((w - margin) - (cx + gap)).max(0);
-    let n_d = (cz - gap - margin).max(0);
-    let s_d = ((d - margin) - (cz + gap)).max(0);
+    let mut x_bands: Vec<(i32, i32, bool)> = Vec::new(); // (start, end_excl, face_east_preferred)
+    if let Some((&lx_w, &lx_e)) = ring_xs.first().zip(ring_xs.get(1)) {
+        x_bands.push((wall_margin, lx_w - 2, true));
+        x_bands.push((lx_w + 3, cx - gap, true));
+        x_bands.push((cx + gap, lx_e - 2, false));
+        x_bands.push((lx_e + 3, w - wall_margin, false));
+    } else {
+        x_bands.push((wall_margin, cx - gap, true));
+        x_bands.push((cx + gap, w - wall_margin, false));
+    }
+    let mut z_bands: Vec<(i32, i32, CardinalFacing)> = Vec::new();
+    if let Some((&lz_n, &lz_s)) = ring_zs.first().zip(ring_zs.get(1)) {
+        z_bands.push((wall_margin, lz_n - 2, CardinalFacing::South));
+        z_bands.push((lz_n + 3, cz - gap, CardinalFacing::South));
+        z_bands.push((cz + gap, lz_s - 2, CardinalFacing::North));
+        z_bands.push((lz_s + 3, d - wall_margin, CardinalFacing::North));
+    } else {
+        z_bands.push((wall_margin, cz - gap, CardinalFacing::South));
+        z_bands.push((cz + gap, d - wall_margin, CardinalFacing::North));
+    }
 
-    let lot_roll = rng.range_i32(0, 2);
-    let lot_specs = match lot_roll {
-        1 => [
-            (margin, margin, nw_w, n_d, CardinalFacing::South, BuildCategory::Tower, "ветряная мельница с лопастями"),
-            (cx + gap, margin, ne_w, n_d, CardinalFacing::South, BuildCategory::Pavilion, "стеклянная теплица с цветами"),
-            (margin, cz + gap, nw_w, s_d, CardinalFacing::North, BuildCategory::House, "таверна с крыльцом и садом"),
-            (cx + gap, cz + gap, ne_w, s_d, CardinalFacing::North, BuildCategory::House, "двухэтажный особняк с мансардной крышей"),
-        ],
-        2 => [
-            (margin, margin, nw_w, n_d, CardinalFacing::South, BuildCategory::Temple, "соборный храм с колоколом и витражами"),
-            (cx + gap, margin, ne_w, n_d, CardinalFacing::South, BuildCategory::House, "библиотека архив с балконом"),
-            (margin, cz + gap, nw_w, s_d, CardinalFacing::North, BuildCategory::Forge, "водяная мельница мастерская с колесом"),
-            (cx + gap, cz + gap, ne_w, s_d, CardinalFacing::North, BuildCategory::Pavilion, "восточный базар ярмарка с навесами"),
-        ],
-        _ => [
-            (margin, margin, nw_w, n_d, CardinalFacing::South, BuildCategory::House, "таверна с крыльцом и садом"),
-            (cx + gap, margin, ne_w, n_d, CardinalFacing::South, BuildCategory::Forge, "кузница с горном и наковальней"),
-            (margin, cz + gap, nw_w, s_d, CardinalFacing::North, BuildCategory::House, "уютный двухэтажный дом с балконом"),
-            (
-                cx + gap,
-                cz + gap,
-                ne_w,
-                s_d,
-                CardinalFacing::North,
-                match spec.style {
-                    BuildStyle::Gothic | BuildStyle::Steampunk | BuildStyle::Nordic => BuildCategory::Tower,
-                    BuildStyle::Classical | BuildStyle::Desert => BuildCategory::Temple,
-                    _ => BuildCategory::Barn,
-                },
-                match spec.style {
-                    BuildStyle::Gothic | BuildStyle::Steampunk | BuildStyle::Nordic => "обсерватория с куполом и башней",
-                    BuildStyle::Classical | BuildStyle::Desert => "малый храм колоннада",
-                    _ => "фермерский амбар со стогами",
-                },
-            ),
-        ],
-    };
-
+    let pool = district_role_pool(spec.style);
+    let lot_offset = rng.range_i32(0, pool.len() as i32 - 1) as usize;
     let mut lots = Vec::new();
-    for (x0, z0, raw_w, raw_d, facing, cat, desc) in lot_specs {
-        if raw_w >= 9 && raw_d >= 9 {
-            let cap_w = raw_w.min(21) as u16;
-            let cap_d = raw_d.min(19) as u16;
-            let off_x = (raw_w - i32::from(cap_w)) / 2;
-            let off_z = (raw_d - i32::from(cap_d)) / 2;
-            lots.push(LotPlan {
-                x0: x0 + off_x,
-                z0: z0 + off_z,
-                w: cap_w,
-                d: cap_d,
-                facing,
-                cat,
-                desc,
-            });
+    let mut small_pockets: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut role_cursor = 0usize;
+
+    for (zi, &(z0, z1, facing_z)) in z_bands.iter().enumerate() {
+        let raw_d = z1 - z0;
+        if raw_d < 5 {
+            continue;
+        }
+        for (xi, &(x0, x1, _east)) in x_bands.iter().enumerate() {
+            let raw_w = x1 - x0;
+            if raw_w < 5 {
+                continue;
+            }
+            let intentional_park = z_bands.len() >= 4
+                && x_bands.len() >= 4
+                && ((xi == 0 && zi == 1) || (xi == 3 && zi == 2));
+            if !intentional_park && raw_w >= 9 && raw_d >= 9 && lots.len() < 12 {
+                let cap_w = raw_w.min(21) as u16;
+                let cap_d = raw_d.min(19) as u16;
+                let off_x = (raw_w - i32::from(cap_w)) / 2;
+                let off_z = (raw_d - i32::from(cap_d)) / 2;
+                let (cat, desc) = pool[(lot_offset + role_cursor) % pool.len()];
+                role_cursor += 1;
+                let facing = if (xi + zi) % 4 == 3 && raw_w >= 11 && raw_d >= 11 {
+                    if x0 < cx { CardinalFacing::East } else { CardinalFacing::West }
+                } else {
+                    facing_z
+                };
+                lots.push(LotPlan {
+                    x0: x0 + off_x,
+                    z0: z0 + off_z,
+                    w: cap_w,
+                    d: cap_d,
+                    facing,
+                    cat,
+                    desc,
+                });
+            } else {
+                small_pockets.push((x0, z0, raw_w, raw_d));
+            }
         }
     }
 
-    // Guarantee at least one cozy cottage/house even on small plot tests (e.g., 19x19 or 13x11).
+    // Guarantee at least one cozy house even on small plot tests (e.g., 19x19 or 13x11).
     if lots.is_empty() && w >= 11 && d >= 11 {
         let sw = ((w - 4).clamp(7, 13)) as u16;
         let sd = ((d - 4).clamp(7, 11)) as u16;
@@ -488,16 +823,17 @@ pub fn generate_settlement(
     for (li, lot) in lots.iter().enumerate() {
         let lw = i32::from(lot.w);
         let ld = i32::from(lot.d);
-        let door_edge_x = lot.x0 + lw / 2;
-        let door_edge_z = match lot.facing {
-            CardinalFacing::South => lot.z0 + ld - 1,
-            CardinalFacing::North => lot.z0,
-            _ => lot.z0 + ld / 2,
+        let (door_edge_x, door_edge_z) = match lot.facing {
+            CardinalFacing::South => (lot.x0 + lw / 2, lot.z0 + ld - 1),
+            CardinalFacing::North => (lot.x0 + lw / 2, lot.z0),
+            CardinalFacing::East => (lot.x0 + lw - 1, lot.z0 + ld / 2),
+            CardinalFacing::West => (lot.x0, lot.z0 + ld / 2),
         };
         let lot_base_y = if is_floating {
             0
         } else if req.adapt_terrain {
-            terrain_at_wxz(terrain_offsets, w, door_edge_x, door_edge_z).clamp(-4, 4)
+            terrain_at_wxz(terrain_offsets, w, door_edge_x.clamp(0, w - 1), door_edge_z.clamp(0, d - 1))
+                .clamp(-4, 4)
         } else {
             0
         };
@@ -538,6 +874,9 @@ pub fn generate_settlement(
             description: full_desc,
             adapt_terrain: req.adapt_terrain,
             air_only: req.air_only,
+            wear_pct: 0,
+            overgrowth_pct: 0,
+            biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
         };
         let sub_bp = crate::generator::generate_blueprint_with_water(
@@ -558,37 +897,100 @@ pub fn generate_settlement(
             }
         }
 
-        // Link house entrance cleanly to main street with cobblestone/dirt path (or timber pier walkway on water).
+        // Link building entrance cleanly to nearest street along facing axis.
         if let Some([dlx, _, dlz]) = sub_bp.door_pos {
             let dx = lot.x0 + dlx;
             let dz = lot.z0 + dlz;
-            let (step_z, lim_z) = if dz < cz { (1, cz) } else { (-1, cz) };
-            let mut cur_z = dz + step_z;
-            while (0..d).contains(&cur_z) && cur_z != lim_z && !is_road[(cur_z * w + dx) as usize] {
+            let (sx_step, sz_step) = match lot.facing {
+                CardinalFacing::South => (0, 1),
+                CardinalFacing::North => (0, -1),
+                CardinalFacing::East => (1, 0),
+                CardinalFacing::West => (-1, 0),
+            };
+            let mut px = dx + sx_step;
+            let mut pz = dz + sz_step;
+            let mut steps = 0;
+            while (1..(w - 1)).contains(&px)
+                && (1..(d - 1)).contains(&pz)
+                && !is_road[(pz * w + px) as usize]
+                && steps < 18
+            {
                 let sy = if is_floating {
                     1
                 } else if req.adapt_terrain {
-                    terrain_at_wxz(terrain_offsets, w, dx, cur_z).clamp(-4, 3)
+                    terrain_at_wxz(terrain_offsets, w, px, pz).clamp(-4, 3)
                 } else {
                     0
                 };
                 if blocks
-                    .get(&[dx, sy + 1, cur_z])
+                    .get(&[px, sy + 1, pz])
                     .is_none_or(|b| b.block_id == "minecraft:air")
                 {
                     if is_floating {
-                        if cur_z % 2 == 0 {
-                            blocks.insert([dx, 0, cur_z], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, dx, 0, cur_z)));
+                        if steps % 2 == 0 {
+                            blocks.insert([px, 0, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, px, 0, pz)));
                         }
-                        blocks.insert([dx, sy, cur_z], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, dx, sy, cur_z)));
+                        blocks.insert([px, sy, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, px, sy, pz)));
                     } else {
                         blocks.insert(
-                            [dx, sy, cur_z],
-                            pave_block_for_style(spec.style, pal, seed, dx, sy, cur_z, rng.next_f64(), false),
+                            [px, sy, pz],
+                            pave_block_for_style(spec.style, pal, seed, px, sy, pz, rng.next_f64(), false),
                         );
                     }
                 }
-                cur_z += step_z;
+                px += sx_step;
+                pz += sz_step;
+                steps += 1;
+            }
+        }
+    }
+
+    // Pocket green squares / parks, custom biome trees, hay bales & lakeside timber docks.
+    for (pi, &(px0, pz0, pw, pd)) in small_pockets.iter().enumerate() {
+        let tx = px0 + pw / 2;
+        let tz = pz0 + pd / 2;
+        if !(2..(w - 2)).contains(&tx) || !(2..(d - 2)).contains(&tz) {
+            continue;
+        }
+        let wd = terrain_at_wxz(water_depths, w, tx, tz);
+        let sy = if req.adapt_terrain {
+            terrain_at_wxz(terrain_offsets, w, tx, tz).clamp(-4, 4)
+        } else {
+            0
+        };
+        if wd > 0 {
+            // Timber shoreline mooring dock over natural water pocket!
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let wx = tx + dx;
+                    let wz = tz + dz;
+                    if (2..(w - 2)).contains(&wx) && (2..(d - 2)).contains(&wz) {
+                        if dx.abs() == 1 && dz.abs() == 1 {
+                            for fy in (sy - wd).clamp(-8, 0)..=1 {
+                                blocks.insert([wx, fy, wz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, wx, fy, wz)));
+                            }
+                            if dx == -1 && dz == -1 {
+                                blocks.insert([wx, 2, wz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, wx, 2, wz)));
+                                blocks.insert([wx, 3, wz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, wx, 3, wz)));
+                            }
+                        }
+                        blocks.insert([wx, 1, wz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, wx, 1, wz)));
+                    }
+                }
+            }
+        } else if (1..=4).all(|dy| blocks.get(&[tx, sy + dy, tz]).is_none_or(|b| b.block_id == "minecraft:air")) {
+            build_town_tree(&mut blocks, pal, &spec.biome_tag, seed, tx, sy, tz, pi % 2 == 0);
+            if tx + 2 < px0 + pw {
+                blocks.insert(
+                    [tx + 2, sy + 1, tz],
+                    make_stair(
+                        &pal.pick(MaterialPalette::SLOT_STAIR_BLOCK, seed, tx + 2, sy + 1, tz),
+                        "west",
+                        "bottom",
+                    ),
+                );
+                blocks.insert([tx + 2, sy + 1, tz + 1], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, tx + 2, sy + 1, tz + 1)));
+                blocks.insert([tx + 2, sy + 2, tz + 1], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, tx + 2, sy + 2, tz + 1)));
             }
         }
     }
@@ -605,7 +1007,7 @@ pub fn generate_settlement(
             if !(2..(w - 2)).contains(&lx) || !(2..(d - 2)).contains(&lz) {
                 continue;
             }
-            if is_plaza[(lz * w + lx) as usize] {
+            if is_plaza[(lz * w + lx) as usize] || is_road[(lz * w + lx) as usize] {
                 continue;
             }
             if (1..=4).any(|y| blocks.get(&[lx, y, lz]).is_some_and(|b| b.block_id != "minecraft:air")) {
@@ -625,47 +1027,127 @@ pub fn generate_settlement(
         }
     }
 
-    // Perimeter Village Fence / Crenellated Town Wall with Gate Piers at road exits.
+    // Perimeter Fortified Town Ramparts, Corner Bastion Watchtowers & Arched Gatehouses (or Cozy Hedgerows).
     if !is_floating && w >= 25 && d >= 25 {
-        let stone_town_wall = matches!(
-            spec.style,
-            BuildStyle::Gothic | BuildStyle::Classical | BuildStyle::Steampunk
-        );
-        for lz in 0..d {
-            for lx in 0..w {
-                let on_rim = lx == 0 || lx == w - 1 || lz == 0 || lz == d - 1;
-                if !on_rim {
-                    continue;
-                }
-                let in_gate = (lx - cx).abs() <= road_half + 1 || (lz - cz).abs() <= road_half + 1;
-                let is_gate_pier = ((lx - cx).abs() == road_half + 2 && (lz == 0 || lz == d - 1))
-                    || ((lz - cz).abs() == road_half + 2 && (lx == 0 || lx == w - 1));
-                if in_gate && !is_gate_pier {
-                    continue;
-                }
-                let base_y = if req.adapt_terrain {
-                    terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
-                } else {
-                    0
-                };
-                if terrain_at_wxz(water_depths, w, lx, lz) > 0 {
-                    continue;
-                }
-                if is_gate_pier || (lx == 0 || lx == w - 1) && (lz == 0 || lz == d - 1) {
-                    blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));
-                    blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 2, lz)));
-                    blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 3, lz)));
-                } else if stone_town_wall {
-                    blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));
-                    blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 2, lz)));
-                    if (lx + lz) % 2 == 0 {
-                        blocks.insert([lx, base_y + 3, lz], make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, lx, base_y + 3, lz), "bottom"));
+        let gate_axis_x = |lx: i32| {
+            (lx - cx).abs() <= road_half + 1 || ring_xs.iter().any(|&rx| (lx - rx).abs() <= 1)
+        };
+        let gate_axis_z = |lz: i32| {
+            (lz - cz).abs() <= road_half + 1 || ring_zs.iter().any(|&rz| (lz - rz).abs() <= 1)
+        };
+
+        if fortified_walls {
+            // Walkable outer rampart (`0` & `1` rim around N/S/E/W edges) + crenellations + arched road gatehouses!
+            for lz in 0..d {
+                for lx in 0..w {
+                    let dist_edge = lx.min(w - 1 - lx).min(lz).min(d - 1 - lz);
+                    if dist_edge > 1 {
+                        continue;
                     }
-                } else if (lx + lz) % 3 == 0 {
-                    blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 1, lz)));
-                    blocks.insert([lx, base_y + 2, lz], make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, lx, base_y + 2, lz)));
-                } else {
-                    blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lx, base_y + 1, lz)));
+                    if terrain_at_wxz(water_depths, w, lx, lz) > 0 {
+                        continue;
+                    }
+                    let base_y = if req.adapt_terrain {
+                        terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
+                    } else {
+                        0
+                    };
+                    let on_ns_edge = lz <= 1 || lz >= d - 2;
+                    let on_ew_edge = lx <= 1 || lx >= w - 2;
+                    let in_gate_gap = (on_ns_edge && gate_axis_x(lx)) || (on_ew_edge && gate_axis_z(lz));
+                    let is_corner_bastion = (lx <= 2 || lx >= w - 3) && (lz <= 2 || lz >= d - 3);
+
+                    if is_corner_bastion {
+                        for dy in 1..=5 {
+                            let slot = if dy == 1 {
+                                MaterialPalette::SLOT_FOUNDATION
+                            } else if dy <= 4 {
+                                MaterialPalette::SLOT_WALL_UPPER
+                            } else {
+                                MaterialPalette::SLOT_TRIM_WALL
+                            };
+                            blocks.insert([lx, base_y + dy, lz], PlannedBlock::simple(pal.pick(slot, seed, lx, base_y + dy, lz)));
+                        }
+                        if (lx == 0 || lx == w - 1) && (lz == 0 || lz == d - 1) {
+                            blocks.insert([lx, base_y + 6, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 6, lz)));
+                        } else if dist_edge == 0 && (lx + lz) % 2 == 0 {
+                            blocks.insert([lx, base_y + 6, lz], make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, lx, base_y + 6, lz), "bottom"));
+                        }
+                        continue;
+                    }
+
+                    if in_gate_gap {
+                        // Overhead stone/timber gate lintel high above road clearance (`>= 4` blocks).
+                        if dist_edge == 0 {
+                            blocks.insert([lx, base_y + 5, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_BEAM, seed, lx, base_y + 5, lz)));
+                            blocks.insert([lx, base_y + 6, lz], make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, lx, base_y + 6, lz), "bottom"));
+                        }
+                        continue;
+                    }
+
+                    let gate_pier = (on_ns_edge && ((lx - cx).abs() == road_half + 2 || ring_xs.iter().any(|&rx| (lx - rx).abs() == 2)))
+                        || (on_ew_edge && ((lz - cz).abs() == road_half + 2 || ring_zs.iter().any(|&rz| (lz - rz).abs() == 2)));
+
+                    if gate_pier {
+                        for dy in 1..=5 {
+                            blocks.insert([lx, base_y + dy, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, lx, base_y + dy, lz)));
+                        }
+                        if dist_edge == 0 {
+                            blocks.insert([lx, base_y + 6, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 6, lz)));
+                        }
+                    } else if dist_edge == 0 {
+                        // Outer curtain masonry wall + battlement crenels.
+                        blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));
+                        blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 2, lz)));
+                        blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 3, lz)));
+                        if (lx + lz) % 2 == 0 {
+                            blocks.insert([lx, base_y + 4, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 4, lz)));
+                            if (lx + lz) % 8 == 0 {
+                                blocks.insert([lx, base_y + 5, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 5, lz)));
+                            }
+                        } else {
+                            blocks.insert([lx, base_y + 4, lz], make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, lx, base_y + 4, lz), "bottom"));
+                        }
+                    } else {
+                        // Inner rampart sentry walkway at `base_y + 3`.
+                        blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));
+                        blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_BEAM, seed, lx, base_y + 2, lz)));
+                        blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, lx, base_y + 3, lz)));
+                    }
+                }
+            }
+        } else {
+            for lz in 0..d {
+                for lx in 0..w {
+                    let on_rim = lx == 0 || lx == w - 1 || lz == 0 || lz == d - 1;
+                    if !on_rim {
+                        continue;
+                    }
+                    let in_gate = gate_axis_x(lx) && (lz == 0 || lz == d - 1)
+                        || gate_axis_z(lz) && (lx == 0 || lx == w - 1);
+                    let is_gate_pier = ((lx - cx).abs() == road_half + 2 && (lz == 0 || lz == d - 1))
+                        || ((lz - cz).abs() == road_half + 2 && (lx == 0 || lx == w - 1));
+                    if in_gate && !is_gate_pier {
+                        continue;
+                    }
+                    let base_y = if req.adapt_terrain {
+                        terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
+                    } else {
+                        0
+                    };
+                    if terrain_at_wxz(water_depths, w, lx, lz) > 0 {
+                        continue;
+                    }
+                    if is_gate_pier || (lx == 0 || lx == w - 1) && (lz == 0 || lz == d - 1) {
+                        blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));
+                        blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 2, lz)));
+                        blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 3, lz)));
+                    } else if (lx + lz) % 3 == 0 {
+                        blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 1, lz)));
+                        blocks.insert([lx, base_y + 2, lz], make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, lx, base_y + 2, lz)));
+                    } else {
+                        blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lx, base_y + 1, lz)));
+                    }
                 }
             }
         }

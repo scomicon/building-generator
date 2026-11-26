@@ -164,6 +164,9 @@ pub(crate) fn sanitize_build_request(mut req: BuildRequest) -> BuildRequest {
         req.dimension = "minecraft:overworld".into();
     }
     req.description = req.description.chars().take(512).collect();
+    req.biome_hint = req.biome_hint.trim().chars().take(96).collect();
+    req.wear_pct = req.wear_pct.min(100);
+    req.overgrowth_pct = req.overgrowth_pct.min(100);
     req.palette.name = req.palette.name.chars().take(64).collect();
     let max_extra = MaterialPalette::MAX_BLOCKS_PER_SLOT.saturating_sub(1);
     req.palette
@@ -581,7 +584,7 @@ pub fn execute_build(
         return deny_permission_response(lang);
     }
 
-    let req = sanitize_build_request(req);
+    let mut req = sanitize_build_request(req);
     if host.level(&req.dimension).is_none() {
         return BuildResponse {
             ok: false,
@@ -591,6 +594,25 @@ pub fn execute_build(
                 UiLang::Ru => format!("Неизвестное измерение: {}", req.dimension),
             },
         };
+    }
+
+    if req.biome_hint.is_empty() && req.style == crate::model::BuildStyle::Auto {
+        let cx = req.origin_x + i32::from(req.width) / 2;
+        let cz = req.origin_z + i32::from(req.depth) / 2;
+        let sampled = sample_biome_at(host, &req.dimension, cx, req.origin_y, cz);
+        if !sampled.is_empty() {
+            req.biome_hint = sampled;
+            if req.palette == MaterialPalette::preset(0)
+                && !crate::parser::description_names_explicit_material(&req.description)
+            {
+                req.palette = crate::parser::infer_palette_with_biome(
+                    req.style,
+                    &req.description,
+                    req.seed as u64,
+                    &req.biome_hint,
+                );
+            }
+        }
     }
 
     let (terrain_offsets, water_depths) = sample_terrain_info(host, &req);
@@ -1170,6 +1192,35 @@ pub fn handle_lang_payload(req: SetLangRequest, cx: &mut dyn IPayloadContext) ->
     Ok(())
 }
 
+pub(crate) fn sample_biome_at(host: &dyn ServerHost, dimension: &str, x: i32, y: i32, z: i32) -> String {
+    let Some(level) = host.level(dimension) else {
+        return String::new();
+    };
+    level.biome_at(host, [x, y, z]).unwrap_or_default()
+}
+
+pub fn handle_biome_payload(
+    req: crate::model::BiomeQueryRequest,
+    cx: &mut dyn IPayloadContext,
+) -> Result<(), String> {
+    let _player = cx.player().map_err(|e| format!("{e:?}"))?;
+    let dim = if req.dimension.trim().is_empty() || req.dimension.chars().count() > 128 {
+        "minecraft:overworld".to_owned()
+    } else {
+        req.dimension
+    };
+    let biome = {
+        let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
+        sample_biome_at(host, &dim, req.x, req.y, req.z)
+    };
+    if let Some(ch) = channels() {
+        let _ = ch
+            .to_client_biome
+            .reply(cx, &crate::model::BiomeQueryResponse { biome });
+    }
+    Ok(())
+}
+
 pub const CLI_PRESETS: &[(&str, BuildCategory, crate::model::BuildStyle, u16, u16, u16, &str)] = &[
     ("teahouse", BuildCategory::House, crate::model::BuildStyle::Japanese, 19, 17, 16, "японский двухэтажный чайный дом с террасой, лавкой, полосатым навесом и фонарями"),
     ("tavern", BuildCategory::House, crate::model::BuildStyle::Medieval, 19, 17, 16, "средневековая двухэтажная таверна с камином и подвалом"),
@@ -1397,7 +1448,14 @@ fn spawn_command_build(
     let salt = ((origin[0] as i64).wrapping_mul(0x9E37_79B9)
         ^ (origin[2] as i64).wrapping_mul(0x517C_C1B7)) as u64;
     let seed = crate::noise::fresh_entropy(seq, salt) as i64;
-    let palette = crate::parser::infer_palette_with_style_and_seed(style, &desc, seed as u64);
+    let biome_hint = sample_biome_at(
+        host,
+        &dim,
+        origin[0] + i32::from(w / 2),
+        origin[1],
+        origin[2] + i32::from(d / 2),
+    );
+    let palette = crate::parser::infer_palette_with_biome(style, &desc, seed as u64, &biome_hint);
 
     let req = BuildRequest {
         dimension: dim,
@@ -1415,6 +1473,9 @@ fn spawn_command_build(
         description: desc,
         adapt_terrain: true,
         air_only: false,
+        wear_pct: 0,
+        overgrowth_pct: 0,
+        biome_hint,
         palette,
     };
     execute_build(host, player_opt, req)
