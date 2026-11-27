@@ -412,6 +412,7 @@ struct PreviewKey {
 struct ClientUiState {
     lang: UiLang,
     lang_loaded: bool,
+    was_playing: bool,
     pending_save_lang: bool,
     pending_send_lang: Option<UiLang>,
     tab: UiTab,
@@ -504,6 +505,7 @@ impl Default for ClientUiState {
         Self {
             lang: UiLang::En,
             lang_loaded: false,
+            was_playing: false,
             pending_save_lang: false,
             pending_send_lang: None,
             tab: UiTab::SizeArea,
@@ -720,6 +722,13 @@ pub fn on_server_response(resp: BuildResponse) {
             if let Some(parsed) = UiLang::parse(code) {
                 apply_ui_lang(st, parsed, false);
             }
+        } else if let Some(rest) = resp.message.strip_prefix("__HISTORY__:") {
+            let mut parts = rest.splitn(2, ':');
+            let u = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let r = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            st.undo_count = u;
+            st.redo_count = r;
+            st.dirty = true;
         } else if let Some(rest) = resp.message.strip_prefix("__PROGRESS__:") {
             let mut parts = rest.splitn(4, ':');
             let pct = parts.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
@@ -3454,6 +3463,19 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
             });
         }
 
+        // Reset stale counters and ask the server to load persisted world Undo/Redo history on world entry.
+        with_state(|st| {
+            if !st.was_playing {
+                st.was_playing = true;
+                st.undo_count = 0;
+                st.redo_count = 0;
+                if st.pending_send_lang.is_none() {
+                    st.pending_send_lang = Some(st.lang);
+                }
+                st.dirty = true;
+            }
+        });
+
         let save_lang = with_state(|st| {
             if st.pending_save_lang {
                 st.pending_save_lang = false;
@@ -3569,6 +3591,26 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
         {
             let _ = ch.to_server_biome.send(host, &bq);
         }
+    } else {
+        with_state(|st| {
+            if st.was_playing {
+                st.was_playing = false;
+                st.undo_count = 0;
+                st.redo_count = 0;
+                st.pending_send_lang = None;
+                st.terrain_cache_key = None;
+                st.cached_terrain_offsets = None;
+                st.cached_water_depths = None;
+                st.bp_cache_key = None;
+                st.cached_bp = None;
+                st.world_mask_key = None;
+                st.world_blocks.clear();
+                st.detected_biome.clear();
+                st.last_biome_query = None;
+                st.build_progress = None;
+                st.dirty = true;
+            }
+        });
     }
 
     let pending = with_state(|st| {

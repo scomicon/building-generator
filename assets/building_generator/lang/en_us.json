@@ -1,4 +1,4 @@
 {
   "mod.building_generator.name": "Building Generator",
-  "mod.building_generator.description": "Bilingual (EN/RU) procedural architecture mod with live 3D hologram preview, collision highlights, [H] frame toggle & in-world 3D move, curated container loot, Settlement 2.0, Biome Auto-Style, Wear/Moss sliders, BOM, air-only mode, undo/redo, and OP security"
+  "mod.building_generator.description": "Bilingual (EN/RU) procedural architecture mod with live 3D hologram preview, collision highlights, [H] frame toggle & Move 3D, multi-level Dungeons & Mineshafts, Estate Compounds, persistent disk Undo/Redo, curated container loot, Settlement 2.0, Biome Auto-Style, Wear/Moss sliders, BOM, air-only mode, and OP security"
 }

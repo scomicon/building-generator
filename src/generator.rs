@@ -282,7 +282,7 @@ fn build_footprint(
             let b = compute_tight_bounds(grid, &fp);
             return (fp, b);
         }
-        BuildCategory::Bridge | BuildCategory::Settlement => {
+        BuildCategory::Bridge | BuildCategory::Settlement | BuildCategory::Dungeon | BuildCategory::Estate => {
             fill_rect(&mut fp, grid, 0, 0, grid.w - 1, grid.d - 1, true);
             return (fp, [0, 0, grid.w - 1, grid.d - 1]);
         }
@@ -2262,7 +2262,24 @@ pub fn generate_blueprint_with_water(
     );
     let noise = NoiseField::new(req.seed as u64);
 
-    let mut bp = if spec.theme == StructureTheme::Colosseum {
+    let mut bp = if spec.category == BuildCategory::Dungeon {
+        crate::gen_dungeon_estate::generate_dungeon_complex(
+            req,
+            spec,
+            grid,
+            height,
+            noise,
+            terrain_offsets,
+        )
+    } else if spec.category == BuildCategory::Estate {
+        crate::gen_dungeon_estate::generate_estate_compound(
+            req,
+            spec,
+            noise,
+            terrain_offsets,
+            water_depths,
+        )
+    } else if spec.theme == StructureTheme::Colosseum {
         generate_colosseum(req, spec, grid, height, noise, terrain_offsets)
     } else if let Some(landmark) = crate::gen_landmarks::try_generate_landmark(
         req,

@@ -2,7 +2,7 @@
 
 **Building Generator** (`building_generator`) is an MIT-licensed bilingual (**English / Russian**) procedural architecture native mod for **Horizon** (Minecraft: Java Edition `26.3`, Horizon Native Mod API `0.2`).
 
-Generate detailed multi-room buildings, monuments, bridges, airship docks, castles, temples, and **Settlement 2.0** multi-district cities from English or Russian text prompts, world biomes, noise seeds, or the 72-structure catalog — complete with an interactive `F8` GUI featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), **live translucent bluish 3D hologram preview in the world before placement**, **Biome Auto-Style**, **0–100% Wear/Ruin & Overgrowth**, **Material Estimate (BOM)**, **Air Only** placement filter, 30-slot block lists, two-phase construction, **5-step Undo/Redo**, and **server OP security**.
+Generate detailed multi-room buildings, monuments, bridges, airship docks, castles, temples, **Multi-Level Dungeons & Mineshafts**, **Estate & Farm Compounds**, and **Settlement 2.0** multi-district cities from English or Russian text prompts, world biomes, noise seeds, or the 76-structure catalog — complete with an interactive `F8` GUI featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), **live translucent bluish 3D hologram preview in the world before placement**, **Biome Auto-Style**, **0–100% Wear/Ruin & Overgrowth**, **Material Estimate (BOM)**, **Air Only** placement filter, 30-slot block lists, two-phase construction, **world-saved persistent 5-step Undo/Redo**, and **server OP security**.
 
 ---
 
@@ -12,8 +12,10 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
   - Starts in **English** by default; click the **`Lang: EN` / `Язык: RU`** button in the top header bar (or run `/buildgen lang <en|ru>`) at any time to switch the entire GUI, catalog, material slots, BOM estimate, HUD overlays, BossBar progress, and chat feedback between English and Russian.
   - Selected language persists locally in `.horizon-mod-data/building_generator/lang.txt`.
   - Prompt parser, Preset Catalog search, and Material Block search accept both English and Russian queries simultaneously.
-- **61 Architectural Themes & 72 Built-in Presets:**
-  - **Houses, Taverns, Estates & Civic:** tea houses, medieval taverns, French mansards, modern villas, treehouses, libraries, apothecaries, bakeries/wineries, town halls, opera houses, museums, marble banks/vaults, magical academies.
+- **61 Architectural Themes & 76 Built-in Presets (across 11 Categories):**
+  - **Multi-Level Subterranean Dungeons & Mineshafts (`Dungeon`, `dungeon` / `mine` presets):** Carves 1–3 branching underground vaults (`y = -18..surface`) connected by walkable switchback stairs (`>= 3`-block headroom), surface ruined/crypt gatehouse entrances, corner armories/libraries/alchemy vaults with chests & barrels, Dwarven lava foundry sanctums, or abandoned timbered mineshafts with minecart rails and ore veins.
+  - **Rural Estate & Farm Compounds (`Estate`, `estate` / `vineyard_estate` presets):** Fenced countryside manor homesteads combining a procedural Manor House, Timber Barn, optional Windmill (`>= 34×34`), irrigated crop fields (`farmland` + water channels + crops + scarecrow), fenced livestock paddock (`water_cauldron` + shelter), orchard trees, and lantern-lit crossroads.
+  - **Houses, Taverns & Civic:** tea houses, medieval taverns, French mansards, modern villas, treehouses, libraries, apothecaries, bakeries/wineries, town halls, opera houses, museums, marble banks/vaults, magical academies.
   - **Ancient & Eastern Monuments:** Roman Pantheon (coffered dome + oculus), Parthenon, Colosseum amphitheater, Egyptian Pyramids & Ziggurats, Great Sphinx, Hanging Gardens of Babylon, Ishtar Gate, Angkor Wat, Mosque & Minaret Palace, Itsukushima Water Shrine & Torii avenue, Triumphal Arch / Obelisk.
   - **Fortresses, Castles & Guilds:** Gothic citadels, Concentric Motte & Bailey castles, fortified Barbican city gates, monasteries & cloisters, jousting arenas, military outposts, Vauban star forts, Japanese Tenshu castles, Big Ben clock towers, steampunk observatories, lighthouses, windmills, watermills.
   - **Bridges, Transport & Maritime (`gen_bridge`, `gen_civic_transport`):** 9 varied bridge archetypes across seeds (single arch, multi-arch viaduct, Gothic ribbed, Roman aqueduct, cable-stayed suspension, covered timber, Japanese Taiko moon bridge, fortified gate bridge, pontoon pier), 3-masted galleons, harbor shipyards, Victorian train stations with steam locomotives, airship docks with zeppelins, hydroelectric dams, circus big tops.
@@ -28,13 +30,14 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
     - **Independent Blue Frame & Post-Build Inspection (`Frame: ON/OFF`, `Hide@Build`, `[H]` / `[Shift+H]`):** hide only the outer blue wireframe box or toggle all overlays with one keypress (`H` in-world) to admire finished builds unobstructed.
     - **Live Collision Highlighting (`Colls: ON/OFF`):** inspects existing world blocks around the target site and highlights intersecting obstacles in translucent warm amber-coral.
     - **Free In-World `Move 3D` Mode:** nudge hologram `X/Z` (`Arrows`/`IJKL`, `+Shift` for `4` blocks), adjust height `Y` (`PgUp`/`PgDn`), rotate (`R`), slice (`[`/`]`), toggle collisions (`C`), snap with a click, and press `Enter` to build directly without reopening `F8`.
-  - **2. Style & Noise + 72-Preset Catalog:** category/style/roof overrides, **Biome Auto**, **Wear %**, **Moss %**, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
+  - **2. Style & Noise + 76-Preset Catalog:** category/style/roof overrides, **Biome Auto**, **Wear %**, **Moss %**, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
   - **3. Materials (30 Architectural Slots):** scrollable slot inspector, per-slot ordered block lists (`Patches` / `Scatter` / `Stripes` / `Checker` mix modes), and a dedicated searchable block picker with item icons (`Rec.` / `All` world blocks).
 - **Living Interiors, Curated Container Supplies & Smart World Integration:**
   - Automatically populates placed `chest`, `barrel`, `smoker`, `furnace`, `blast_furnace`, and `brewing_stand` block entities with themed item stacks & stylized bilingual container names tailored to the structure's category/theme and seed.
   - Multi-arm hanging chandeliers in tall halls (`floor_height >= 5`), wizard/alchemy workstations (`MageTower` / `Apothecary`), automatic hillside entrance stairs when ground sits above doorway steps, flat threshold stone aprons, and stepped settlement walkways connecting entrances directly to roads.
-- **Safe Two-Phase Placement, Undo/Redo & Server Security:**
+- **Safe Two-Phase Placement, Persistent Disk Undo/Redo & Server Security:**
   - Adapts foundations to terrain, detects water depth (`OceanFloor` vs `MotionBlockingNoLeaves`), builds solid frames first and doors/beds/lanterns/decor second, and supports `/buildgen reroll` plus up to 5 steps of **`/buildgen undo` & `/buildgen redo`** (also accessible from the GUI footer).
+  - **World-Saved Undo/Redo History (`BGH1`):** Saves compact column-RLE block-state-named snapshots per world inside `<save>/horizon-mod-data/building_generator/` so Undo and Redo counters & full rollback state survive closing and reopening the game cleanly.
   - Enforces **operator permission level 2+ (OP)** on all build/undo/redo/reroll commands and network payloads, sanitizes bounds/strings on the server, and rate-limits rapid GUI build requests.
 
 ---
@@ -45,7 +48,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
 |---|---|
 | `/buildgen` | Open the interactive mod menu (or press `F8`) |
 | `/buildgen lang <en\|ru>` | Switch GUI & chat feedback language between English (`en`) and Russian (`ru`) |
-| `/buildgen preset <name>` | Instantly build any of the 72 presets (OP 2+, supports Tab completion and EN/RU search) |
+| `/buildgen preset <name>` | Instantly build any of the 76 presets (OP 2+, supports Tab completion and EN/RU search) |
 | `/buildgen generate <text>` | Generate a building from an EN/RU description in front of you (OP 2+) |
 | `/buildgen size <w> <d> <h> <text>` | Generate with explicit bounding dimensions (`7..96 × 7..96 × 5..48`, OP 2+) |
 | `/buildgen reroll` | Undo the last build and regenerate at the same spot with a fresh seed (OP 2+) |
@@ -58,7 +61,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
 ## Installation
 
 ### From Release (`.hmod`)
-1. Download `building_generator-0.5.0.hmod` from the release artifacts.
+1. Download `building_generator-0.6.0.hmod` from the release artifacts.
 2. Place it in your Horizon instance's `horizon-mods/` (or `horizon-native-mods/`) folder, or add it via the Horizon Launcher Native Mods tab.
 3. Rebuild the instance with native code trusted (`--trust-native-code`) in Horizon Launcher.
 

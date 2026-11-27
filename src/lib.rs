@@ -4,6 +4,7 @@ mod gen_ancient;
 mod gen_bridge;
 mod gen_civic_transport;
 mod gen_common;
+mod gen_dungeon_estate;
 mod gen_fantasy_folk;
 mod gen_fortress;
 mod gen_landmarks;
@@ -136,7 +137,8 @@ impl Hooks for BuildingGeneratorMod {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Mutex, OnceLock};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use mod_api::__private::game::{BackendMutRefOf, BackendRefOf};
     use mod_api::prelude::*;
@@ -144,9 +146,11 @@ mod tests {
     use mod_api::{
         Backend, BackendMut, BackendMutRef, BackendRef, BlockEdit, BlockKey, BlockMetadata,
         BlockState, BlockStateError, BlockStateRecord, ClientHost, CommandArgument,
-        CommandArgumentValue, CommandInvocation, CommandSource, Flow, Heightmap, Host, Hooks,
-        LevelRef, ModEntry, PermissionLevel, Registrar, RegistrationContext, RunModCommandEvent,
-        ServerHost, StateConstraint, decode_payload, encode_payload,
+        CommandArgumentValue, CommandInvocation, CommandSource, ConfigEntry, ConfigFileError,
+        ConfigFiles, ConfigPath, ConfigStat, Flow, FluidKey, GameRuleReadError, GameRuleValue,
+        Heightmap, Host, Hooks, ItemKey, ItemStack, LevelRef, MobTickCost, ModEntry,
+        PermissionLevel, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
+        ServerReloadResources, StateConstraint, decode_payload, encode_payload,
     };
 
     use crate::generator::generate_blueprint;
@@ -732,6 +736,23 @@ mod tests {
         "minecraft:brown_mushroom_block",
         "minecraft:cobbled_deepslate_slab",
         "minecraft:chiseled_sandstone",
+        "minecraft:carrots",
+        "minecraft:potatoes",
+        "minecraft:beetroots",
+        "minecraft:iron_ore",
+        "minecraft:gold_ore",
+        "minecraft:coal_ore",
+        "minecraft:copper_ore",
+        "minecraft:deepslate_iron_ore",
+        "minecraft:deepslate_gold_ore",
+        "minecraft:deepslate_coal_ore",
+        "minecraft:deepslate_redstone_ore",
+        "minecraft:deepslate_diamond_ore",
+        "minecraft:lava",
+        "minecraft:coarse_dirt",
+        "minecraft:stone_pressure_plate",
+        "minecraft:gilded_blackstone",
+        "minecraft:jack_o_lantern",
     ];
 
     static REGISTERED_KEYS: OnceLock<Mutex<HashMap<String, BlockKey>>> = OnceLock::new();
@@ -749,6 +770,43 @@ mod tests {
     }
 
     /// Test double combining `FakeHost` world/player state with in-memory `WorldEditServerHost` & `BlockMetadata`.
+    #[derive(Clone, Default)]
+    struct MemWorldFiles {
+        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    }
+
+    impl ConfigFiles for MemWorldFiles {
+        fn read(&self, file: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(file.as_str())
+                .cloned()
+                .ok_or(ConfigFileError::NotFound)
+        }
+
+        fn write(&self, file: &ConfigPath, bytes: &[u8]) -> Result<(), ConfigFileError> {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(file.as_str().to_owned(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn list(
+            &self,
+            _folder: &ConfigPath,
+            _after: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<ConfigEntry>, ConfigFileError> {
+            Ok(Vec::new())
+        }
+
+        fn stat(&self, _path: &ConfigPath) -> Result<Option<ConfigStat>, ConfigFileError> {
+            Ok(None)
+        }
+    }
+
     struct TestWorldHost {
         fake: FakeHost,
         key_to_id: HashMap<BlockKey, String>,
@@ -758,6 +816,8 @@ mod tests {
         sent_payloads: Vec<(String, Vec<u8>)>,
         player_perms: HashMap<u128, u8>,
         biome_id: Option<String>,
+        world_dir_path: Option<PathBuf>,
+        world_files: MemWorldFiles,
     }
 
     impl TestWorldHost {
@@ -777,6 +837,8 @@ mod tests {
                 sent_payloads: Vec::new(),
                 player_perms: HashMap::new(),
                 biome_id: None,
+                world_dir_path: None,
+                world_files: MemWorldFiles::default(),
             };
             let grass = BlockStateRecord::new(grass_key, 0).into();
             for x in 0..40 {
@@ -836,7 +898,40 @@ mod tests {
             Some(<BackendRef<'_> as BackendRefOf>::of(self))
         }
     }
-    mod_api::impl_host_areas!(TestWorldHost, except(entities, keys, payload_tokens, players, block_entities));
+    mod_api::impl_host_areas!(TestWorldHost, except(entities, keys, payload_tokens, players, block_entities, block_states));
+
+    impl BlockStatesHost for TestWorldHost {
+        fn lit_block_name(&self, pos: [i32; 3]) -> Option<BlockKey> {
+            <FakeHost as BlockStatesHost>::lit_block_name(&self.fake, pos)
+        }
+        fn fluid_key(&self, id: &str) -> Option<FluidKey> {
+            <FakeHost as BlockStatesHost>::fluid_key(&self.fake, id)
+        }
+        fn block_state_id(&self, name: &str) -> Option<BlockState> {
+            let base = name.split('[').next()?;
+            let key = *self.id_to_key.get(base)?;
+            Some(BlockStateRecord::new(key, 0).into())
+        }
+        fn block_state_string(&self, state: BlockState) -> Option<String> {
+            self.key_to_id.get(&state.block()).cloned()
+        }
+        fn block_state_default(&self, block: BlockKey) -> Option<BlockState> {
+            if self.key_to_id.contains_key(&block) {
+                Some(BlockStateRecord::new(block, 0).into())
+            } else {
+                None
+            }
+        }
+        fn item_crafting_remainder(&self, stack: &ItemStack) -> Option<ItemStack> {
+            <FakeHost as BlockStatesHost>::item_crafting_remainder(&self.fake, stack)
+        }
+        fn block_item(&self, block: BlockKey) -> Option<ItemKey> {
+            <FakeHost as BlockStatesHost>::block_item(&self.fake, block)
+        }
+        fn item_block(&self, item: ItemKey) -> Option<BlockKey> {
+            <FakeHost as BlockStatesHost>::item_block(&self.fake, item)
+        }
+    }
 
     impl PayloadTokensHost for TestWorldHost {
         fn check_payload_token(
@@ -888,7 +983,61 @@ mod tests {
             Some(<BackendMutRef<'_> as BackendMutRefOf>::of(self))
         }
     }
-    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services, block_entities));
+    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services, block_entities, config));
+
+    impl ConfigServerHost for TestWorldHost {
+        fn game_tests_enabled(&self) -> bool {
+            <FakeHost as ConfigServerHost>::game_tests_enabled(&self.fake)
+        }
+        fn entity_range_percent(&self) -> i32 {
+            <FakeHost as ConfigServerHost>::entity_range_percent(&self.fake)
+        }
+        fn tick_stats(&self) -> (f32, f64) {
+            <FakeHost as ConfigServerHost>::tick_stats(&self.fake)
+        }
+        fn tick_times(&self) -> Vec<u64> {
+            <FakeHost as ConfigServerHost>::tick_times(&self.fake)
+        }
+        fn mob_cost_sampling(&mut self, on: bool) -> bool {
+            <FakeHost as ConfigServerHost>::mob_cost_sampling(&mut self.fake, on)
+        }
+        fn take_mob_costs(&mut self) -> Vec<MobTickCost> {
+            <FakeHost as ConfigServerHost>::take_mob_costs(&mut self.fake)
+        }
+        fn count_packets(&mut self, on: bool) -> bool {
+            <FakeHost as ConfigServerHost>::count_packets(&mut self.fake, on)
+        }
+        fn server_view_distance(&self) -> Option<i32> {
+            <FakeHost as ConfigServerHost>::server_view_distance(&self.fake)
+        }
+        fn server_simulation_distance(&self) -> Option<i32> {
+            <FakeHost as ConfigServerHost>::server_simulation_distance(&self.fake)
+        }
+        fn server_set_view_distance(&mut self, distance: i32) -> bool {
+            <FakeHost as ConfigServerHost>::server_set_view_distance(&mut self.fake, distance)
+        }
+        fn server_set_simulation_distance(&mut self, distance: i32) -> bool {
+            <FakeHost as ConfigServerHost>::server_set_simulation_distance(&mut self.fake, distance)
+        }
+        fn set_tick_rate(&mut self, rate: f32) -> bool {
+            <FakeHost as ConfigServerHost>::set_tick_rate(&mut self.fake, rate)
+        }
+        fn world_dir(&self) -> Option<PathBuf> {
+            self.world_dir_path.clone()
+        }
+        fn world_data_files(&self) -> &dyn ConfigFiles {
+            &self.world_files
+        }
+        fn game_rules(&self) -> Vec<(String, GameRuleValue)> {
+            <FakeHost as ConfigServerHost>::game_rules(&self.fake)
+        }
+        fn game_rule(&self, id: &str) -> Result<GameRuleValue, GameRuleReadError> {
+            <FakeHost as ConfigServerHost>::game_rule(&self.fake, id)
+        }
+        fn reload_resources(&self) -> &dyn ServerReloadResources {
+            <FakeHost as ConfigServerHost>::reload_resources(&self.fake)
+        }
+    }
 
     impl ServicesServerHost for TestWorldHost {
         fn commands(&mut self) -> &mut dyn mod_api::Commands {
@@ -1717,7 +1866,7 @@ mod tests {
         assert_eq!(find_cli_preset("village").map(|p| p.0), Some("village"));
         assert_eq!(find_cli_preset("квартал").map(|p| p.0), Some("village"));
         assert!(find_cli_preset("nonexistent_preset_xyz").is_none());
-        assert_eq!(CLI_PRESETS.len(), 72);
+        assert_eq!(CLI_PRESETS.len(), 76);
     }
 
     #[test]
@@ -3576,7 +3725,7 @@ mod tests {
         use crate::parser::StructureTheme;
         use crate::server_builder::{CLI_PRESETS, find_cli_preset};
 
-        assert_eq!(CLI_PRESETS.len(), 72);
+        assert_eq!(CLI_PRESETS.len(), 76);
         let mut seen_new_themes: HashMap<StructureTheme, &'static str> = HashMap::new();
 
         for (idx, &(slug, cat, style, w, d, h, desc)) in CLI_PRESETS.iter().enumerate() {
@@ -3622,7 +3771,7 @@ mod tests {
                 }
             }
 
-            if idx >= 28 {
+            if (28..72).contains(&idx) {
                 assert_ne!(
                     bp.spec.theme,
                     StructureTheme::Standard,
@@ -4660,7 +4809,7 @@ mod tests {
             assert!(bp.non_air_count() > 100);
         }
 
-        // Sweep all 72 CLI presets at minimum slider dimensions (7x7x5) and small studio sizes (11x11x7).
+        // Sweep all 76 CLI presets at minimum slider dimensions (7x7x5) and small studio sizes (11x11x7).
         for &(w, d, h) in &[(7u16, 7u16, 5u16), (11, 11, 7)] {
             for (idx, &(slug, cat, style, _pw, _pd, _ph, prompt)) in CLI_PRESETS.iter().enumerate() {
                 let mut req = sample_request(prompt, 50_000 + idx as i64);
@@ -4824,5 +4973,273 @@ mod tests {
             .values()
             .any(|b| b.block_id == "minecraft:iron_chain");
         assert!(has_chain_lantern, "expected ceiling chain chandelier in tall hall");
+    }
+
+    #[test]
+    fn v060_categories_dungeon_and_estate_parse_and_roundtrip() {
+        assert_eq!(BuildCategory::ALL.len(), 11);
+        assert_eq!(BuildCategory::from_slug("dungeon"), Some(BuildCategory::Dungeon));
+        assert_eq!(BuildCategory::from_slug("шахта"), Some(BuildCategory::Dungeon));
+        assert_eq!(BuildCategory::from_slug("estate"), Some(BuildCategory::Estate));
+        assert_eq!(BuildCategory::from_slug("усадьба"), Some(BuildCategory::Estate));
+
+        // Explicit descriptions disambiguate Dungeon vs existing MausoleumCrypt, and Estate vs Settlement.
+        let s_dun = parse_description(
+            BuildCategory::House,
+            BuildStyle::Auto,
+            "deep abandoned mineshaft dungeon with rails and ore veins",
+            27,
+            27,
+            18,
+            NoiseLevel::Balanced,
+            42,
+        );
+        assert_eq!(s_dun.category, BuildCategory::Dungeon);
+
+        let s_crypt = parse_description(
+            BuildCategory::Temple,
+            BuildStyle::Gothic,
+            "мрачный склеп мавзолей с подземными катакомбами и саркофагом",
+            19,
+            21,
+            14,
+            NoiseLevel::Balanced,
+            42,
+        );
+        assert_eq!(s_crypt.category, BuildCategory::Temple);
+
+        let s_est = parse_description(
+            BuildCategory::House,
+            BuildStyle::Auto,
+            "сельская усадьба поместье с домом, амбаром и полями",
+            35,
+            33,
+            20,
+            NoiseLevel::Balanced,
+            42,
+        );
+        assert_eq!(s_est.category, BuildCategory::Estate);
+
+        // BG2 share code round-trip for Dungeon (9) and Estate (10) preserves exact indices!
+        for &cat in &[BuildCategory::Dungeon, BuildCategory::Estate] {
+            let p = crate::persist::SavedPreset {
+                name: format!("Test {:?}", cat),
+                category: cat,
+                style: BuildStyle::Medieval,
+                roof_raw: 0,
+                toggles: [0; 5],
+                width: 27,
+                depth: 27,
+                height: 18,
+                noise_level: NoiseLevel::Balanced,
+                adapt_terrain: true,
+                air_only: false,
+                wear_pct: 15,
+                overgrowth_pct: 20,
+                seed: 777_123,
+                description: cat.slug().to_owned(),
+                palette_manual: false,
+                palette: MaterialPalette::preset(0),
+            };
+            let code = crate::persist::encode_share_code(&p);
+            let decoded = crate::persist::decode_share_code(&code, None).expect("decode BG2 share code");
+            assert_eq!(decoded.category, cat);
+        }
+    }
+
+    #[test]
+    fn v060_dungeon_generates_multi_tier_subterranean_vaults_with_stairs_and_loot() {
+        // 1. Multi-tier Gothic Dungeon Catacombs
+        let mut req = sample_request("multi-level gothic dungeon catacombs with chests", 6001);
+        req.category = BuildCategory::Dungeon;
+        req.style = BuildStyle::Gothic;
+        req.width = 27;
+        req.depth = 27;
+        req.height = 18;
+        let bp = generate_blueprint(&req, None);
+        assert_eq!(bp.spec.category, BuildCategory::Dungeon);
+        let min_y = bp.blocks.keys().map(|p| p[1]).min().unwrap_or(0);
+        assert!(min_y <= -12, "Multi-tier dungeon must extend deep underground (min_y={min_y})");
+
+        let stair_positions: Vec<[i32; 3]> = bp
+            .blocks
+            .iter()
+            .filter_map(|(pos, b)| {
+                if pos[1] <= 0 && b.block_id.ends_with("_stairs") {
+                    Some(*pos)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(!stair_positions.is_empty(), "Dungeon tiers must be linked by subterranean stairs");
+        for [sx, sy, sz] in stair_positions {
+            let head_clear = bp
+                .blocks
+                .get(&[sx, sy + 2, sz])
+                .is_none_or(|b| b.block_id == "minecraft:air");
+            assert!(head_clear, "Subterranean stair at [{sx},{sy},{sz}] must keep headroom clear");
+        }
+
+        let loot = crate::server_builder::collect_post_build_containers(&bp, req.seed as u64, crate::model::UiLang::En);
+        assert!(!loot.is_empty(), "Dungeon vaults must populate chest/barrel/brewing loot");
+        assert!(
+            loot.iter().any(|c| c.custom_name.contains("Crypt") || c.custom_name.contains("Miner")),
+            "Dungeon containers should get dedicated Dungeon loot titles"
+        );
+
+        // 2. Abandoned Mineshaft Dungeon with rails & ores
+        let mut mine_req = sample_request("deep abandoned timber mineshaft dungeon with rails and ore veins", 6002);
+        mine_req.category = BuildCategory::Dungeon;
+        mine_req.style = BuildStyle::Medieval;
+        mine_req.width = 29;
+        mine_req.depth = 29;
+        mine_req.height = 18;
+        let mine_bp = generate_blueprint(&mine_req, None);
+        assert!(mine_bp.blocks.values().any(|b| b.block_id == "minecraft:rail"), "Mineshaft must lay rail tracks");
+        assert!(
+            mine_bp.blocks.values().any(|b| b.block_id.ends_with("_ore")),
+            "Mineshaft walls should expose ore veins"
+        );
+
+        // 3. Dwarven Lava Sanctum
+        let mut dw_req = sample_request("dwarven subterranean lava forge dungeon sanctum", 6003);
+        dw_req.category = BuildCategory::Dungeon;
+        dw_req.style = BuildStyle::Nordic;
+        dw_req.width = 27;
+        dw_req.depth = 27;
+        dw_req.height = 18;
+        let dw_bp = generate_blueprint(&dw_req, None);
+        assert!(
+            dw_bp.blocks.values().any(|b| b.block_id == "minecraft:lava"),
+            "Dwarven foundry dungeon should include sub-floor lava channel"
+        );
+    }
+
+    #[test]
+    fn v060_estate_generates_compound_manor_barn_crops_paddock_and_windmill() {
+        let mut req = sample_request("rural country manor estate compound with barn and fields", 6101);
+        req.category = BuildCategory::Estate;
+        req.style = BuildStyle::Cottage;
+        req.width = 35;
+        req.depth = 35;
+        req.height = 20;
+        req.adapt_terrain = true;
+        // Gently sloping terrain across estate footprint
+        let mut terrain = vec![0i32; 35 * 35];
+        for z in 0..35usize {
+            for x in 0..35usize {
+                terrain[z * 35 + x] = (x as i32 / 10) - 1;
+            }
+        }
+        let bp = crate::generator::generate_blueprint_with_water(&req, Some(&terrain), None);
+        assert_eq!(bp.spec.category, BuildCategory::Estate);
+        assert!(bp.non_air_count() > 1500, "Large 35x35 estate should build rich compound buildings & fields");
+        assert!(
+            bp.blocks.values().any(|b| b.block_id == "minecraft:farmland"),
+            "Estate SW quadrant must create irrigated farmland"
+        );
+        assert!(
+            bp.blocks.values().any(|b| matches!(b.block_id.as_str(), "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots")),
+            "Estate fields must grow crops"
+        );
+        assert!(
+            bp.blocks.values().any(|b| b.block_id == "minecraft:water_cauldron"),
+            "Livestock paddock should place water trough cauldron"
+        );
+        assert!(
+            bp.blocks.values().any(|b| b.block_id == "minecraft:hay_block"),
+            "Estate barn/paddock should include hay blocks"
+        );
+        let containers = crate::server_builder::collect_post_build_containers(&bp, req.seed as u64, crate::model::UiLang::En);
+        assert!(
+            !containers.is_empty(),
+            "Estate manor/barn/field must contain populated barrels/chests"
+        );
+
+        // Compact 15x15 estate on hillside should adapt smoothly without errors
+        let mut small_req = sample_request("cozy country homestead estate", 6102);
+        small_req.category = BuildCategory::Estate;
+        small_req.width = 15;
+        small_req.depth = 15;
+        small_req.height = 12;
+        small_req.adapt_terrain = true;
+        let small_terrain: Vec<i32> = (0..(15 * 15)).map(|i| ((i % 15) as i32) / 5 - 1).collect();
+        let small_bp = crate::generator::generate_blueprint_with_water(&small_req, Some(&small_terrain), None);
+        assert!(small_bp.blocks.values().any(|b| b.block_id == "minecraft:farmland"));
+        assert!(small_bp.non_air_count() > 150);
+    }
+
+    #[test]
+    fn v060_persistent_undo_redo_survives_simulated_restart_and_world_switch() {
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+            crate::server_builder::clear_history_memory_cache();
+
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let world_a_files = MemWorldFiles::default();
+            let mut host = TestWorldHost::new(keys.clone());
+            host.world_dir_path = Some(PathBuf::from("test_world_alpha"));
+            host.world_files = world_a_files.clone();
+
+            host.fake.join(88, 100);
+            let player = host.player(88).unwrap();
+            host.set_player_perm(player.uuid(), 2);
+            let before_snapshot = host.world_blocks.clone();
+
+            let mut req = sample_request("cozy timber cottage with porch", 6601);
+            req.width = 11;
+            req.depth = 11;
+            req.height = 10;
+            let build_resp = execute_build(&mut host, Some(player), req);
+            assert!(build_resp.ok, "build failed: {}", build_resp.message);
+            assert_ne!(host.world_blocks, before_snapshot);
+
+            // Verify BGH1 binary snapshot was persisted to World A's data files!
+            let undo_key = format!("undo_{:032x}.bin", player.uuid());
+            assert!(
+                world_a_files.files.lock().unwrap().get(&undo_key).is_some_and(|b| b.starts_with(b"BGH1")),
+                "Undo history must be written as BGH1 to world_data_files"
+            );
+
+            // Simulate full game restart: wipe ALL in-memory caches while keeping world_a_files!
+            crate::server_builder::clear_history_memory_cache();
+
+            let undo_resp = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(undo_resp.ok, "Persisted Undo after restart must succeed: {}", undo_resp.message);
+            assert!(undo_resp.message.contains("redo: 1/") || undo_resp.message.contains("возврат: 1/"));
+            assert_eq!(host.world_blocks, before_snapshot, "Undo from disk must restore exact pre-build blocks");
+
+            // Simulate another restart, then verify persisted Redo stack survives too!
+            crate::server_builder::clear_history_memory_cache();
+            let redo_resp = execute_redo(&mut host, Some(player), "minecraft:overworld");
+            assert!(redo_resp.ok, "Persisted Redo after restart must succeed: {}", redo_resp.message);
+            assert_ne!(host.world_blocks, before_snapshot, "Redo from disk must re-apply structure");
+
+            // Switching to World B must isolate history cleanly and not leak World A's undo stack.
+            host.world_dir_path = Some(PathBuf::from("test_world_beta"));
+            host.world_files = MemWorldFiles::default();
+            let b_undo = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(!b_undo.ok, "Switching worlds must not inherit another save's undo stack");
+
+            // Switching back to World A must automatically reload World A's persisted undo stack!
+            host.world_dir_path = Some(PathBuf::from("test_world_alpha"));
+            host.world_files = world_a_files;
+            let a_undo_again = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(a_undo_again.ok, "Returning to World A must reload its disk-saved Undo history");
+            assert_eq!(host.world_blocks, before_snapshot);
+
+            crate::server_builder::clear_history_memory_cache();
+        });
     }
 }

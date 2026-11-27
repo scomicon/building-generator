@@ -3,7 +3,7 @@ use mod_api::PayloadCodec;
 /// Mod version string, falling back when Horizon's prebuilt-api rustc compiles without Cargo env vars.
 pub const MOD_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(ver) => ver,
-    None => "0.5.0",
+    None => "0.6.0",
 };
 
 /// UI and chat feedback language supported by the mod (`En` default, switchable to `Ru`).
@@ -57,10 +57,12 @@ pub enum BuildCategory {
     Temple,
     Bridge,
     Settlement,
+    Dungeon,
+    Estate,
 }
 
 impl BuildCategory {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::House,
         Self::Tower,
         Self::Barn,
@@ -70,6 +72,8 @@ impl BuildCategory {
         Self::Temple,
         Self::Bridge,
         Self::Settlement,
+        Self::Dungeon,
+        Self::Estate,
     ];
 
     pub fn label(self, lang: UiLang) -> &'static str {
@@ -84,6 +88,8 @@ impl BuildCategory {
                 Self::Temple => "Temple",
                 Self::Bridge => "Bridge",
                 Self::Settlement => "District",
+                Self::Dungeon => "Dungeon",
+                Self::Estate => "Estate",
             },
             UiLang::Ru => self.label_ru(),
         }
@@ -100,6 +106,8 @@ impl BuildCategory {
             Self::Temple => "Храм",
             Self::Bridge => "Мост",
             Self::Settlement => "Квартал",
+            Self::Dungeon => "Данж",
+            Self::Estate => "Усадьба",
         }
     }
 
@@ -114,6 +122,8 @@ impl BuildCategory {
             Self::Temple => "temple",
             Self::Bridge => "bridge",
             Self::Settlement => "settlement",
+            Self::Dungeon => "dungeon",
+            Self::Estate => "estate",
         }
     }
 
@@ -127,8 +137,14 @@ impl BuildCategory {
             "forge" | "smithy" | "кузница" | "мастерская" => Some(Self::Forge),
             "temple" | "shrine" | "храм" | "святилище" => Some(Self::Temple),
             "bridge" | "viaduct" | "мост" | "виадук" => Some(Self::Bridge),
-            "settlement" | "village" | "town" | "estate" | "квартал" | "деревня" | "поселение" | "усадьба" => {
+            "settlement" | "village" | "town" | "квартал" | "деревня" | "поселение" => {
                 Some(Self::Settlement)
+            }
+            "dungeon" | "mineshaft" | "mine" | "данж" | "подземелье" | "шахта" => {
+                Some(Self::Dungeon)
+            }
+            "estate" | "homestead" | "farmstead" | "усадьба" | "поместье" => {
+                Some(Self::Estate)
             }
             _ => None,
         }
@@ -144,7 +160,9 @@ impl BuildCategory {
             Self::Forge => Self::Temple,
             Self::Temple => Self::Bridge,
             Self::Bridge => Self::Settlement,
-            Self::Settlement => Self::House,
+            Self::Settlement => Self::Dungeon,
+            Self::Dungeon => Self::Estate,
+            Self::Estate => Self::House,
         }
     }
 
@@ -159,6 +177,8 @@ impl BuildCategory {
             Self::Temple => 6,
             Self::Bridge => 7,
             Self::Settlement => 8,
+            Self::Dungeon => 9,
+            Self::Estate => 10,
         }
     }
 

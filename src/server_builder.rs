@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -7,9 +8,9 @@ static CMD_BUILD_SEQ: AtomicU64 = AtomicU64::new(1);
 
 use mod_api::{
     BlockEdit, BlockKey, BlockRun, BlockState, BossBarColor, BossBarRef, Command,
-    CommandArgumentValue, CommandSource, Flow, Heightmap, HostBlockStates, IPayloadContext,
-    PlayerRef, RegisterCommandsEvent, RunModCommandEvent, ScheduledTaskEvent, ServerHost,
-    StateConstraint, TabCompleteEvent, Tag, Text,
+    CommandArgumentValue, CommandSource, ConfigPath, Flow, Heightmap, HostBlockStates,
+    IPayloadContext, PlayerRef, RegisterCommandsEvent, RunModCommandEvent, ScheduledTaskEvent,
+    ServerHost, StateConstraint, TabCompleteEvent, Tag, Text,
 };
 
 use crate::generator::{GeneratedBlueprint, PlannedBlock};
@@ -61,10 +62,23 @@ struct PendingBatchJob {
 
 static UNDO_STACK: Mutex<Option<HashMap<u128, Vec<UndoEntry>>>> = Mutex::new(None);
 static REDO_STACK: Mutex<Option<HashMap<u128, Vec<UndoEntry>>>> = Mutex::new(None);
+static HISTORY_WORLD_DIR: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
+static LOADED_HISTORY_OWNERS: Mutex<Option<HashSet<u128>>> = Mutex::new(None);
 static LAST_REQUESTS: Mutex<Option<HashMap<u128, BuildRequest>>> = Mutex::new(None);
 static PENDING_JOBS: Mutex<Option<VecDeque<PendingBatchJob>>> = Mutex::new(None);
 static PLAYER_LANG: Mutex<Option<HashMap<u128, UiLang>>> = Mutex::new(None);
 static LAST_BUILD_AT: Mutex<Option<HashMap<u128, Instant>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn clear_history_memory_cache() {
+    with_undo_map(|m| m.clear());
+    with_redo_map(|m| m.clear());
+    with_last_requests(|m| m.clear());
+    *HISTORY_WORLD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Ok(mut g) = LOADED_HISTORY_OWNERS.lock() {
+        g.get_or_insert_with(HashSet::new).clear();
+    }
+}
 
 fn with_undo_map<R>(f: impl FnOnce(&mut HashMap<u128, Vec<UndoEntry>>) -> R) -> R {
     let mut guard = UNDO_STACK.lock().unwrap_or_else(|e| e.into_inner());
@@ -661,6 +675,41 @@ pub(crate) fn collect_post_build_containers(
                             ("minecraft:book", 1, 3),
                         ],
                     )
+                } else if bp.spec.category == BuildCategory::Dungeon {
+                    (
+                        if is_barrel {
+                            tr(lang, "Miner's Supply Barrel", "Шахтёрская бочка")
+                        } else {
+                            tr(lang, "Crypt Reliquary", "Ларец подземелья")
+                        },
+                        &[
+                            ("minecraft:gold_ingot", 2, 6),
+                            ("minecraft:iron_ingot", 3, 8),
+                            ("minecraft:emerald", 1, 4),
+                            ("minecraft:amethyst_shard", 2, 6),
+                            ("minecraft:coal", 5, 14),
+                            ("minecraft:torch", 4, 12),
+                            ("minecraft:golden_apple", 1, 2),
+                            ("minecraft:bread", 2, 5),
+                        ],
+                    )
+                } else if bp.spec.category == BuildCategory::Estate {
+                    (
+                        if is_barrel {
+                            tr(lang, "Vineyard Cask", "Усадебная бочка")
+                        } else {
+                            tr(lang, "Estate Provision Chest", "Усадебный сундук")
+                        },
+                        &[
+                            ("minecraft:wheat", 5, 14),
+                            ("minecraft:apple", 3, 8),
+                            ("minecraft:bread", 3, 7),
+                            ("minecraft:sweet_berries", 3, 8),
+                            ("minecraft:honey_bottle", 1, 3),
+                            ("minecraft:carrot", 3, 9),
+                            ("minecraft:iron_ingot", 1, 4),
+                        ],
+                    )
                 } else if ly < 0 {
                     (
                         if is_barrel {
@@ -904,6 +953,258 @@ fn push_history_entry(
     stack.push(entry);
 }
 
+const HISTORY_MAGIC: &[u8; 4] = b"BGH1";
+const MAX_PERSIST_BYTES: usize = 48 * 1024 * 1024;
+const MAX_DECODE_CELLS_PER_ENTRY: usize = 2_000_000;
+
+fn history_config_path(kind: &str, owner_key: u128) -> Option<ConfigPath> {
+    ConfigPath::new(&format!("{kind}_{owner_key:032x}.bin")).ok()
+}
+
+fn sync_history_world(host: &dyn ServerHost) {
+    let cur_world = host.world_dir();
+    let changed = {
+        let mut guard = HISTORY_WORLD_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(prev) if *prev == cur_world => false,
+            _ => {
+                *guard = Some(cur_world);
+                true
+            }
+        }
+    };
+    if changed {
+        with_undo_map(|m| m.clear());
+        with_redo_map(|m| m.clear());
+        with_last_requests(|m| m.clear());
+        let mut loaded = LOADED_HISTORY_OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        loaded.get_or_insert_with(HashSet::new).clear();
+    }
+}
+
+fn encode_single_entry(host: &dyn ServerHost, entry: &UndoEntry) -> Option<Vec<u8>> {
+    let mut state_to_pal: HashMap<BlockState, u16> = HashMap::new();
+    let mut name_to_pal: HashMap<String, u16> = HashMap::new();
+    let mut palette: Vec<String> = Vec::new();
+    let mut cells: Vec<(i32, i32, i32, u16)> = Vec::with_capacity(entry.previous_blocks.len());
+
+    for &(pos, state) in &entry.previous_blocks {
+        let pal_idx = if let Some(&idx) = state_to_pal.get(&state) {
+            idx
+        } else {
+            let Some(name) = host.block_state_string(state) else {
+                continue;
+            };
+            let idx = if let Some(&idx) = name_to_pal.get(&name) {
+                idx
+            } else {
+                let Ok(idx) = u16::try_from(palette.len()) else {
+                    continue;
+                };
+                palette.push(name.clone());
+                name_to_pal.insert(name, idx);
+                idx
+            };
+            state_to_pal.insert(state, idx);
+            idx
+        };
+        cells.push((pos[0], pos[2], pos[1], pal_idx));
+    }
+
+    if cells.is_empty() {
+        return None;
+    }
+
+    // Sort by (x, z, y) so vertical runs collapse cleanly into compact RLE segments.
+    cells.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+
+    let mut runs: Vec<(i32, i32, i32, u16, u16)> = Vec::with_capacity(cells.len() / 2 + 1);
+    let mut i = 0;
+    while i < cells.len() {
+        let (x, z, y0, pal_idx) = cells[i];
+        let mut len: u16 = 1;
+        while i + usize::from(len) < cells.len() && len < u16::MAX {
+            let (nx, nz, ny, np) = cells[i + usize::from(len)];
+            if nx == x && nz == z && np == pal_idx && ny == y0.saturating_add(i32::from(len)) {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+        runs.push((x, y0, z, len, pal_idx));
+        i += usize::from(len);
+    }
+
+    let dim_bytes = entry.dimension.as_bytes();
+    let dim_len = u16::try_from(dim_bytes.len()).ok()?;
+    let pal_len = u32::try_from(palette.len()).ok()?;
+    let run_len = u32::try_from(runs.len()).ok()?;
+
+    let mut out = Vec::with_capacity(2 + dim_bytes.len() + 4 + palette.len() * 24 + runs.len() * 16);
+    out.extend_from_slice(&dim_len.to_le_bytes());
+    out.extend_from_slice(dim_bytes);
+    out.extend_from_slice(&pal_len.to_le_bytes());
+    for name in &palette {
+        let nb = name.as_bytes();
+        let nl = u16::try_from(nb.len()).ok()?;
+        out.extend_from_slice(&nl.to_le_bytes());
+        out.extend_from_slice(nb);
+    }
+    out.extend_from_slice(&run_len.to_le_bytes());
+    for (x, y0, z, len, pal_idx) in runs {
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&y0.to_le_bytes());
+        out.extend_from_slice(&z.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&pal_idx.to_le_bytes());
+    }
+    Some(out)
+}
+
+fn encode_history_stack(host: &dyn ServerHost, entries: &[UndoEntry]) -> Vec<u8> {
+    let start = entries.len().saturating_sub(MAX_UNDO_HISTORY_PER_PLAYER);
+    let mut encoded_entries: Vec<Vec<u8>> = entries[start..]
+        .iter()
+        .filter_map(|e| encode_single_entry(host, e))
+        .collect();
+    // Respect horizon ConfigFiles 64 MiB hard cap comfortably by pruning oldest entries if ever needed.
+    while !encoded_entries.is_empty()
+        && 5 + encoded_entries.iter().map(Vec::len).sum::<usize>() > MAX_PERSIST_BYTES
+    {
+        encoded_entries.remove(0);
+    }
+    let total_len = 5 + encoded_entries.iter().map(Vec::len).sum::<usize>();
+    let mut out = Vec::with_capacity(total_len);
+    out.extend_from_slice(HISTORY_MAGIC);
+    out.push(encoded_entries.len() as u8);
+    for chunk in encoded_entries {
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
+fn decode_history_stack(host: &dyn ServerHost, bytes: &[u8]) -> Option<Vec<UndoEntry>> {
+    if bytes.len() < 5 || &bytes[0..4] != HISTORY_MAGIC {
+        return None;
+    }
+    let count = (bytes[4] as usize).min(MAX_UNDO_HISTORY_PER_PLAYER);
+    let mut cur = 5usize;
+
+    let take = |cur: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = cur.checked_add(n)?;
+        let slice = bytes.get(*cur..end)?;
+        *cur = end;
+        Some(slice)
+    };
+    let take_u16 = |cur: &mut usize| -> Option<u16> {
+        let s = take(cur, 2)?;
+        Some(u16::from_le_bytes([s[0], s[1]]))
+    };
+    let take_u32 = |cur: &mut usize| -> Option<u32> {
+        let s = take(cur, 4)?;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let take_i32 = |cur: &mut usize| -> Option<i32> {
+        let s = take(cur, 4)?;
+        Some(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let dim_len = usize::from(take_u16(&mut cur)?);
+        let dim = std::str::from_utf8(take(&mut cur, dim_len)?).ok()?.to_owned();
+        let pal_len = take_u32(&mut cur)? as usize;
+        if pal_len > 65_536 {
+            return None;
+        }
+        let mut palette: Vec<Option<BlockState>> = Vec::with_capacity(pal_len);
+        for _ in 0..pal_len {
+            let nl = usize::from(take_u16(&mut cur)?);
+            let name = std::str::from_utf8(take(&mut cur, nl)?).ok()?;
+            palette.push(host.block_state_id(name));
+        }
+        let run_len = take_u32(&mut cur)? as usize;
+        if run_len > MAX_DECODE_CELLS_PER_ENTRY {
+            return None;
+        }
+        let mut previous_blocks = Vec::with_capacity(run_len.min(65_536));
+        for _ in 0..run_len {
+            let x = take_i32(&mut cur)?;
+            let y0 = take_i32(&mut cur)?;
+            let z = take_i32(&mut cur)?;
+            let len = take_u16(&mut cur)?;
+            let pal_idx = usize::from(take_u16(&mut cur)?);
+            if previous_blocks.len().saturating_add(usize::from(len)) > MAX_DECODE_CELLS_PER_ENTRY {
+                return None;
+            }
+            if let Some(Some(state)) = palette.get(pal_idx).copied() {
+                for dy in 0..i32::from(len) {
+                    previous_blocks.push(([x, y0 + dy, z], state));
+                }
+            }
+        }
+        if !previous_blocks.is_empty() {
+            out.push(UndoEntry {
+                dimension: dim,
+                previous_blocks,
+            });
+        }
+    }
+    Some(out)
+}
+
+fn ensure_history_loaded(host: &dyn ServerHost, owner_key: u128) {
+    sync_history_world(host);
+    {
+        let mut loaded = LOADED_HISTORY_OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = loaded.get_or_insert_with(HashSet::new);
+        if !set.insert(owner_key) {
+            return;
+        }
+    }
+    let files = host.world_data_files();
+    if let Some(p) = history_config_path("undo", owner_key)
+        && let Ok(bytes) = files.read(&p)
+        && let Some(mut entries) = decode_history_stack(host, &bytes)
+    {
+        if entries.len() > MAX_UNDO_HISTORY_PER_PLAYER {
+            entries.drain(..entries.len() - MAX_UNDO_HISTORY_PER_PLAYER);
+        }
+        if !entries.is_empty() {
+            with_undo_map(|map| {
+                map.entry(owner_key).or_insert(entries);
+            });
+        }
+    }
+    if let Some(p) = history_config_path("redo", owner_key)
+        && let Ok(bytes) = files.read(&p)
+        && let Some(mut entries) = decode_history_stack(host, &bytes)
+    {
+        if entries.len() > MAX_UNDO_HISTORY_PER_PLAYER {
+            entries.drain(..entries.len() - MAX_UNDO_HISTORY_PER_PLAYER);
+        }
+        if !entries.is_empty() {
+            with_redo_map(|map| {
+                map.entry(owner_key).or_insert(entries);
+            });
+        }
+    }
+}
+
+fn persist_owner_history(host: &dyn ServerHost, owner_key: u128) {
+    let undo_entries = with_undo_map(|map| map.get(&owner_key).cloned().unwrap_or_default());
+    let redo_entries = with_redo_map(|map| map.get(&owner_key).cloned().unwrap_or_default());
+    let files = host.world_data_files();
+    if let Some(p) = history_config_path("undo", owner_key) {
+        let encoded = encode_history_stack(host, &undo_entries);
+        let _ = files.write(&p, &encoded);
+    }
+    if let Some(p) = history_config_path("redo", owner_key) {
+        let encoded = encode_history_stack(host, &redo_entries);
+        let _ = files.write(&p, &encoded);
+    }
+}
+
 fn sample_terrain_info(
     host: &dyn ServerHost,
     req: &BuildRequest,
@@ -1002,6 +1303,7 @@ pub fn execute_build(
     );
 
     let owner_key = player.map_or(0, PlayerRef::uuid);
+    ensure_history_loaded(host, owner_key);
     let undo_snapshot =
         prepare_undo_and_filter_blueprint(host, &req.dimension, &mut bp, req.air_only);
     let post_containers = collect_post_build_containers(&bp, req.seed as u64, lang);
@@ -1054,6 +1356,7 @@ pub fn execute_build(
     with_last_requests(|map| {
         map.insert(owner_key, req.clone());
     });
+    persist_owner_history(host, owner_key);
 
     if total_runs <= MAX_RUNS_PER_BATCH {
         let mut changed = 0u64;
@@ -1384,6 +1687,7 @@ fn execute_history_step(
     }
 
     let owner_key = player.map_or(0, PlayerRef::uuid);
+    ensure_history_loaded(host, owner_key);
     let popped = if is_redo {
         with_redo_map(|map| map.get_mut(&owner_key).and_then(Vec::pop))
     } else {
@@ -1446,6 +1750,7 @@ fn execute_history_step(
             with_redo_map(|map| push_history_entry(map, owner_key, inv));
         }
     }
+    persist_owner_history(host, owner_key);
 
     let u = undo_depth(owner_key);
     let r = redo_depth(owner_key);
@@ -1498,6 +1803,7 @@ pub fn execute_reroll(
     }
 
     let owner_key = player.map_or(0, PlayerRef::uuid);
+    ensure_history_loaded(host, owner_key);
     let prev_opt = with_last_requests(|map| map.get(&owner_key).cloned());
     let Some(mut next_req) = prev_opt else {
         return BuildResponse {
@@ -1582,6 +1888,22 @@ pub fn handle_reroll_payload(req: RerollRequest, cx: &mut dyn IPayloadContext) -
 pub fn handle_lang_payload(req: SetLangRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
     let player = cx.player().map_err(|e| format!("{e:?}"))?;
     set_player_lang(Some(player), req.lang);
+    let (u, r) = {
+        let host = cx.server_host().map_err(|e| format!("{e:?}"))?;
+        let owner_key = player.uuid();
+        ensure_history_loaded(host, owner_key);
+        (undo_depth(owner_key), redo_depth(owner_key))
+    };
+    if let Some(ch) = channels() {
+        let _ = ch.to_client_reply.reply(
+            cx,
+            &BuildResponse {
+                ok: true,
+                blocks_changed: 0,
+                message: format!("__HISTORY__:{u}:{r}"),
+            },
+        );
+    }
     Ok(())
 }
 
@@ -1687,9 +2009,13 @@ pub const CLI_PRESETS: &[(&str, BuildCategory, crate::model::BuildStyle, u16, u1
     ("chalet", BuildCategory::House, crate::model::BuildStyle::Cottage, 17, 19, 15, "тёплое альпийское горное шале из бруса со снежной крышей и дровницей"),
     ("kasbah", BuildCategory::Castle, crate::model::BuildStyle::Desert, 21, 21, 18, "восточная касба риад с глинобитными башнями бадгир и оазисом во дворе"),
     ("venice", BuildCategory::Settlement, crate::model::BuildStyle::Classical, 48, 48, 18, "венецианский город на воде на сваях с каналами и деревянными мостиками"),
+    ("dungeon", BuildCategory::Dungeon, crate::model::BuildStyle::Gothic, 27, 27, 18, "многоуровневое подземное подземелье темница с залами, лестницами, сундуками и наземным входом"),
+    ("mine", BuildCategory::Dungeon, crate::model::BuildStyle::Medieval, 29, 29, 18, "глубокая заброшенная шахта штольня с рельсами, деревянными крепями и рудными жилами"),
+    ("estate", BuildCategory::Estate, crate::model::BuildStyle::Cottage, 35, 33, 20, "загородная усадьба поместье с хозяйским домом, амбаром, грядками, загоном и садом"),
+    ("vineyard_estate", BuildCategory::Estate, crate::model::BuildStyle::Medieval, 31, 29, 18, "средневековая загородная усадьба хутор с хозяйским домом, бочками, садом и огородом"),
 ];
 
-pub const CLI_PRESET_DESCS_EN: [&str; 72] = [
+pub const CLI_PRESET_DESCS_EN: [&str; 76] = [
     "japanese two-story teahouse with terrace, stall, striped awning and lanterns",
     "medieval two-story tavern with fireplace and basement",
     "multi-tiered japanese pagoda with cherry blossom garden",
@@ -1762,6 +2088,10 @@ pub const CLI_PRESET_DESCS_EN: [&str; 72] = [
     "warm alpine timber chalet with snow roof and woodshed",
     "oriental desert kasbah riad with adobe towers and oasis courtyard",
     "venetian floating village on stilts with canals and timber bridges",
+    "multi-level subterranean gothic dungeon chambers with stairs, chests, torches and stone entrance",
+    "deep abandoned timber mineshaft dungeon with rails, ore veins and supply crates",
+    "rural country manor estate compound with house, barn, irrigated crop fields, livestock paddock and orchard",
+    "medieval countryside homestead estate with manor house, orchard well, irrigated fields and paddock",
 ];
 
 pub fn cli_preset_desc(idx: usize, lang: UiLang) -> &'static str {
@@ -1942,6 +2272,8 @@ pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
                 "roman pantheon rotunda with dome and portico",
                 "glass curtain skyscraper highrise with spire",
                 "venetian floating village on stilts with canals",
+                "subterranean gothic dungeon catacombs with chests",
+                "rural country estate with manor, barn and crop fields",
             ][..],
             UiLang::Ru => &[
                 "уютный двухэтажный средневековый дом с крыльцом и камином",
@@ -1952,6 +2284,8 @@ pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
                 "римский пантеон ротонда с куполом и портиком",
                 "современный стеклянный небоскрёб со шпилем",
                 "венецианский город на воде на сваях с каналами",
+                "многоуровневое подземелье катакомбы с сундуками и порталом",
+                "загородная усадьба с особняком, амбаром, грядками и мельницей",
             ][..],
         };
         for sample in samples {

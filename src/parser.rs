@@ -745,9 +745,22 @@ pub fn parse_description_with_biome(
     let theme = infer_theme_from_text(&lower);
 
     let effective_cat = if matches!(theme, StructureTheme::ShipyardDock | StructureTheme::FloatingVillage)
-        || contains_any(&lower, &["квартал", "деревн", "поселен", "посёлок", "поселок", "усадьб", "городок", "village", "town", "hamlet", "settlement", "district", "compound"])
+        || contains_any(&lower, &["квартал", "деревн", "поселен", "посёлок", "поселок", "городок", "village", "town", "hamlet", "settlement", "district"])
     {
         BuildCategory::Settlement
+    } else if contains_any(&lower, &["поместь", "усадьб", "имение", "хутор", "ранчо", "estate", "homestead", "farmstead", "ranch", "compound"]) {
+        BuildCategory::Estate
+    } else if (category == BuildCategory::Dungeon
+        || !matches!(
+            theme,
+            StructureTheme::MausoleumCrypt | StructureTheme::Bunker | StructureTheme::DwarvenHall | StructureTheme::DragonSanctuary
+        ))
+        && contains_any(
+            &lower,
+            &["данж", "подземель", "темниц", "шахт", "штольн", "лабиринт", "dungeon", "mineshaft", "mine shaft", "labyrinth", "subterranean"],
+        )
+    {
+        BuildCategory::Dungeon
     } else if theme == StructureTheme::DamBarrage
         || contains_any(&lower, &["мост", "виадук", "переправ", "акведук", "bridge", "viaduct", "aqueduct"])
     {
@@ -890,7 +903,14 @@ pub fn parse_description_with_biome(
                 min_f + if span_f > 0 { rng.range_i32(0, span_f as i32) as u16 } else { 0 }
             }
             BuildCategory::Castle => 2.min(max_fit_floors).max(1),
-            BuildCategory::Barn | BuildCategory::Pavilion | BuildCategory::Forge | BuildCategory::Temple | BuildCategory::Bridge | BuildCategory::Settlement => 1,
+            BuildCategory::Barn
+            | BuildCategory::Pavilion
+            | BuildCategory::Forge
+            | BuildCategory::Temple
+            | BuildCategory::Bridge
+            | BuildCategory::Settlement
+            | BuildCategory::Dungeon
+            | BuildCategory::Estate => 1,
             BuildCategory::House => {
                 let roll = rng.next_f64();
                 if theme == StructureTheme::Tavern && max_fit_floors >= 2 {
@@ -944,7 +964,7 @@ pub fn parse_description_with_biome(
             (_, _, StructureTheme::JapaneseCastle | StructureTheme::OnsenBath | StructureTheme::WaterShrine) => RoofStyle::Pagoda,
             (_, _, StructureTheme::Cathedral | StructureTheme::MausoleumCrypt) => RoofStyle::Steep,
             (_, _, StructureTheme::Pyramid | StructureTheme::TriumphalArch | StructureTheme::Skyscraper | StructureTheme::Bunker | StructureTheme::ModernStadium) => RoofStyle::Flat,
-            (BuildCategory::Castle | BuildCategory::Bridge, _, _) => RoofStyle::Flat,
+            (BuildCategory::Castle | BuildCategory::Bridge | BuildCategory::Dungeon, _, _) => RoofStyle::Flat,
             (_, BuildStyle::Japanese, _) => RoofStyle::Pagoda,
             (_, BuildStyle::Modern, _) => if roll < 0.85 { RoofStyle::Flat } else { RoofStyle::Hip },
             (_, BuildStyle::Desert, _) => {
@@ -1105,6 +1125,8 @@ pub fn parse_description_with_biome(
     } else {
         effective_cat != BuildCategory::Bridge
             && effective_cat != BuildCategory::Pavilion
+            && effective_cat != BuildCategory::Dungeon
+            && effective_cat != BuildCategory::Estate
             && width >= 9
             && depth >= 9
             && (contains_any(&lower, &["подвал", "погреб", "крипт", "подзем", "basement", "cellar", "crypt"])
@@ -1131,7 +1153,10 @@ pub fn parse_description_with_biome(
     } else {
         (overgrown || garden_lanterns || courtyard_garden_kw) && width >= 11 && depth >= 10
     };
-    let courtyard_well = !matches!(effective_cat, BuildCategory::Bridge | BuildCategory::Pavilion)
+    let courtyard_well = !matches!(
+        effective_cat,
+        BuildCategory::Bridge | BuildCategory::Pavilion | BuildCategory::Dungeon | BuildCategory::Estate
+    )
         && !ruin_flag
         && width >= 19
         && depth >= 17
@@ -1143,7 +1168,12 @@ pub fn parse_description_with_biome(
         && depth >= 11
         && !matches!(
             effective_cat,
-            BuildCategory::Tower | BuildCategory::Temple | BuildCategory::Bridge | BuildCategory::Pavilion
+            BuildCategory::Tower
+            | BuildCategory::Temple
+            | BuildCategory::Bridge
+            | BuildCategory::Pavilion
+            | BuildCategory::Dungeon
+            | BuildCategory::Estate
         )
         && !matches!(
             theme,
@@ -1207,7 +1237,10 @@ pub fn parse_description_with_biome(
         width >= 15
             && depth >= 13
             && !ruin_flag
-            && !matches!(effective_cat, BuildCategory::Bridge | BuildCategory::Pavilion)
+            && !matches!(
+                effective_cat,
+                BuildCategory::Bridge | BuildCategory::Pavilion | BuildCategory::Dungeon | BuildCategory::Estate
+            )
             && !matches!(
                 theme,
                 StructureTheme::Greenhouse | StructureTheme::Windmill | StructureTheme::Lighthouse
@@ -1365,7 +1398,10 @@ pub fn parse_description_with_biome(
                     && width >= 13
                     && depth >= 11
                     && !ruin_flag
-                    && !matches!(effective_cat, BuildCategory::Bridge | BuildCategory::Pavilion))
+                    && !matches!(
+                effective_cat,
+                BuildCategory::Bridge | BuildCategory::Pavilion | BuildCategory::Dungeon | BuildCategory::Estate
+            ))
         },
         half_hip: !is_colosseum && !is_classical && half_hip,
         rose_window: !is_colosseum && !is_classical && rose_window,
