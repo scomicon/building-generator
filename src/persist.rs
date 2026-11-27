@@ -23,6 +23,9 @@ pub struct SavedPreset {
     pub seed: u64,
     pub palette_manual: bool,
     pub palette: MaterialPalette,
+    pub living_decor: bool,
+    pub spawn_npcs: bool,
+    pub blend_radius: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,10 +179,10 @@ fn read_str(data: &[u8], cursor: &mut usize, lang: UiLang) -> Result<String, Str
     Ok(s)
 }
 
-/// Encodes a preset configuration into a compact `BG2:...` share code with FNV-1a checksum (`v4` includes wear & overgrowth %).
+/// Encodes a preset configuration into a compact `BG2:...` share code with FNV-1a checksum (`v5` includes living decor, NPC toggle & blend radius).
 pub fn encode_share_code(p: &SavedPreset) -> String {
-    let mut buf = Vec::with_capacity(228);
-    buf.extend_from_slice(b"BG2\x04");
+    let mut buf = Vec::with_capacity(232);
+    buf.extend_from_slice(b"BG2\x05");
     buf.extend_from_slice(&p.width.to_le_bytes());
     buf.extend_from_slice(&p.depth.to_le_bytes());
     buf.extend_from_slice(&p.height.to_le_bytes());
@@ -189,7 +192,9 @@ pub fn encode_share_code(p: &SavedPreset) -> String {
     buf.push(p.noise_level.to_idx());
     let flags = u8::from(p.adapt_terrain)
         | (u8::from(p.palette_manual) << 1)
-        | (u8::from(p.air_only) << 2);
+        | (u8::from(p.air_only) << 2)
+        | (u8::from(p.living_decor) << 3)
+        | (u8::from(p.spawn_npcs) << 4);
     buf.push(flags);
     buf.extend_from_slice(&p.toggles);
     buf.extend_from_slice(&p.seed.to_le_bytes());
@@ -252,12 +257,13 @@ pub fn encode_share_code(p: &SavedPreset) -> String {
     }
     buf.push(p.wear_pct.min(100));
     buf.push(p.overgrowth_pct.min(100));
+    buf.push(p.blend_radius.min(10));
     let sum = fnv1a_32(&buf);
     buf.extend_from_slice(&sum.to_le_bytes());
     format!("BG2:{}", b64_encode(&buf))
 }
 
-/// Decodes a `BG2:...` share code (`v1` 16-field, `v2` 32-field, `v3` with slot block lists), validating checksum.
+/// Decodes a `BG2:...` share code (`v1..v5`), validating checksum.
 pub fn decode_share_code(raw: &str, name_override: Option<&str>) -> Result<SavedPreset, String> {
     decode_share_code_lang(raw, name_override, UiLang::En)
 }
@@ -277,16 +283,17 @@ pub fn decode_share_code_lang(
         .ok_or_else(|| err_msg(lang, "Share code must start with BG2:", "Код должен начинаться с BG2:"))?;
     let bytes = b64_decode(payload, lang)?;
     if bytes.len() < 4 + 24 + 4
-        || (&bytes[0..4] != b"BG2\x01"
-            && &bytes[0..4] != b"BG2\x02"
-            && &bytes[0..4] != b"BG2\x03"
-            && &bytes[0..4] != b"BG2\x04")
+        || !matches!(
+            &bytes[0..4],
+            b"BG2\x01" | b"BG2\x02" | b"BG2\x03" | b"BG2\x04" | b"BG2\x05"
+        )
     {
         return Err(err_msg(lang, "Unsupported Share code version", "Неподдерживаемая версия Share-кода"));
     }
     let is_v2 = &bytes[0..4] == b"BG2\x02";
-    let is_v3_or_v4 = &bytes[0..4] == b"BG2\x03" || &bytes[0..4] == b"BG2\x04";
-    let is_v4 = &bytes[0..4] == b"BG2\x04";
+    let is_v3_or_v4 = matches!(&bytes[0..4], b"BG2\x03" | b"BG2\x04" | b"BG2\x05");
+    let is_v4 = matches!(&bytes[0..4], b"BG2\x04" | b"BG2\x05");
+    let is_v5 = &bytes[0..4] == b"BG2\x05";
     let body_len = bytes.len() - 4;
     let stored_sum = u32::from_le_bytes([
         bytes[body_len],
@@ -311,6 +318,8 @@ pub fn decode_share_code_lang(
     let adapt_terrain = (flags & 1) != 0;
     let palette_manual = (flags & 2) != 0;
     let air_only = (flags & 4) != 0;
+    let living_decor = if is_v5 { (flags & 8) != 0 } else { true };
+    let spawn_npcs = if is_v5 { (flags & 16) != 0 } else { false };
     let toggles = [
         body[15].min(2),
         body[16].min(2),
@@ -462,10 +471,17 @@ pub fn decode_share_code_lang(
         inferred
     };
 
-    let (wear_pct, overgrowth_pct) = if is_v4 && cur + 2 <= body.len() {
-        (body[cur].min(100), body[cur + 1].min(100))
+    let (wear_pct, overgrowth_pct, blend_radius) = if is_v4 && cur + 2 <= body.len() {
+        let br = if is_v5 && cur + 3 <= body.len() {
+            body[cur + 2].min(10)
+        } else if adapt_terrain {
+            4
+        } else {
+            0
+        };
+        (body[cur].min(100), body[cur + 1].min(100), br)
     } else {
-        (0, 0)
+        (0, 0, if adapt_terrain { 4 } else { 0 })
     };
 
     let name = name_override
@@ -490,6 +506,9 @@ pub fn decode_share_code_lang(
         seed,
         palette_manual,
         palette,
+        living_decor,
+        spawn_npcs,
+        blend_radius,
     })
 }
 

@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::gen_common::{
-    LocalGrid, PlannedBlock, get_uv, is_fp, is_lantern, is_solid_or_occupied, make_beam_block_at,
-    make_frame_block_at, make_slab, make_stair, make_trapdoor, make_wall_sconce, set_uv,
-    style_carpet, style_pot,
+    BannerStyle, LecternBookKind, LivingEntityKind, LivingPlan, LocalGrid, PlannedBanner,
+    PlannedBlock, PlannedEntity, PlannedLectern, get_uv, is_fp, is_lantern, is_solid_or_occupied,
+    make_beam_block_at, make_frame_block_at, make_slab, make_stair, make_trapdoor, make_wall_sconce,
+    set_uv, style_carpet, style_pot,
 };
-use crate::model::{BuildCategory, BuildStyle, MaterialPalette};
+use crate::model::{BuildCategory, BuildStyle, CardinalFacing, MaterialPalette};
 use crate::noise::SplitMix64;
 use crate::parser::{BlueprintSpec, StructureTheme};
 
@@ -2136,4 +2137,498 @@ pub(crate) fn build_interior_zoning(
             bp_idx += 1;
         }
     }
+}
+
+pub(crate) fn wood_prefix_for_palette(pal: &MaterialPalette) -> &'static str {
+    let key = format!("{} {} {}", pal.door, pal.fence, pal.floor);
+    if key.contains("cherry") {
+        "cherry"
+    } else if key.contains("spruce") {
+        "spruce"
+    } else if key.contains("dark_oak") {
+        "dark_oak"
+    } else if key.contains("birch") {
+        "birch"
+    } else if key.contains("bamboo") {
+        "bamboo"
+    } else if key.contains("pale_oak") {
+        "pale_oak"
+    } else {
+        "oak"
+    }
+}
+
+pub(crate) fn banner_theme_for_spec(
+    spec: &BlueprintSpec,
+) -> (BannerStyle, &'static str, &'static str) {
+    if spec.style == BuildStyle::Gothic {
+        return match spec.category {
+            BuildCategory::Temple => (BannerStyle::TempleSacred, "purple", "white"),
+            _ => (BannerStyle::RoyalCastle, "purple", "yellow"),
+        };
+    }
+    match (spec.category, spec.theme) {
+        (BuildCategory::Castle | BuildCategory::Tower, _) => {
+            (BannerStyle::RoyalCastle, "red", "yellow")
+        }
+        (BuildCategory::Temple, _) => (BannerStyle::TempleSacred, "white", "yellow"),
+        (BuildCategory::Forge, _) => (BannerStyle::GuildCraft, "red", "black"),
+        (BuildCategory::Engineering, _) => (BannerStyle::EngineerCog, "gray", "orange"),
+        (BuildCategory::Agricultural | BuildCategory::Barn | BuildCategory::Pavilion, _) => {
+            (BannerStyle::ParkBotanical, "green", "lime")
+        }
+        (BuildCategory::DecorArt, _) => (BannerStyle::ParkBotanical, "cyan", "white"),
+        (_, StructureTheme::ShipyardDock | StructureTheme::CanalLock) => {
+            (BannerStyle::HarborNautical, "blue", "white")
+        }
+        (_, StructureTheme::TrainStation | StructureTheme::RailwayRoundhouse) => {
+            (BannerStyle::EngineerCog, "gray", "yellow")
+        }
+        _ => (BannerStyle::GuildCraft, "blue", "yellow"),
+    }
+}
+
+fn lectern_book_for_spec(spec: &BlueprintSpec) -> LecternBookKind {
+    match (spec.theme, spec.category) {
+        (StructureTheme::Library | StructureTheme::Academy, _) => LecternBookKind::LibraryChronicle,
+        (StructureTheme::MageTower | StructureTheme::Apothecary, _) => LecternBookKind::MageGrimoire,
+        (StructureTheme::Observatory, _) => LecternBookKind::ObservatoryStarChart,
+        (_, BuildCategory::Temple) => LecternBookKind::TempleCodex,
+        (_, BuildCategory::Castle) => LecternBookKind::CastleDecree,
+        (_, BuildCategory::Engineering) => LecternBookKind::EngineeringLog,
+        (_, BuildCategory::Agricultural | BuildCategory::Barn) => LecternBookKind::FarmAlmanac,
+        (_, BuildCategory::Dungeon) => LecternBookKind::DungeonJournal,
+        (StructureTheme::TownHall | StructureTheme::Tavern, _) => LecternBookKind::TownCharter,
+        _ => LecternBookKind::StudyNotes,
+    }
+}
+
+pub(crate) fn is_opaque_wall_block(b: &PlannedBlock) -> bool {
+    let id = b.block_id.as_str();
+    id != "minecraft:air"
+        && id != "minecraft:water"
+        && id != "minecraft:lava"
+        && !id.contains("glass")
+        && !id.ends_with("_door")
+        && !id.ends_with("_bed")
+        && !id.ends_with("_stairs")
+        && !id.ends_with("_slab")
+        && !id.ends_with("_fence")
+        && !id.ends_with("_fence_gate")
+        && !id.ends_with("_wall")
+        && !id.ends_with("_carpet")
+        && !id.ends_with("_trapdoor")
+        && !id.ends_with("_leaves")
+        && !id.ends_with("_banner")
+        && !id.ends_with("_wall_banner")
+        && !id.ends_with("_sign")
+        && !id.ends_with("_wall_sign")
+        && !id.ends_with("_pressure_plate")
+        && !id.ends_with("_grate")
+        && !id.ends_with("torch")
+        && !id.ends_with("lantern")
+        && !matches!(
+            id,
+            "minecraft:iron_bars" | "minecraft:lever" | "minecraft:ladder" | "minecraft:vine"
+        )
+}
+
+#[inline]
+fn local_pos(grid: LocalGrid, u: i32, y: i32, v: i32) -> [i32; 3] {
+    let [lx, lz] = grid.to_local_xz(u, v);
+    [lx, y, lz]
+}
+
+fn is_air_or_empty(blocks: &BTreeMap<[i32; 3], PlannedBlock>, grid: LocalGrid, u: i32, y: i32, v: i32) -> bool {
+    grid.in_bounds(u, v)
+        && get_uv(blocks, grid, u, y, v).is_none_or(|b| b.block_id == "minecraft:air")
+}
+
+/// Adds Living Interiors 2.0 redstone thresholds/levers, banners, paintings, armor stands,
+/// item frames, readable lecterns, and optional resident NPCs/pets inside generated structures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decorate_living_interiors(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    grid: LocalGrid,
+    fp: &[bool],
+    bounds: [i32; 4],
+    best_door: Option<(i32, i32)>,
+    stairwell_uv: &[(i32, i32)],
+    spec: &BlueprintSpec,
+    pal: &MaterialPalette,
+    seed: u64,
+) -> LivingPlan {
+    let mut living = LivingPlan::default();
+    if spec.ruin_erosion >= 0.1
+        || (spec.category == BuildCategory::Pavilion && spec.theme != StructureTheme::Greenhouse)
+    {
+        return living;
+    }
+    if !spec.living_decor && !spec.spawn_npcs {
+        return living;
+    }
+
+    let mut rng = SplitMix64::new(seed ^ 0x4C49_5649_4E47_3230);
+    let ground_y = i32::from(spec.foundation_height);
+    let floor_h = i32::from(spec.floor_height);
+    let [b_u0, b_v0, b_u1, b_v1] = bounds;
+
+    // 1. Collect all readable lecterns across floors (and add one in key interiors if missing).
+    let book_kind = lectern_book_for_spec(spec);
+    for f in 0..i32::from(spec.floors.max(1)) {
+        let ly = ground_y + f * floor_h + 1;
+        for v in 0..grid.d {
+            for u in 0..grid.w {
+                if get_uv(blocks, grid, u, ly, v)
+                    .is_some_and(|b| b.block_id == "minecraft:lectern")
+                {
+                    living.lecterns.push(PlannedLectern {
+                        pos: local_pos(grid, u, ly, v),
+                        book: book_kind,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Threshold pressure plates & gate/forge levers inside the entrance.
+    if spec.living_decor
+        && let Some((du, dv)) = best_door
+    {
+        let in_v = dv - 1;
+        if grid.in_bounds(du, in_v)
+            && is_fp(grid, fp, du, in_v)
+            && get_uv(blocks, grid, du, ground_y, in_v).is_some_and(is_opaque_wall_block)
+            && is_air_or_empty(blocks, grid, du, ground_y + 1, in_v)
+        {
+            let plate_id = if matches!(
+                spec.category,
+                BuildCategory::Castle | BuildCategory::Forge | BuildCategory::Tower
+            ) {
+                "minecraft:heavy_weighted_pressure_plate".to_owned()
+            } else {
+                format!("minecraft:{}_pressure_plate", wood_prefix_for_palette(pal))
+            };
+            set_uv(
+                blocks,
+                grid,
+                du,
+                ground_y + 1,
+                in_v,
+                PlannedBlock::with_props(plate_id, vec![("powered", "false")]),
+            );
+        }
+
+        if matches!(
+            spec.category,
+            BuildCategory::Castle | BuildCategory::Forge | BuildCategory::Tower
+        ) {
+            for side in [-1, 1] {
+                let lu = du + side;
+                if grid.in_bounds(lu, in_v)
+                    && is_fp(grid, fp, lu, in_v)
+                    && get_uv(blocks, grid, lu, ground_y + 2, dv).is_some_and(is_opaque_wall_block)
+                    && is_air_or_empty(blocks, grid, lu, ground_y + 2, in_v)
+                {
+                    set_uv(
+                        blocks,
+                        grid,
+                        lu,
+                        ground_y + 2,
+                        in_v,
+                        PlannedBlock::with_props(
+                            "minecraft:lever",
+                            vec![
+                                ("face", "wall"),
+                                ("facing", grid.dir_back()),
+                                ("powered", "false"),
+                            ],
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Gather clean interior floor & wall-backed spots on ground (and upper) floors.
+    let mut floor_spots: Vec<(i32, i32, i32)> = Vec::new();
+    let mut wall_spots: Vec<(i32, i32, i32, &'static str)> = Vec::new();
+    let dirs = [
+        (0, -1, grid.dir_front()),
+        (0, 1, grid.dir_back()),
+        (-1, 0, grid.dir_right()),
+        (1, 0, grid.dir_left()),
+    ];
+
+    for f in 0..i32::from(spec.floors.min(2)) {
+        let fy = ground_y + f * floor_h;
+        for v in (b_v0 + 1)..b_v1 {
+            for u in (b_u0 + 1)..b_u1 {
+                if !is_fp(grid, fp, u, v)
+                    || stairwell_uv
+                        .iter()
+                        .any(|&(su, sv)| (su - u).abs() <= 1 && (sv - v).abs() <= 1)
+                    || best_door.is_some_and(|(du, dv)| (du - u).abs() <= 1 && (dv - v).abs() <= 2)
+                {
+                    continue;
+                }
+                if get_uv(blocks, grid, u, fy, v).is_some_and(is_opaque_wall_block)
+                    && is_air_or_empty(blocks, grid, u, fy + 1, v)
+                    && is_air_or_empty(blocks, grid, u, fy + 2, v)
+                {
+                    floor_spots.push((u, fy + 1, v));
+                }
+                if floor_h >= 4 && is_air_or_empty(blocks, grid, u, fy + 2, v) {
+                    for &(du_w, dv_w, inward_face) in &dirs {
+                        if get_uv(blocks, grid, u + du_w, fy + 2, v + dv_w)
+                            .is_some_and(is_opaque_wall_block)
+                        {
+                            wall_spots.push((u, fy + 2, v, inward_face));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut used_coords: BTreeSet<(i32, i32, i32)> = BTreeSet::new();
+
+    if living.lecterns.is_empty()
+        && spec.furnished
+        && (matches!(
+            spec.category,
+            BuildCategory::Castle | BuildCategory::Temple | BuildCategory::Tower
+        ) || matches!(
+            spec.theme,
+            StructureTheme::Library
+                | StructureTheme::Academy
+                | StructureTheme::MageTower
+                | StructureTheme::Observatory
+                | StructureTheme::TownHall
+        ))
+        && let Some(&(u, y, v)) = floor_spots.first()
+    {
+        set_uv(
+            blocks,
+            grid,
+            u,
+            y,
+            v,
+            PlannedBlock::with_props(
+                "minecraft:lectern",
+                vec![("facing", grid.dir_front()), ("has_book", "true")],
+            ),
+        );
+        living.lecterns.push(PlannedLectern {
+            pos: local_pos(grid, u, y, v),
+            book: book_kind,
+        });
+        used_coords.insert((u, y, v));
+    }
+
+    if spec.living_decor {
+        let (banner_style, banner_pri, banner_acc) = banner_theme_for_spec(spec);
+        let want_banners = matches!(
+            spec.category,
+            BuildCategory::Castle | BuildCategory::Temple | BuildCategory::Tower | BuildCategory::Forge
+        ) || matches!(
+            spec.theme,
+            StructureTheme::Tavern | StructureTheme::Library | StructureTheme::TownHall
+        ) || (grid.w >= 13 && grid.d >= 11);
+
+        // Wall Banners
+        let mut banner_count = 0usize;
+        if want_banners {
+            let banner_id = format!("minecraft:{banner_pri}_wall_banner");
+            let max_banners = if matches!(spec.category, BuildCategory::Castle | BuildCategory::Temple)
+            {
+                2
+            } else {
+                1
+            };
+            for &(u, y, v, face) in &wall_spots {
+                if banner_count >= max_banners {
+                    break;
+                }
+                let by = if floor_h >= 5 && is_air_or_empty(blocks, grid, u, y + 1, v) {
+                    y + 1
+                } else {
+                    y
+                };
+                if used_coords.contains(&(u, by, v)) || !is_air_or_empty(blocks, grid, u, by, v) {
+                    continue;
+                }
+                set_uv(
+                    blocks,
+                    grid,
+                    u,
+                    by,
+                    v,
+                    PlannedBlock::with_props(banner_id.clone(), vec![("facing", face)]),
+                );
+                living.banners.push(PlannedBanner {
+                    pos: local_pos(grid, u, by, v),
+                    style: banner_style,
+                    primary_color: banner_pri,
+                    accent_color: banner_acc,
+                });
+                used_coords.insert((u, by, v));
+                used_coords.insert((u, y, v));
+                banner_count += 1;
+            }
+        }
+
+        // Paintings (`1x1` variants so they fit cleanly on any interior wall column)
+        let painting_variants = [
+            "minecraft:kebab",
+            "minecraft:aztec",
+            "minecraft:alban",
+            "minecraft:aztec2",
+            "minecraft:bomb",
+            "minecraft:plant",
+            "minecraft:wasteland",
+        ];
+        let mut painting_count = 0usize;
+        let max_paintings = if grid.w >= 13 { 2 } else { 1 };
+        for (idx, &(u, y, v, face)) in wall_spots.iter().enumerate() {
+            if painting_count >= max_paintings {
+                break;
+            }
+            if idx % 2 == 0 || used_coords.contains(&(u, y, v)) {
+                continue;
+            }
+            let variant = painting_variants[rng.range_i32(0, (painting_variants.len() - 1) as i32) as usize];
+            living.entities.push(PlannedEntity {
+                pos: local_pos(grid, u, y, v),
+                kind: LivingEntityKind::Painting,
+                facing: LocalGrid::dir_str_to_facing(face),
+                detail: variant.to_owned(),
+                sub_detail: String::new(),
+                is_decor: true,
+            });
+            used_coords.insert((u, y, v));
+            painting_count += 1;
+        }
+
+        // ItemFrame / GlowItemFrame
+        let is_glow = matches!(spec.category, BuildCategory::Temple | BuildCategory::Tower)
+            || matches!(
+                spec.theme,
+                StructureTheme::MageTower | StructureTheme::Apothecary | StructureTheme::Observatory
+            );
+        let frame_items: &[&str] = match (spec.category, spec.theme) {
+            (BuildCategory::Forge, _) => &["minecraft:iron_sword", "minecraft:iron_pickaxe", "minecraft:anvil"],
+            (_, StructureTheme::Tavern | StructureTheme::WineryBakery) => &["minecraft:bread", "minecraft:apple", "minecraft:golden_apple"],
+            (_, StructureTheme::MageTower | StructureTheme::Apothecary | StructureTheme::Library | StructureTheme::Observatory) => {
+                &["minecraft:written_book", "minecraft:compass", "minecraft:spyglass"]
+            }
+            (BuildCategory::Castle | BuildCategory::Tower, _) => &["minecraft:iron_sword", "minecraft:shield"],
+            (BuildCategory::Temple, _) => &["minecraft:golden_apple", "minecraft:candle"],
+            _ => &["minecraft:lantern", "minecraft:compass", "minecraft:clock"],
+        };
+        let mut frame_count = 0usize;
+        let max_frames = if grid.w >= 15 { 2 } else { 1 };
+        for &(u, y, v, face) in &wall_spots {
+            if frame_count >= max_frames {
+                break;
+            }
+            if used_coords.contains(&(u, y, v)) {
+                continue;
+            }
+            let item = frame_items[frame_count % frame_items.len()];
+            living.entities.push(PlannedEntity {
+                pos: local_pos(grid, u, y, v),
+                kind: if is_glow {
+                    LivingEntityKind::GlowItemFrame
+                } else {
+                    LivingEntityKind::ItemFrame
+                },
+                facing: LocalGrid::dir_str_to_facing(face),
+                detail: item.to_owned(),
+                sub_detail: String::new(),
+                is_decor: true,
+            });
+            used_coords.insert((u, y, v));
+            frame_count += 1;
+        }
+
+        // ArmorStand in martial / noble / workshop builds
+        let want_armor = matches!(
+            spec.category,
+            BuildCategory::Castle | BuildCategory::Forge | BuildCategory::Tower | BuildCategory::Dungeon
+        ) || matches!(spec.theme, StructureTheme::TownHall | StructureTheme::Academy);
+        if want_armor
+            && let Some(&(u, y, v)) = floor_spots.iter().find(|&&(u, y, v)| !used_coords.contains(&(u, y, v)))
+        {
+            let (mat, wpn) = match (spec.category, spec.style) {
+                (BuildCategory::Forge, _) => ("iron", "iron_sword"),
+                (BuildCategory::Castle, BuildStyle::Classical | BuildStyle::Desert) => ("golden", "golden_sword"),
+                (BuildCategory::Tower, _) => ("chainmail", "iron_sword"),
+                _ => ("iron", "iron_sword"),
+            };
+            let opp_facing = match grid.facing {
+                CardinalFacing::North => CardinalFacing::South,
+                CardinalFacing::South => CardinalFacing::North,
+                CardinalFacing::East => CardinalFacing::West,
+                CardinalFacing::West => CardinalFacing::East,
+            };
+            living.entities.push(PlannedEntity {
+                pos: local_pos(grid, u, y, v),
+                kind: LivingEntityKind::ArmorStand,
+                facing: opp_facing,
+                detail: mat.to_owned(),
+                sub_detail: wpn.to_owned(),
+                is_decor: true,
+            });
+            used_coords.insert((u, y, v));
+        }
+    }
+
+    // 4. Optional Living Residents (`spawn_npcs`, `is_decor: false`).
+    if spec.spawn_npcs
+        && let Some(&(u, y, v)) = floor_spots.iter().find(|&&(u, y, v)| !used_coords.contains(&(u, y, v)))
+    {
+        let prof = match (spec.category, spec.theme) {
+            (BuildCategory::Forge, _) => "weaponsmith",
+            (BuildCategory::Barn, _) => "farmer",
+            (BuildCategory::Temple, _) => "cleric",
+            (BuildCategory::Castle | BuildCategory::Tower, _) => "armorer",
+            (_, StructureTheme::Library | StructureTheme::Academy | StructureTheme::Observatory) => {
+                "librarian"
+            }
+            (_, StructureTheme::MageTower | StructureTheme::Apothecary) => "cleric",
+            (_, StructureTheme::Tavern | StructureTheme::WineryBakery) => "butcher",
+            (_, StructureTheme::ShipyardDock) => "fisherman",
+            _ => "mason",
+        };
+        living.entities.push(PlannedEntity {
+            pos: local_pos(grid, u, y, v),
+            kind: LivingEntityKind::Villager,
+            facing: grid.facing,
+            detail: prof.to_owned(),
+            sub_detail: spec.biome_tag.clone(),
+            is_decor: false,
+        });
+        used_coords.insert((u, y, v));
+
+        if (matches!(spec.category, BuildCategory::House)
+            || matches!(spec.theme, StructureTheme::Tavern | StructureTheme::Library | StructureTheme::WineryBakery))
+            && let Some(&(cu, cy, cv)) = floor_spots
+                .iter()
+                .find(|&&(u2, y2, v2)| !used_coords.contains(&(u2, y2, v2)))
+        {
+            living.entities.push(PlannedEntity {
+                pos: local_pos(grid, cu, cy, cv),
+                kind: LivingEntityKind::Cat,
+                facing: grid.facing,
+                detail: String::new(),
+                sub_detail: String::new(),
+                is_decor: false,
+            });
+        }
+    }
+
+    living
 }

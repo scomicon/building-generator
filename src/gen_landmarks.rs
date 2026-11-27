@@ -77,7 +77,14 @@ pub(crate) fn try_generate_landmark(
         StructureTheme::VikingLonghouse => Some(crate::gen_fantasy_folk::generate_viking_longhouse(req, spec, grid, height, noise, terrain_offsets)),
         StructureTheme::AlpineChalet => Some(crate::gen_fantasy_folk::generate_alpine_chalet(req, spec, grid, height, noise, terrain_offsets)),
         StructureTheme::DesertKasbah => Some(crate::gen_fantasy_folk::generate_desert_kasbah(req, spec, grid, height, noise, terrain_offsets)),
-        _ => None,
+        _ => crate::gen_new_categories::try_generate_new_category(
+            req,
+            &spec,
+            grid,
+            height,
+            noise,
+            terrain_offsets,
+        ),
     }
 }
 
@@ -386,12 +393,54 @@ pub(crate) fn finish_landmark(
     spec: BlueprintSpec,
     grid: LocalGrid,
     height: u16,
+    blocks: BTreeMap<[i32; 3], PlannedBlock>,
+    noise: NoiseField,
+    door_pos: Option<[i32; 3]>,
+) -> GeneratedBlueprint {
+    finish_landmark_with_living(
+        req,
+        spec,
+        grid,
+        height,
+        blocks,
+        noise,
+        door_pos,
+        crate::gen_common::LivingPlan::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_landmark_with_living(
+    req: &BuildRequest,
+    mut spec: BlueprintSpec,
+    grid: LocalGrid,
+    height: u16,
     mut blocks: BTreeMap<[i32; 3], PlannedBlock>,
     _noise: NoiseField,
     door_pos: Option<[i32; 3]>,
+    mut living: crate::gen_common::LivingPlan,
 ) -> GeneratedBlueprint {
+    spec.living_decor &= req.living_decor;
+    spec.spawn_npcs |= req.spawn_npcs;
+    if !spec.living_decor {
+        living.signs.clear();
+        living.banners.clear();
+        living.entities.retain(|e| !e.is_decor);
+    }
+    if !spec.spawn_npcs {
+        living.entities.retain(|e| e.is_decor);
+    }
+    if spec.living_decor {
+        living.materialize_signs_and_banners(
+            &mut blocks,
+            crate::gen_interior::wood_prefix_for_palette(&req.palette),
+        );
+    }
     prune_map_unsupported(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
+    living
+        .lecterns
+        .retain(|l| blocks.get(&l.pos).is_some_and(|b| b.block_id == "minecraft:lectern"));
     GeneratedBlueprint {
         spec,
         origin: [req.origin_x, req.origin_y, req.origin_z],
@@ -400,6 +449,7 @@ pub(crate) fn finish_landmark(
         height,
         blocks,
         door_pos,
+        living,
     }
 }
 

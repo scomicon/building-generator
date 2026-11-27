@@ -11,7 +11,8 @@ use mod_api::{
 
 use crate::model::{
     BuildCategory, BuildRequest, BuildResponse, BuildStyle, CardinalFacing, MaterialPalette,
-    NoiseLevel, RedoRequest, RerollRequest, SetLangRequest, UiLang, UndoRequest,
+    NoiseLevel, RedoRequest, RerollRequest, RoadConnectRequest, SetLangRequest, UiLang,
+    UndoRequest,
 };
 use crate::network::channels;
 use crate::persist::{
@@ -28,6 +29,7 @@ enum UiTab {
     SizeArea,
     DescNoise,
     Materials,
+    WorldDecor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,9 @@ fn current_saved_preset(st: &ClientUiState, name: String) -> SavedPreset {
         seed: st.seed,
         palette_manual: st.palette_manual,
         palette: st.palette.clone(),
+        living_decor: st.living_decor,
+        spawn_npcs: st.spawn_npcs,
+        blend_radius: st.blend_radius,
     }
 }
 
@@ -117,10 +122,14 @@ fn apply_saved_preset(st: &mut ClientUiState, preset: SavedPreset) {
     st.auto_seed = false;
     st.palette_manual = preset.palette_manual;
     st.palette = preset.palette;
+    st.living_decor = preset.living_decor;
+    st.spawn_npcs = preset.spawn_npcs;
+    st.blend_radius = preset.blend_radius.min(10);
     sync_palette_from_ui(st);
     st.mat_list_scroll = 0;
     st.picker_scroll = 0;
     st.bom_scroll = 0;
+    st.bp_cache_key = None;
     st.preview_key = None;
 }
 
@@ -220,6 +229,8 @@ enum WorldSelectMode {
     PickingCorner1,
     PickingCorner2 { c1: [i32; 3] },
     MovePreview,
+    PickingRoadStart,
+    PickingRoadEnd { start: [i32; 3] },
 }
 
 #[derive(Clone)]
@@ -228,11 +239,13 @@ enum PendingAction {
     CloseMenu,
     StartWorldSelect,
     StartMovePreview,
+    StartRoadSelect,
     PlaceInFront,
     CopyShareCode(SavedPreset),
     PasteShareCode,
     CopyBomText(String),
     SendBuild(BuildRequest),
+    SendRoad(RoadConnectRequest),
     SendReroll(String),
     SendUndo(String),
     SendRedo(String),
@@ -253,6 +266,7 @@ struct WidgetHandles {
     tab_size: Option<WidgetId>,
     tab_desc: Option<WidgetId>,
     tab_mats: Option<WidgetId>,
+    tab_world: Option<WidgetId>,
 
     // Tab 1: Size & Area
     w_dec: Option<WidgetId>,
@@ -352,6 +366,14 @@ struct WidgetHandles {
     picker_grid_btns: Vec<(WidgetId, String)>,
     picker_chip_btns: Vec<(WidgetId, usize)>,
 
+    // Tab 4: World & Decor
+    living_decor_btn: Option<WidgetId>,
+    spawn_npcs_btn: Option<WidgetId>,
+    blend_radius_btn: Option<WidgetId>,
+    road_width_btn: Option<WidgetId>,
+    road_auto_bridge_btn: Option<WidgetId>,
+    road_connect_btn: Option<WidgetId>,
+
     // Persistent Footer
     generate_btn: WidgetId,
     reroll_btn: WidgetId,
@@ -397,6 +419,7 @@ struct BpCacheKey {
     palette_fp: u64,
     wear_pct: u8,
     overgrowth_pct: u8,
+    living_decor: bool,
     biome_hint: String,
 }
 
@@ -426,6 +449,11 @@ struct ClientUiState {
     air_only: bool,
     wear_pct: u8,
     overgrowth_pct: u8,
+    living_decor: bool,
+    spawn_npcs: bool,
+    blend_radius: u8,
+    road_width: u8,
+    road_auto_bridge: bool,
     use_biome_auto: bool,
     detected_biome: String,
     last_biome_query: Option<(String, i32, i32, i32)>,
@@ -476,6 +504,7 @@ struct ClientUiState {
     auto_sync_wood: bool,
     world_select: WorldSelectMode,
     aimed_block: Option<[i32; 3]>,
+    road_preview_cache: Option<([i32; 3], [i32; 3], Vec<f64>)>,
     terrain_cache_key: Option<(bool, i32, i32, i32, u16, u16)>,
     cached_terrain_offsets: Option<Vec<i32>>,
     cached_water_depths: Option<Vec<i32>>,
@@ -519,6 +548,11 @@ impl Default for ClientUiState {
             air_only: false,
             wear_pct: 0,
             overgrowth_pct: 0,
+            living_decor: true,
+            spawn_npcs: false,
+            blend_radius: 3,
+            road_width: 3,
+            road_auto_bridge: true,
             use_biome_auto: true,
             detected_biome: String::new(),
             last_biome_query: None,
@@ -569,6 +603,7 @@ impl Default for ClientUiState {
             auto_sync_wood: true,
             world_select: WorldSelectMode::Inactive,
             aimed_block: None,
+            road_preview_cache: None,
             terrain_cache_key: None,
             cached_terrain_offsets: None,
             cached_water_depths: None,
@@ -1121,21 +1156,23 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let mut tab_size = None;
     let mut tab_desc = None;
     let mut tab_mats = None;
+    let mut tab_world = None;
     let tab_y = py + 24.0;
     let body_y = tab_y + 24.0;
 
     if !st.picker_open && !st.preset_picker_open && !st.bom_open {
-        let tab_w = ((inner_w - 8.0) / 3.0).floor();
+        let tab_w = ((inner_w - 12.0) / 4.0).floor();
+        let tab_w4 = inner_w - (tab_w + 4.0) * 3.0;
         let mut b1 = Button::new(
             [px + pad, tab_y, tab_w, 18.0],
-            Text::literal(tr(lang, "1. Size & Area", "1. Размер и Область")),
+            Text::literal(tr(lang, "1. Size & Area", "1. Размер")),
         );
         b1.active = st.tab != UiTab::SizeArea;
         tab_size = Some(w.add_button(b1));
 
         let mut b2 = Button::new(
             [px + pad + tab_w + 4.0, tab_y, tab_w, 18.0],
-            Text::literal(tr(lang, "2. Style & Noise", "2. Стиль и Шум")),
+            Text::literal(tr(lang, "2. Style & Noise", "2. Стиль")),
         );
         b2.active = st.tab != UiTab::DescNoise;
         tab_desc = Some(w.add_button(b2));
@@ -1146,6 +1183,13 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         );
         b3.active = st.tab != UiTab::Materials;
         tab_mats = Some(w.add_button(b3));
+
+        let mut b4 = Button::new(
+            [px + pad + (tab_w + 4.0) * 3.0, tab_y, tab_w4, 18.0],
+            Text::literal(tr(lang, "4. World & Decor", "4. Мир и Декор")),
+        );
+        b4.active = st.tab != UiTab::WorldDecor;
+        tab_world = Some(w.add_button(b4));
     }
 
     let mut w_dec = None;
@@ -1239,6 +1283,13 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let mut picker_down_btn = None;
     let mut picker_grid_btns = Vec::new();
     let mut picker_chip_btns = Vec::new();
+
+    let mut living_decor_btn = None;
+    let mut spawn_npcs_btn = None;
+    let mut blend_radius_btn = None;
+    let mut road_width_btn = None;
+    let mut road_auto_bridge_btn = None;
+    let mut road_connect_btn = None;
 
     let mut slot_scroll_zone = None;
     let mut list_scroll_zone = None;
@@ -2028,6 +2079,76 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                 scroll: list_scroll,
             });
         }
+        UiTab::WorldDecor => {
+            let lx = px + pad;
+            let half_w = ((inner_w - 6.0) * 0.5).floor();
+            let rx = lx + half_w + 6.0;
+            let right_w = inner_w - half_w - 6.0;
+
+            // Section 1: Living Interiors 2.0 + Outer Terrain Smoothing
+            living_decor_btn = Some(w.add_button(Button::new(
+                [lx, body_y + 17.0, half_w, 19.0],
+                Text::literal(match (lang, st.living_decor) {
+                    (UiLang::En, true) => "Living Decor: ON",
+                    (UiLang::En, false) => "Living Decor: OFF",
+                    (UiLang::Ru, true) => "Живой декор: ВКЛ",
+                    (UiLang::Ru, false) => "Живой декор: ВЫКЛ",
+                }),
+            )));
+            spawn_npcs_btn = Some(w.add_button(Button::new(
+                [rx, body_y + 17.0, right_w, 19.0],
+                Text::literal(match (lang, st.spawn_npcs) {
+                    (UiLang::En, true) => "Spawn NPCs/Mobs: ON",
+                    (UiLang::En, false) => "Spawn NPCs/Mobs: OFF",
+                    (UiLang::Ru, true) => "Спавн NPC/Мобов: ВКЛ",
+                    (UiLang::Ru, false) => "Спавн NPC/Мобов: ВЫКЛ",
+                }),
+            )));
+
+            let blend_lbl = match (lang, st.blend_radius) {
+                (UiLang::En, 0) => "Edge Blend: Off".to_owned(),
+                (UiLang::En, r) => format!("Edge Blend: {r}b"),
+                (UiLang::Ru, 0) => "Сглаж. краёв: Выкл".to_owned(),
+                (UiLang::Ru, r) => format!("Сглаж. краёв: {r}"),
+            };
+            blend_radius_btn = Some(w.add_button(Button::new(
+                [lx, body_y + 40.0, half_w, 19.0],
+                Text::literal(blend_lbl),
+            )));
+            terrain_btn = Some(w.add_button(Button::new(
+                [rx, body_y + 40.0, right_w, 19.0],
+                Text::literal(match (lang, st.adapt_terrain) {
+                    (UiLang::En, true) => "Terrain: ON",
+                    (UiLang::En, false) => "Terrain: OFF",
+                    (UiLang::Ru, true) => "Рельеф: ВКЛ",
+                    (UiLang::Ru, false) => "Рельеф: ВЫКЛ",
+                }),
+            )));
+
+            // Section 2: 2-Point Road & Auto-Bridge Connector
+            road_width_btn = Some(w.add_button(Button::new(
+                [lx, body_y + 96.0, half_w, 19.0],
+                Text::literal(match lang {
+                    UiLang::En => format!("Road Width: {}", st.road_width),
+                    UiLang::Ru => format!("Ширина дороги: {}", st.road_width),
+                }),
+            )));
+            road_auto_bridge_btn = Some(w.add_button(Button::new(
+                [rx, body_y + 96.0, right_w, 19.0],
+                Text::literal(match (lang, st.road_auto_bridge) {
+                    (UiLang::En, true) => "Auto-Bridge: ON",
+                    (UiLang::En, false) => "Auto-Bridge: OFF",
+                    (UiLang::Ru, true) => "Авто-мост: ВКЛ",
+                    (UiLang::Ru, false) => "Авто-мост: ВЫКЛ",
+                }),
+            )));
+
+            let r_rect = [lx, body_y + 119.0, inner_w, 22.0];
+            road_connect_btn = Some(w.add_button(Button::new(
+                r_rect,
+                Text::literal(tr(lang, "Connect Road (2 Points)", "Проложить дорогу (2 точки)")),
+            )));
+        }
     }
     }
 
@@ -2091,6 +2212,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             tab_size,
             tab_desc,
             tab_mats,
+            tab_world,
             w_dec,
             w_inc,
             d_dec,
@@ -2177,6 +2299,12 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             picker_down_btn,
             picker_grid_btns,
             picker_chip_btns,
+            living_decor_btn,
+            spawn_npcs_btn,
+            blend_radius_btn,
+            road_width_btn,
+            road_auto_bridge_btn,
+            road_connect_btn,
             generate_btn,
             reroll_btn,
             undo_btn,
@@ -2530,6 +2658,67 @@ fn handle_widget_input(host: &dyn ClientHost, input: impl FnOnce(&mut Widgets) -
                 } else if Some(id) == h.tab_mats {
                     st.tab = UiTab::Materials;
                     st.dirty = true;
+                } else if Some(id) == h.tab_world {
+                    st.tab = UiTab::WorldDecor;
+                    st.dirty = true;
+                } else if Some(id) == h.living_decor_btn {
+                    st.living_decor = !st.living_decor;
+                    st.bp_cache_key = None;
+                    st.preview_key = None;
+                    st.status = match (st.lang, st.living_decor) {
+                        (UiLang::En, true) => "Living Decor: ON (stands, frames, banners, signs, lamps)".into(),
+                        (UiLang::En, false) => "Living Decor: OFF".into(),
+                        (UiLang::Ru, true) => "Живой декор: ВКЛ (стойки, рамки, флаги, таблички, лампы)".into(),
+                        (UiLang::Ru, false) => "Живой декор: ВЫКЛ".into(),
+                    };
+                    st.dirty = true;
+                } else if Some(id) == h.spawn_npcs_btn {
+                    st.spawn_npcs = !st.spawn_npcs;
+                    st.bp_cache_key = None;
+                    st.preview_key = None;
+                    st.status = match (st.lang, st.spawn_npcs) {
+                        (UiLang::En, true) => "Spawn NPCs/Mobs: ON".into(),
+                        (UiLang::En, false) => "Spawn NPCs/Mobs: OFF".into(),
+                        (UiLang::Ru, true) => "Спавн NPC/Мобов: ВКЛ".into(),
+                        (UiLang::Ru, false) => "Спавн NPC/Мобов: ВЫКЛ".into(),
+                    };
+                    st.dirty = true;
+                } else if Some(id) == h.blend_radius_btn {
+                    st.blend_radius = match st.blend_radius {
+                        0 => 3,
+                        1..=3 => 6,
+                        4..=6 => 8,
+                        _ => 0,
+                    };
+                    st.bp_cache_key = None;
+                    st.preview_key = None;
+                    st.status = match (st.lang, st.blend_radius) {
+                        (UiLang::En, 0) => "Outer Edge Blend: OFF".into(),
+                        (UiLang::En, r) => format!("Outer Edge Blend: {r} blocks"),
+                        (UiLang::Ru, 0) => "Сглаживание краёв: ВЫКЛ".into(),
+                        (UiLang::Ru, r) => format!("Сглаживание краёв: {r} бл."),
+                    };
+                    st.dirty = true;
+                } else if Some(id) == h.road_width_btn {
+                    st.road_width = if st.road_width == 3 { 5 } else { 3 };
+                    st.road_preview_cache = None;
+                    st.status = match st.lang {
+                        UiLang::En => format!("Road Width: {} blocks", st.road_width),
+                        UiLang::Ru => format!("Ширина дороги: {} бл.", st.road_width),
+                    };
+                    st.dirty = true;
+                } else if Some(id) == h.road_auto_bridge_btn {
+                    st.road_auto_bridge = !st.road_auto_bridge;
+                    st.road_preview_cache = None;
+                    st.status = match (st.lang, st.road_auto_bridge) {
+                        (UiLang::En, true) => "Auto-Bridge: ON (spans water & gaps)".into(),
+                        (UiLang::En, false) => "Auto-Bridge: OFF (terrain hugging)".into(),
+                        (UiLang::Ru, true) => "Авто-мост: ВКЛ (через воду и обрывы)".into(),
+                        (UiLang::Ru, false) => "Авто-мост: ВЫКЛ (по рельефу)".into(),
+                    };
+                    st.dirty = true;
+                } else if Some(id) == h.road_connect_btn {
+                    st.pending = Some(PendingAction::StartRoadSelect);
                 } else if Some(id) == h.w_dec {
                     st.width = st.width.saturating_sub(2).max(7);
                     st.dirty = true;
@@ -3150,6 +3339,9 @@ fn queue_build_from_state(host: &dyn ClientHost, st: &mut ClientUiState) {
             String::new()
         },
         palette: st.palette.clone(),
+        living_decor: st.living_decor,
+        spawn_npcs: st.spawn_npcs,
+        blend_radius: if st.adapt_terrain { st.blend_radius } else { 0 },
     };
     st.status = match st.lang {
         UiLang::En => format!("Build (seed {}) sent...", st.seed),
@@ -3299,6 +3491,34 @@ pub fn on_input_key(host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {
         }
     }
 
+    if matches!(
+        mode,
+        WorldSelectMode::PickingRoadStart | WorldSelectMode::PickingRoadEnd { .. }
+    ) {
+        if event.key == "key.keyboard.escape" {
+            with_state(|st| {
+                st.world_select = WorldSelectMode::Inactive;
+                st.road_preview_cache = None;
+                st.dirty = true;
+            });
+            host.mod_screen_open(SCREEN_ID);
+        } else if event.key == "key.keyboard.r" {
+            let now = host.millis();
+            with_state(|st| {
+                st.road_width = if st.road_width == 3 { 5 } else { 3 };
+                st.road_preview_cache = None;
+                let msg = match st.lang {
+                    UiLang::En => format!("Road width: {} blocks", st.road_width),
+                    UiLang::Ru => format!("Ширина дороги: {} бл.", st.road_width),
+                };
+                st.status = msg.clone();
+                st.hud_toast = Some((msg, now + 1800));
+                st.dirty = true;
+            });
+        }
+        return;
+    }
+
     if event.key == "key.keyboard.r" {
         with_state(|st| {
             st.facing = st.facing.next();
@@ -3442,6 +3662,87 @@ pub fn on_mouse_button_pre(host: &mut dyn ClientHost, event: &mut MouseButtonPre
                     st.dirty = true;
                 }
                 false
+            }
+            WorldSelectMode::PickingRoadStart => {
+                if event.button == 0 || event.button == 1 {
+                    let now = host.millis();
+                    st.world_select = WorldSelectMode::PickingRoadEnd { start: hit_pos };
+                    st.road_preview_cache = None;
+                    st.hud_toast = Some((
+                        tr(
+                            st.lang,
+                            "Pick road end point [LMB/RMB] or [Esc] cancel",
+                            "Выберите конец дороги [ЛКМ/ПКМ] или [Esc] отмена",
+                        )
+                        .into(),
+                        now + 2600,
+                    ));
+                    st.status = match st.lang {
+                        UiLang::En => format!(
+                            "Road start @ ({}, {}, {}) — pick end point",
+                            hit_pos[0], hit_pos[1], hit_pos[2]
+                        ),
+                        UiLang::Ru => format!(
+                            "Начало дороги @ ({}, {}, {}) — выберите конец",
+                            hit_pos[0], hit_pos[1], hit_pos[2]
+                        ),
+                    };
+                }
+                false
+            }
+            WorldSelectMode::PickingRoadEnd { start } => {
+                if event.button == 0 || event.button == 1 {
+                    if st.auto_seed {
+                        st.build_seq = st.build_seq.wrapping_add(1);
+                        push_seed_history(st, st.seed);
+                        st.seed = crate::noise::fresh_entropy(st.build_seq, host.millis());
+                        st.seed_text = st.seed.to_string();
+                    }
+                    sync_palette_from_ui(st);
+                    let req = RoadConnectRequest {
+                        dimension: st.dimension.clone(),
+                        start_x: start[0],
+                        start_y: start[1],
+                        start_z: start[2],
+                        end_x: hit_pos[0],
+                        end_y: hit_pos[1],
+                        end_z: hit_pos[2],
+                        road_width: st.road_width,
+                        auto_bridge: st.road_auto_bridge,
+                        style: st.style,
+                        seed: st.seed as i64,
+                        air_only: st.air_only,
+                        blend_radius: st.blend_radius,
+                        living_decor: st.living_decor,
+                        spawn_npcs: st.spawn_npcs,
+                        biome_hint: if st.use_biome_auto {
+                            st.detected_biome.clone()
+                        } else {
+                            String::new()
+                        },
+                        palette: st.palette.clone(),
+                    };
+                    st.world_select = WorldSelectMode::Inactive;
+                    st.road_preview_cache = None;
+                    let now = host.millis();
+                    let msg = match st.lang {
+                        UiLang::En => format!(
+                            "Road ({},{},{}) -> ({},{},{}) [w={}] sent...",
+                            start[0], start[1], start[2], hit_pos[0], hit_pos[1], hit_pos[2], st.road_width
+                        ),
+                        UiLang::Ru => format!(
+                            "Дорога ({},{},{}) -> ({},{},{}) [шир={}] отправлена...",
+                            start[0], start[1], start[2], hit_pos[0], hit_pos[1], hit_pos[2], st.road_width
+                        ),
+                    };
+                    st.hud_toast = Some((msg.clone(), now + 2600));
+                    st.status = msg;
+                    st.pending = Some(PendingAction::SendRoad(req));
+                    st.dirty = true;
+                    true
+                } else {
+                    false
+                }
             }
         }
     });
@@ -3675,6 +3976,14 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
                 st.aimed_block = current_aim_block(host);
             });
         }
+        PendingAction::StartRoadSelect => {
+            host.mod_screen_close(SCREEN_ID);
+            with_state(|st| {
+                st.world_select = WorldSelectMode::PickingRoadStart;
+                st.road_preview_cache = None;
+                st.aimed_block = current_aim_block(host);
+            });
+        }
         PendingAction::PlaceInFront => {
             with_state(|st| {
                 compute_origin_in_front(host, st);
@@ -3782,6 +4091,18 @@ pub fn on_client_tick_pre(host: &mut dyn ClientHost, _: &mut ClientTickPreEvent)
         PendingAction::SendRedo(dim) => {
             if let Some(ch) = channels() {
                 if let Err(e) = ch.to_server_redo.send(host, &RedoRequest { dimension: dim }) {
+                    with_state(|st| {
+                        st.status = match st.lang {
+                            UiLang::En => format!("Network error: {e:?}"),
+                            UiLang::Ru => format!("Ошибка сети: {e:?}"),
+                        };
+                    });
+                }
+            }
+        }
+        PendingAction::SendRoad(req) => {
+            if let Some(ch) = channels() {
+                if let Err(e) = ch.to_server_road.send(host, &req) {
                     with_state(|st| {
                         st.status = match st.lang {
                             UiLang::En => format!("Network error: {e:?}"),
@@ -4117,6 +4438,39 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
                         draw_scrollbar(&mut *event.draw, z, event.screen.mouse);
                     }
                 }
+                UiTab::WorldDecor => {
+                    let lx = px + pad;
+                    event.draw.text(
+                        tr(
+                            lang,
+                            "Living Interiors 2.0 & Smooth Terrain Blending:",
+                            "Живые интерьеры 2.0 и сглаживание ландшафта:",
+                        ),
+                        [lx, body_y + 4.0],
+                        0xFFE2_E8F0,
+                        false,
+                    );
+                    event.draw.text(
+                        tr(
+                            lang,
+                            "2-Point Road & Auto-Bridge Connector:",
+                            "Дорога между 2 точками и авто-мосты:",
+                        ),
+                        [lx, body_y + 70.0],
+                        0xFFE2_E8F0,
+                        false,
+                    );
+                    event.draw.text(
+                        tr(
+                            lang,
+                            "Pick Start -> End point in world (or use /buildgen connect).",
+                            "Выберите Старт -> Финиш в мире (или /buildgen connect).",
+                        ),
+                        [lx, body_y + 82.0],
+                        0xFF94_A3B8,
+                        false,
+                    );
+                }
             }
         }
 
@@ -4416,7 +4770,7 @@ pub fn on_screen_char_typed(
 
 pub fn on_render_gui_post(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<'_>) {
     let now = host.millis();
-    let (lang, mode, facing, origin, show_frame, show_preview, progress, toast) = with_state(|st| {
+    let (lang, mode, facing, origin, aimed, road_width, show_frame, show_preview, progress, toast) = with_state(|st| {
         if let Some((_, exp)) = st.hud_toast
             && now >= exp
         {
@@ -4427,6 +4781,8 @@ pub fn on_render_gui_post(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<
             st.world_select,
             st.facing,
             st.origin,
+            st.aimed_block,
+            st.road_width,
             st.show_frame_box,
             st.show_preview_box,
             st.build_progress.clone(),
@@ -4520,6 +4876,30 @@ pub fn on_render_gui_post(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<
                 ),
             }
         }
+        WorldSelectMode::PickingRoadStart => match lang {
+            UiLang::En => format!(
+                "Road [1/2]: [LMB/RMB] set START | [W] width ({road_width}b) | [Esc] cancel"
+            ),
+            UiLang::Ru => format!(
+                "Дорога [1/2]: [ЛКМ/ПКМ] СТАРТ | [W] ширина ({road_width} бл.) | [Esc] отмена"
+            ),
+        },
+        WorldSelectMode::PickingRoadEnd { start } => {
+            let end = aimed.unwrap_or(start);
+            let dist = (((end[0] - start[0]).pow(2) + (end[2] - start[2]).pow(2)) as f64)
+                .sqrt()
+                .round() as i32;
+            match lang {
+                UiLang::En => format!(
+                    "Road [2/2] ({},{},{}) ~{}m: [LMB/RMB] build road | [W] {}b | [Esc]",
+                    start[0], start[1], start[2], dist, road_width
+                ),
+                UiLang::Ru => format!(
+                    "Дорога [2/2] ({},{},{}) ~{}м: [ЛКМ/ПКМ] построить | [W] {} бл. | [Esc]",
+                    start[0], start[1], start[2], dist, road_width
+                ),
+            }
+        }
     };
     let tw = event.draw.text_width(&msg) + 16.0;
     let bx = ((sw - tw) * 0.5).floor();
@@ -4582,6 +4962,7 @@ fn effective_preview_box(
         WorldSelectMode::Inactive | WorldSelectMode::MovePreview => origin.map(|o| {
             (o, [o[0] + i32::from(w), o[1] + i32::from(h), o[2] + i32::from(d)], w, d, h)
         }),
+        WorldSelectMode::PickingRoadStart | WorldSelectMode::PickingRoadEnd { .. } => None,
     }
 }
 
@@ -4906,6 +5287,7 @@ fn ensure_preview_cached_with_host(
         palette_fp: palette_fingerprint(&st.palette),
         wear_pct: st.wear_pct,
         overgrowth_pct: st.overgrowth_pct,
+        living_decor: st.living_decor,
         biome_hint: biome_key.clone(),
     };
     if st.bp_cache_key.as_ref() != Some(&bp_key) || st.cached_bp.is_none() {
@@ -4929,6 +5311,9 @@ fn ensure_preview_cached_with_host(
             overgrowth_pct: st.overgrowth_pct,
             biome_hint: biome_key,
             palette: st.palette.clone(),
+            living_decor: st.living_decor,
+            spawn_npcs: st.spawn_npcs,
+            blend_radius: 0,
         };
         let terrain_off = if st.adapt_terrain {
             st.cached_terrain_offsets.as_deref()
@@ -5005,12 +5390,122 @@ pub fn on_submit_custom_geometry(
             st.depth,
             st.height,
             st.facing,
+            st.road_width,
+            st.road_auto_bridge,
             st.show_preview_box,
             st.show_frame_box,
         )
     });
 
-    let (mode, aimed, origin, w, d, h, facing, show_preview, show_frame) = snapshot;
+    let (mode, aimed, origin, w, d, h, facing, road_width, road_auto_bridge, show_preview, show_frame) =
+        snapshot;
+
+    if matches!(
+        mode,
+        WorldSelectMode::PickingRoadStart | WorldSelectMode::PickingRoadEnd { .. }
+    ) {
+        let mut lines = Vec::new();
+        let mut quads = Vec::new();
+        match mode {
+            WorldSelectMode::PickingRoadStart => {
+                if let Some(p) = aimed {
+                    let bmin = [p[0] as f64, p[1] as f64, p[2] as f64];
+                    let bmax = [bmin[0] + 1.0, bmin[1] + 1.0, bmin[2] + 1.0];
+                    push_box_lines(&mut lines, bmin, bmax, 0xFF38_BDF8, 2.5);
+                    lines.push(WorldLine::new(
+                        [bmin[0] + 0.5, bmax[1], bmin[2] + 0.5],
+                        [bmin[0] + 0.5, bmax[1] + 4.0, bmin[2] + 0.5],
+                        0xFF38_BDF8,
+                        2.5,
+                        WorldDepth::ThroughWalls,
+                    ));
+                    quads.push(WorldQuad::new(
+                        [
+                            [bmin[0], bmax[1] + 0.03, bmin[2]],
+                            [bmin[0], bmax[1] + 0.03, bmax[2]],
+                            [bmax[0], bmax[1] + 0.03, bmax[2]],
+                            [bmax[0], bmax[1] + 0.03, bmin[2]],
+                        ],
+                        0x5538_BDF8,
+                        WorldDepth::Tested,
+                    ));
+                }
+            }
+            WorldSelectMode::PickingRoadEnd { start } => {
+                let smin = [start[0] as f64, start[1] as f64, start[2] as f64];
+                push_box_lines(
+                    &mut lines,
+                    smin,
+                    [smin[0] + 1.0, smin[1] + 1.0, smin[2] + 1.0],
+                    0xFF34_D399,
+                    2.6,
+                );
+                let end = aimed.unwrap_or(start);
+                let emin = [end[0] as f64, end[1] as f64, end[2] as f64];
+                push_box_lines(
+                    &mut lines,
+                    emin,
+                    [emin[0] + 1.0, emin[1] + 1.0, emin[2] + 1.0],
+                    0xFFFACC15,
+                    2.4,
+                );
+
+                let sx = smin[0] + 0.5;
+                let sy = smin[1] + 1.05;
+                let sz = smin[2] + 0.5;
+                let ex = emin[0] + 0.5;
+                let ey = emin[1] + 1.05;
+                let ez = emin[2] + 0.5;
+                let dx = ex - sx;
+                let dz = ez - sz;
+                let len = (dx * dx + dz * dz).sqrt().max(0.01);
+                let hw = f64::from(road_width.clamp(3, 5)) * 0.5;
+                let nx = -dz / len * hw;
+                let nz = dx / len * hw;
+                let steps = ((len / 2.0).ceil() as usize).clamp(1, 32);
+
+                let mut prev_l = [sx + nx, sy, sz + nz];
+                let mut prev_r = [sx - nx, sy, sz - nz];
+                let mut prev_c = [sx, sy + 0.08, sz];
+                for step in 1..=steps {
+                    let t = step as f64 / steps as f64;
+                    let arch = if road_auto_bridge && len >= 10.0 {
+                        4.0 * t * (1.0 - t) * 0.5
+                    } else {
+                        0.0
+                    };
+                    let px = sx + dx * t;
+                    let py = sy + (ey - sy) * t + arch;
+                    let pz = sz + dz * t;
+                    let cur_l = [px + nx, py, pz + nz];
+                    let cur_r = [px - nx, py, pz - nz];
+                    let cur_c = [px, py + 0.08, pz];
+
+                    quads.push(WorldQuad::new(
+                        [prev_l, cur_l, cur_r, prev_r],
+                        0x4438_BDF8,
+                        WorldDepth::Tested,
+                    ));
+                    lines.push(WorldLine::new(prev_l, cur_l, 0xE038_BDF8, 2.5, WorldDepth::Tested));
+                    lines.push(WorldLine::new(prev_r, cur_r, 0xE038_BDF8, 2.5, WorldDepth::Tested));
+                    lines.push(WorldLine::new(prev_c, cur_c, 0x99A5_F3FC, 1.8, WorldDepth::Tested));
+
+                    prev_l = cur_l;
+                    prev_r = cur_r;
+                    prev_c = cur_c;
+                }
+            }
+            _ => {}
+        }
+        if !lines.is_empty() {
+            let _ = event.draw.lines(&lines);
+        }
+        if !quads.is_empty() {
+            let _ = event.draw.quads(&quads);
+        }
+        return;
+    }
+
     if mode == WorldSelectMode::Inactive && ((!show_preview && !show_frame) || origin.is_none()) {
         return;
     }

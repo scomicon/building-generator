@@ -66,6 +66,19 @@ pub enum StructureTheme {
     AlpineChalet,
     DesertKasbah,
     FloatingVillage,
+    // --- v0.7.0: Engineering & Transport, Agricultural, Decor & Art ---
+    CanalLock,
+    RailwayRoundhouse,
+    GantryDrydock,
+    PowerSubstation,
+    VineyardPress,
+    GrainSiloFarm,
+    OrchardApiary,
+    HorseStables,
+    PlazaFountain,
+    GuardianStatue,
+    HedgeMazePark,
+    ZenKaresansui,
 }
 
 /// Distinct geometric archetypes for bridges and viaducts.
@@ -135,6 +148,9 @@ pub struct BlueprintSpec {
     pub ground_wall: Option<String>,
     pub upper_wall: Option<String>,
     pub biome_tag: String,
+    pub living_decor: bool,
+    pub spawn_npcs: bool,
+    pub blend_radius: u8,
 }
 
 fn parse_material_from_clause(clause: &str) -> Option<String> {
@@ -265,12 +281,33 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 /// Detects specialized structural themes (mills, monuments, castles, transport, fantasy, regional, etc.).
 pub fn infer_theme_from_text(description: &str) -> StructureTheme {
     let lower = description.to_lowercase();
+    let is_estate_prompt = contains_any(
+        &lower,
+        &["усадьб", "поместье", "хутор", "estate", "homestead"],
+    );
     if contains_any(&lower, &["водян мельниц", "водяная мельниц", "мельница с колес", "watermill", "water mill", "waterwheel"]) {
         StructureTheme::Watermill
-    } else if contains_any(&lower, &["мельниц", "ветрян", "windmill"]) {
+    } else if contains_any(&lower, &["мельниц", "ветрян", "windmill"]) && !contains_any(&lower, &["зернохранил", "элеватор", "силос", "grain silo", "silo_farm"]) {
         StructureTheme::Windmill
     } else if contains_any(&lower, &["маяк", "lighthouse"]) {
         StructureTheme::Lighthouse
+    } else if contains_any(
+        &lower,
+        &[
+            "сухой док",
+            "козлов кран",
+            "портальн кран",
+            "drydock",
+            "dry dock",
+            "gantry",
+        ],
+    ) && !contains_any(
+        &lower,
+        &["ракет", "космодром", "launchpad", "rocket", "spaceport"],
+    ) {
+        StructureTheme::GantryDrydock
+    } else if contains_any(&lower, &["виноградник", "виноградн", "vineyard", "wine press", "winepress"]) && !is_estate_prompt {
+        StructureTheme::VineyardPress
     } else if contains_any(&lower, &["пантеон", "pantheon"]) {
         StructureTheme::Pantheon
     } else if contains_any(&lower, &["парфенон", "периптер", "акрополь", "parthenon", "peripter", "acropolis"]) {
@@ -319,10 +356,16 @@ pub fn infer_theme_from_text(description: &str) -> StructureTheme {
         StructureTheme::AirshipDock
     } else if contains_any(&lower, &["пиратск кораб", "корабл", "галеон", "фрегат", "драккар", "джонк", "ship", "galleon", "frigate", "pirate ship"]) {
         StructureTheme::SailingShip
+    } else if contains_any(&lower, &["веерное депо", "локомотив депо", "кругов депо", "депо поезд", "roundhouse", "turntable", "locomotive depot"]) {
+        StructureTheme::RailwayRoundhouse
     } else if contains_any(&lower, &["вокзал", "железнодорож", "станц поезд", "паровоз", "дебаркадер", "train station", "railway"]) {
         StructureTheme::TrainStation
-    } else if contains_any(&lower, &["плотин", "дамб", "гэс", "водосброс", "dam ", "dam,", "barrage", "hydroelectric"]) || lower.trim() == "dam" {
+    } else if contains_any(&lower, &["плотин", "дамб", "гэс", "гидроэлектро", "водосброс", "dam ", "dam,", "barrage", "hydroelectric"]) || lower.trim() == "dam" {
         StructureTheme::DamBarrage
+    } else if contains_any(&lower, &["судоход шлюз", "шлюз канал", "canal lock", "navigation lock", "sluice gate", "lock chamber"]) || (lower.contains("шлюз") && !contains_any(&lower, &["бункер", "убежищ", "bunker", "airlock"])) {
+        StructureTheme::CanalLock
+    } else if contains_any(&lower, &["ветрогенератор", "подстанц", "электроподстанц", "трансформатор", "wind turbine", "substation", "transformer"]) {
+        StructureTheme::PowerSubstation
     } else if contains_any(&lower, &["цирк", "шапито", "манеж", "circus", "big top"]) {
         StructureTheme::CircusTent
     } else if contains_any(&lower, &["небоскр", "высотк", "бизнес центр", "skyscraper", "highrise"]) {
@@ -363,7 +406,23 @@ pub fn infer_theme_from_text(description: &str) -> StructureTheme {
         StructureTheme::Observatory
     } else if contains_any(&lower, &["пирамид", "зиккурат", "зикурат", "майя храм", "pyramid", "ziggurat", "aztec"]) {
         StructureTheme::Pyramid
-    } else if contains_any(&lower, &["триумфаль", "триумф арк", "памятн арк", "обелиск", "мемориал", "triumphal", "triumph arch", "obelisk", "monument"]) {
+    } else if contains_any(
+        &lower,
+        &[
+            "триумфаль",
+            "триумф арк",
+            "памятн арк",
+            "обелиск",
+            "мемориал",
+            "triumphal",
+            "triumph arch",
+            "obelisk",
+            "monument",
+        ],
+    ) && !contains_any(
+        &lower,
+        &["стату", "скульптур", "statue", "sculpture", "colossus", "guardian"],
+    ) {
         StructureTheme::TriumphalArch
     } else if contains_any(&lower, &["биг-бен", "биг бен", "часов башн", "часовая башн", "башня с час", "курант", "колокольн", "clocktower", "clock tower", "big ben", "belfry"]) {
         StructureTheme::ClockTower
@@ -385,6 +444,20 @@ pub fn infer_theme_from_text(description: &str) -> StructureTheme {
         StructureTheme::Tavern
     } else if contains_any(&lower, &["библиотек", "архив", "читальн", "library", "archive"]) {
         StructureTheme::Library
+    } else if contains_any(&lower, &["силос", "зернохранил", "элеватор", "зернов башн", "grain silo", "grain farmstead", "granary", "hayloft"]) && !is_estate_prompt {
+        StructureTheme::GrainSiloFarm
+    } else if contains_any(&lower, &["пасек", "ульям", "улей", "пчел", "яблонев сад", "apiary", "beehive", "blossom orchard", "fruit orchard"]) && !is_estate_prompt {
+        StructureTheme::OrchardApiary
+    } else if contains_any(&lower, &["конюш", "стойл", "ипподром", "конеферм", "horse stable", "stables", "riding arena"]) && !is_estate_prompt {
+        StructureTheme::HorseStables
+    } else if contains_any(&lower, &["лабиринт из живой", "зелен лабиринт", "лабиринт из куст", "розари", "топиар", "hedge maze", "topiary", "rose garden"]) {
+        StructureTheme::HedgeMazePark
+    } else if contains_any(&lower, &["сад камн", "дзен сад", "бонсай", "карэсансуй", "zen garden", "rock garden", "karesansui", "bonsai"]) {
+        StructureTheme::ZenKaresansui
+    } else if contains_any(&lower, &["фонтан", "водн площад", "fountain", "water plaza"]) && !is_estate_prompt {
+        StructureTheme::PlazaFountain
+    } else if contains_any(&lower, &["стату", "скульптур", "монумент рыцар", "памятник", "statue", "sculpture", "colossus"]) {
+        StructureTheme::GuardianStatue
     } else {
         StructureTheme::Standard
     }
@@ -748,6 +821,30 @@ pub fn parse_description_with_biome(
         || contains_any(&lower, &["квартал", "деревн", "поселен", "посёлок", "поселок", "городок", "village", "town", "hamlet", "settlement", "district"])
     {
         BuildCategory::Settlement
+    } else if matches!(
+        theme,
+        StructureTheme::CanalLock
+            | StructureTheme::RailwayRoundhouse
+            | StructureTheme::GantryDrydock
+            | StructureTheme::PowerSubstation
+    ) {
+        BuildCategory::Engineering
+    } else if matches!(
+        theme,
+        StructureTheme::VineyardPress
+            | StructureTheme::GrainSiloFarm
+            | StructureTheme::OrchardApiary
+            | StructureTheme::HorseStables
+    ) {
+        BuildCategory::Agricultural
+    } else if matches!(
+        theme,
+        StructureTheme::PlazaFountain
+            | StructureTheme::GuardianStatue
+            | StructureTheme::HedgeMazePark
+            | StructureTheme::ZenKaresansui
+    ) {
+        BuildCategory::DecorArt
     } else if contains_any(&lower, &["поместь", "усадьб", "имение", "хутор", "ранчо", "estate", "homestead", "farmstead", "ranch", "compound"]) {
         BuildCategory::Estate
     } else if (category == BuildCategory::Dungeon
@@ -852,6 +949,12 @@ pub fn parse_description_with_biome(
         BuildCategory::Barn
     } else if contains_any(&lower, &["павильон", "беседк", "ротонд", "pavilion", "gazebo"]) {
         BuildCategory::Pavilion
+    } else if contains_any(&lower, &["инженер", "транспорт", "индустр", "engineering", "transport", "industrial"]) {
+        BuildCategory::Engineering
+    } else if contains_any(&lower, &["сельхоз", "агро", "agriculture", "agricultural"]) {
+        BuildCategory::Agricultural
+    } else if contains_any(&lower, &["декор", "арт", "скульптур", "decor", "sculpture"]) {
+        BuildCategory::DecorArt
     } else {
         category
     };
@@ -910,7 +1013,10 @@ pub fn parse_description_with_biome(
             | BuildCategory::Bridge
             | BuildCategory::Settlement
             | BuildCategory::Dungeon
-            | BuildCategory::Estate => 1,
+            | BuildCategory::Estate
+            | BuildCategory::Engineering
+            | BuildCategory::Agricultural
+            | BuildCategory::DecorArt => 1,
             BuildCategory::House => {
                 let roll = rng.next_f64();
                 if theme == StructureTheme::Tavern && max_fit_floors >= 2 {
@@ -1409,6 +1515,12 @@ pub fn parse_description_with_biome(
         ground_wall,
         upper_wall,
         biome_tag: normalize_biome_id(biome_hint),
+        living_decor: true,
+        spawn_npcs: contains_any(
+            &lower,
+            &["жител", "npc", "страж", "охрана", "обитаем", "villager", "inhabited", "livestock", "animals"],
+        ),
+        blend_radius: 4,
     }
 }
 

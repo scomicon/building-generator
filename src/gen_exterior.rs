@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::gen_common::{
-    LocalGrid, PlannedBlock, get_uv, is_fp, is_lantern, is_solid_or_occupied,
+    LivingEntityKind, LivingPlan, LocalGrid, PlannedBanner, PlannedBlock, PlannedEntity,
+    PlannedSign, SignPurpose, get_uv, is_fp, is_lantern, is_solid_or_occupied,
     make_frame_block_at, make_leaves, make_pillar_block_at, make_slab, make_stair, make_trapdoor,
     set_uv, style_pot, terrain_rel_at, water_depth_at,
+};
+use crate::gen_interior::{
+    banner_theme_for_spec, is_opaque_wall_block, wood_prefix_for_palette,
 };
 use crate::model::{BuildCategory, BuildStyle, MaterialPalette};
 use crate::noise::{NoiseField, SplitMix64};
@@ -1146,7 +1150,7 @@ fn find_clear_3x2(
     find_clear_rect(blocks, grid, fp, best_door, b_v1, 3, 2)
 }
 
-/// Builds front pathway, Torii/courtyard gates, flanking lantern posts, roofed well, wheat farmland, pergola, and bushes.
+/// Builds terrain-adaptive front pathway, Torii/courtyard gates, flanking lantern posts, roofed well, wheat farmland, pergola, and bushes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_courtyard_and_landscaping(
     blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
@@ -1158,14 +1162,25 @@ pub(crate) fn build_courtyard_and_landscaping(
     pal: &MaterialPalette,
     seed: u64,
     noise: NoiseField,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
 ) {
     if spec.on_stilts {
         return;
     }
     let [b_u0, b_v0, b_u1, b_v1] = bounds;
     let base_y = i32::from(spec.foundation_height);
+    let terr_at_uv = |u: i32, v: i32| -> i32 {
+        if adapt_terrain {
+            terrain_rel_at(terrain_offsets, grid, u, v).clamp(-10, 10)
+        } else {
+            0
+        }
+    };
 
     if let Some((du, dv)) = best_door {
+        let mut prev_py = 0i32;
         for pv in (dv + 2)..grid.d {
             let sway = if pv >= dv + 4 && grid.w >= 13 && spec.style != BuildStyle::Modern {
                 match (pv + du) % 4 {
@@ -1178,43 +1193,101 @@ pub(crate) fn build_courtyard_and_landscaping(
             };
             let pu = (du + sway).clamp(1, grid.w - 2);
             if !is_fp(grid, fp, pu, pv) && !is_solid_or_occupied(blocks, grid, pu, 1, pv) {
-                let p_blk = if spec.style != BuildStyle::Modern && spec.style != BuildStyle::Desert {
-                    match (pv - dv).abs() % 3 {
-                        0 => pal.pick(MaterialPalette::SLOT_PAVING, seed, pu, 0, pv),
-                        1 => pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pu, 0, pv),
-                        _ => "minecraft:dirt_path".to_owned(),
+                let raw_t = terr_at_uv(pu, pv);
+                let wd = if adapt_terrain {
+                    water_depth_at(water_depths, grid, pu, pv)
+                } else {
+                    0
+                };
+                let target_py = if wd > 0 { prev_py.max(1) } else { raw_t };
+                let py = if target_py > prev_py {
+                    prev_py + 1
+                } else if target_py < prev_py {
+                    prev_py - 1
+                } else {
+                    target_py
+                };
+                prev_py = py;
+                if wd > 0 {
+                    // Mini slab/plank footbridge over courtyard puddles/stream.
+                    set_uv(
+                        blocks,
+                        grid,
+                        pu,
+                        py,
+                        pv,
+                        make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, pu, py, pv), "bottom"),
+                    );
+                    if (pv + pu) % 2 == 0 {
+                        let lo = (raw_t - wd).clamp(-12, py - 1);
+                        for fy in lo..py {
+                            set_uv(
+                                blocks,
+                                grid,
+                                pu,
+                                fy,
+                                pv,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, pu, fy, pv)),
+                            );
+                        }
                     }
                 } else {
-                    pal.pick(MaterialPalette::SLOT_PAVING, seed, pu, 0, pv)
-                };
-                set_uv(blocks, grid, pu, 0, pv, PlannedBlock::simple(p_blk));
+                    if py > raw_t {
+                        for fy in raw_t.max(-10)..py {
+                            set_uv(
+                                blocks,
+                                grid,
+                                pu,
+                                fy,
+                                pv,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pu, fy, pv)),
+                            );
+                        }
+                    }
+                    let p_blk = if spec.style != BuildStyle::Modern && spec.style != BuildStyle::Desert {
+                        match (pv - dv).abs() % 3 {
+                            0 => pal.pick(MaterialPalette::SLOT_PAVING, seed, pu, py, pv),
+                            1 => pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pu, py, pv),
+                            _ => "minecraft:dirt_path".to_owned(),
+                        }
+                    } else {
+                        pal.pick(MaterialPalette::SLOT_PAVING, seed, pu, py, pv)
+                    };
+                    set_uv(blocks, grid, pu, py, pv, PlannedBlock::simple(p_blk));
+                }
+                for cy in (py + 1)..=(raw_t.max(py) + 3) {
+                    if !is_solid_or_occupied(blocks, grid, pu, cy, pv) {
+                        set_uv(blocks, grid, pu, cy, pv, PlannedBlock::simple("minecraft:air"));
+                    }
+                }
             }
         }
         if spec.garden_lanterns {
             for side in [-1, 1] {
                 let lu = du + side * 3;
                 let lv = (dv + 2).min(grid.d - 1);
+                let ly = terr_at_uv(lu, lv);
                 if grid.in_bounds(lu, lv)
                     && !is_fp(grid, fp, lu, lv)
-                    && !is_solid_or_occupied(blocks, grid, lu, 1, lv)
-                    && !is_solid_or_occupied(blocks, grid, lu, 2, lv)
-                    && !is_solid_or_occupied(blocks, grid, lu, 3, lv)
+                    && !is_solid_or_occupied(blocks, grid, lu, ly + 1, lv)
+                    && !is_solid_or_occupied(blocks, grid, lu, ly + 2, lv)
+                    && !is_solid_or_occupied(blocks, grid, lu, ly + 3, lv)
                 {
-                    let light_id = pal.pick(MaterialPalette::SLOT_LIGHT, seed, lu, 3, lv);
-                    set_uv(blocks, grid, lu, 1, lv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lu, 1, lv)));
+                    let light_id = pal.pick(MaterialPalette::SLOT_LIGHT, seed, lu, ly + 3, lv);
+                    set_uv(blocks, grid, lu, ly + 1, lv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lu, ly + 1, lv)));
                     set_uv(
                         blocks,
                         grid,
                         lu,
-                        2,
+                        ly + 2,
                         lv,
                         PlannedBlock::simple(if is_lantern(&light_id) {
-                            pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, 2, lv)
+                            pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ly + 2, lv)
                         } else {
-                            pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lu, 2, lv)
+                            pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lu, ly + 2, lv)
                         }),
                     );
-                    set_uv(blocks, grid, lu, 3, lv, PlannedBlock::simple(light_id));
+                    set_uv(blocks, grid, lu, ly + 3, lv, PlannedBlock::simple(light_id));
                 }
             }
         }
@@ -2588,4 +2661,291 @@ pub(crate) fn build_custom_yard_trees(
             set_uv(blocks, grid, cu, 1, cv, dec);
         }
     }
+}
+
+fn sign_purpose_for_spec(spec: &BlueprintSpec) -> SignPurpose {
+    match (spec.theme, spec.category) {
+        (StructureTheme::Tavern, _) => SignPurpose::Tavern,
+        (StructureTheme::WineryBakery, _) => SignPurpose::Bakery,
+        (StructureTheme::Library | StructureTheme::Academy, _) => SignPurpose::Library,
+        (StructureTheme::Apothecary, _) => SignPurpose::Apothecary,
+        (StructureTheme::TrainStation | StructureTheme::RailwayRoundhouse, _) => SignPurpose::Station,
+        (StructureTheme::ShipyardDock | StructureTheme::CanalLock, _) => SignPurpose::Harbor,
+        (_, BuildCategory::Forge) => SignPurpose::Forge,
+        (_, BuildCategory::Barn) => SignPurpose::FarmBarn,
+        _ => SignPurpose::Waypost,
+    }
+}
+
+/// Adds Living Interiors 2.0 exterior signage, facade banners, inverted-daylight streetlamps,
+/// and optional yard livestock/golems/bees.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decorate_living_exteriors(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    grid: LocalGrid,
+    fp: &[bool],
+    best_door: Option<(i32, i32)>,
+    spec: &BlueprintSpec,
+    pal: &MaterialPalette,
+    seed: u64,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
+) -> LivingPlan {
+    let mut living = LivingPlan::default();
+    if spec.ruin_erosion >= 0.1 || (!spec.living_decor && !spec.spawn_npcs) {
+        return living;
+    }
+
+    let ground_y = i32::from(spec.foundation_height);
+    let terr_at_uv = |u: i32, v: i32| -> i32 {
+        if adapt_terrain {
+            terrain_rel_at(terrain_offsets, grid, u, v).clamp(-10, 10)
+        } else {
+            0
+        }
+    };
+    let sign_purpose = sign_purpose_for_spec(spec);
+
+    if spec.living_decor {
+        // 1. Register any existing hanging shop/tavern/forge sign already placed on the facade.
+        for (&pos, blk) in blocks.iter() {
+            if blk.block_id.ends_with("_hanging_sign") || blk.block_id.ends_with("_wall_sign") {
+                living.signs.push(PlannedSign {
+                    pos,
+                    purpose: sign_purpose,
+                    custom_en: None,
+                    custom_ru: None,
+                });
+            }
+        }
+
+        // 2. Ensure a readable facade wall sign & flanking exterior banners near main entrance.
+        if let Some((du, dv)) = best_door {
+            let fv = dv + 1;
+            if grid.in_bounds(du, fv) && !is_fp(grid, fp, du, fv) {
+                if living.signs.is_empty() {
+                    let sign_id = format!("minecraft:{}_wall_sign", wood_prefix_for_palette(pal));
+                    for side in [2, -2, 1, -1] {
+                        let su = du + side;
+                        if grid.in_bounds(su, fv)
+                            && !is_fp(grid, fp, su, fv)
+                            && get_uv(blocks, grid, su, ground_y + 2, dv).is_some_and(is_opaque_wall_block)
+                            && get_uv(blocks, grid, su, ground_y + 2, fv).is_none_or(|b| b.block_id == "minecraft:air")
+                        {
+                            set_uv(
+                                blocks,
+                                grid,
+                                su,
+                                ground_y + 2,
+                                fv,
+                                PlannedBlock::with_props(
+                                    sign_id,
+                                    vec![("facing", grid.dir_front()), ("waterlogged", "false")],
+                                ),
+                            );
+                            let [lx, lz] = grid.to_local_xz(su, fv);
+                            living.signs.push(PlannedSign {
+                                pos: [lx, ground_y + 2, lz],
+                                purpose: sign_purpose,
+                                custom_en: None,
+                                custom_ru: None,
+                            });
+                            break;
+                        }
+                    }
+                }
+
+                if matches!(
+                    spec.category,
+                    BuildCategory::Castle | BuildCategory::Tower | BuildCategory::Temple | BuildCategory::Forge
+                ) || matches!(
+                    spec.theme,
+                    StructureTheme::Tavern | StructureTheme::TownHall | StructureTheme::Academy
+                ) {
+                    let (b_style, pri, acc) = banner_theme_for_spec(spec);
+                    let w_banner = format!("minecraft:{pri}_wall_banner");
+                    for side in [-2, 2] {
+                        let bu = du + side;
+                        if grid.in_bounds(bu, fv)
+                            && !is_fp(grid, fp, bu, fv)
+                            && get_uv(blocks, grid, bu, ground_y + 3, dv).is_some_and(is_opaque_wall_block)
+                            && get_uv(blocks, grid, bu, ground_y + 3, fv).is_none_or(|b| b.block_id == "minecraft:air")
+                        {
+                            set_uv(
+                                blocks,
+                                grid,
+                                bu,
+                                ground_y + 3,
+                                fv,
+                                PlannedBlock::with_props(w_banner.clone(), vec![("facing", grid.dir_front())]),
+                            );
+                            let [lx, lz] = grid.to_local_xz(bu, fv);
+                            living.banners.push(PlannedBanner {
+                                pos: [lx, ground_y + 3, lz],
+                                style: b_style,
+                                primary_color: pri,
+                                accent_color: acc,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 3. Automated Night Streetlight (`daylight_detector[inverted=true]` + `redstone_lamp`) in spacious front/side yard.
+            if !spec.on_stilts && grid.w >= 13 && grid.d >= 15 {
+                let mut candidates: Vec<(i32, i32)> = Vec::new();
+                for dv_off in [4, 3, 2, 5, 1, 6, -2] {
+                    let lv = (dv + dv_off).clamp(1, grid.d - 2);
+                    for side in [-3, 3, -4, 4, -5, 5, -2, 2, -6, 6] {
+                        let lu = du + side;
+                        if (lu - du).abs() >= 2 || (lv - dv).abs() >= 2 {
+                            candidates.push((lu, lv));
+                        }
+                    }
+                }
+                for v in (1..=grid.d - 2).rev() {
+                    for u in 1..=grid.w - 2 {
+                        if (u - du).abs() >= 2 {
+                            candidates.push((u, v));
+                        }
+                    }
+                }
+                for (lu, lv) in candidates {
+                    if !grid.in_bounds(lu, lv)
+                        || is_fp(grid, fp, lu, lv)
+                        || water_depth_at(water_depths, grid, lu, lv) > 0
+                    {
+                        continue;
+                    }
+                    let ty = terr_at_uv(lu, lv);
+                    let supported = ty <= 0 || is_solid_or_occupied(blocks, grid, lu, ty, lv);
+                    if supported && (1..=5).all(|dy| !is_solid_or_occupied(blocks, grid, lu, ty + dy, lv)) {
+                        set_uv(
+                            blocks,
+                            grid,
+                            lu,
+                            ty + 1,
+                            lv,
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lu, ty + 1, lv)),
+                        );
+                        set_uv(
+                            blocks,
+                            grid,
+                            lu,
+                            ty + 2,
+                            lv,
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ty + 2, lv)),
+                        );
+                        set_uv(
+                            blocks,
+                            grid,
+                            lu,
+                            ty + 3,
+                            lv,
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ty + 3, lv)),
+                        );
+                        set_uv(
+                            blocks,
+                            grid,
+                            lu,
+                            ty + 4,
+                            lv,
+                            PlannedBlock::with_props("minecraft:redstone_lamp", vec![("lit", "false")]),
+                        );
+                        set_uv(
+                            blocks,
+                            grid,
+                            lu,
+                            ty + 5,
+                            lv,
+                            PlannedBlock::with_props(
+                                "minecraft:daylight_detector",
+                                vec![("inverted", "true"), ("power", "0")],
+                            ),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Optional Exterior Guards, Livestock & Pollinator Bees (`spawn_npcs`).
+    if spec.spawn_npcs && !spec.on_stilts {
+        let find_yard_spot = |prefer_front: bool| -> Option<(i32, i32, i32)> {
+            let v_iter: Vec<i32> = if prefer_front {
+                (1..grid.d - 1).rev().collect()
+            } else {
+                (1..grid.d - 1).collect()
+            };
+            for v in v_iter {
+                for u in 1..(grid.w - 1) {
+                    if is_fp(grid, fp, u, v) || water_depth_at(water_depths, grid, u, v) > 0 {
+                        continue;
+                    }
+                    let ty = terr_at_uv(u, v);
+                    if !is_solid_or_occupied(blocks, grid, u, ty + 1, v)
+                        && !is_solid_or_occupied(blocks, grid, u, ty + 2, v)
+                    {
+                        return Some((u, ty + 1, v));
+                    }
+                }
+            }
+            None
+        };
+
+        if matches!(spec.category, BuildCategory::Barn) || matches!(spec.theme, StructureTheme::Windmill) {
+            if let Some((u, y, v)) = find_yard_spot(false) {
+                let [lx, lz] = grid.to_local_xz(u, v);
+                living.entities.push(PlannedEntity {
+                    pos: [lx, y, lz],
+                    kind: LivingEntityKind::Cow,
+                    facing: grid.facing,
+                    detail: String::new(),
+                    sub_detail: String::new(),
+                    is_decor: false,
+                });
+            }
+            if let Some((u, y, v)) = find_yard_spot(true) {
+                let [lx, lz] = grid.to_local_xz(u, v);
+                living.entities.push(PlannedEntity {
+                    pos: [lx, y, lz],
+                    kind: LivingEntityKind::Sheep,
+                    facing: grid.facing,
+                    detail: String::new(),
+                    sub_detail: String::new(),
+                    is_decor: false,
+                });
+            }
+        } else if matches!(spec.category, BuildCategory::Castle | BuildCategory::Tower)
+            || matches!(spec.theme, StructureTheme::TownHall)
+        {
+            if let Some((u, y, v)) = find_yard_spot(true) {
+                let [lx, lz] = grid.to_local_xz(u, v);
+                living.entities.push(PlannedEntity {
+                    pos: [lx, y, lz],
+                    kind: LivingEntityKind::IronGolem,
+                    facing: grid.facing,
+                    detail: String::new(),
+                    sub_detail: String::new(),
+                    is_decor: false,
+                });
+            }
+        } else if (spec.courtyard_garden || matches!(spec.theme, StructureTheme::Greenhouse | StructureTheme::Apothecary))
+            && let Some((u, y, v)) = find_yard_spot(false)
+        {
+            let [lx, lz] = grid.to_local_xz(u, v);
+            living.entities.push(PlannedEntity {
+                pos: [lx, y + 1, lz],
+                kind: LivingEntityKind::Bee,
+                facing: grid.facing,
+                detail: String::new(),
+                sub_detail: String::new(),
+                is_decor: false,
+            });
+        }
+    }
+
+    living
 }

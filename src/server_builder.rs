@@ -8,15 +8,18 @@ static CMD_BUILD_SEQ: AtomicU64 = AtomicU64::new(1);
 
 use mod_api::{
     BlockEdit, BlockKey, BlockRun, BlockState, BossBarColor, BossBarRef, Command,
-    CommandArgumentValue, CommandSource, ConfigPath, Flow, Heightmap, HostBlockStates,
+    CommandArgumentValue, CommandSource, ConfigPath, Direction, Flow, Heightmap, HostBlockStates,
     IPayloadContext, PlayerRef, RegisterCommandsEvent, RunModCommandEvent, ScheduledTaskEvent,
     ServerHost, StateConstraint, TabCompleteEvent, Tag, Text,
 };
 
+use crate::gen_common::{
+    BannerStyle, LecternBookKind, LivingEntityKind, LivingPlan, SignPurpose,
+};
 use crate::generator::{GeneratedBlueprint, PlannedBlock};
 use crate::model::{
     BuildCategory, BuildRequest, BuildResponse, CardinalFacing, MaterialPalette, NoiseLevel,
-    RedoRequest, RerollRequest, SetLangRequest, UiLang, UndoRequest,
+    RedoRequest, RerollRequest, RoadConnectRequest, SetLangRequest, UiLang, UndoRequest,
 };
 use crate::network::channels;
 use crate::noise::SplitMix64;
@@ -31,6 +34,7 @@ const MIN_NETWORK_BUILD_INTERVAL: Duration = Duration::from_millis(350);
 struct UndoEntry {
     dimension: String,
     previous_blocks: Vec<([i32; 3], BlockState)>,
+    spawned_entities: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +62,8 @@ struct PendingBatchJob {
     label: String,
     lang: UiLang,
     post_containers: Vec<PostBuildContainer>,
+    post_living: LivingPlan,
+    post_origin: [i32; 3],
 }
 
 static UNDO_STACK: Mutex<Option<HashMap<u128, Vec<UndoEntry>>>> = Mutex::new(None);
@@ -68,6 +74,7 @@ static LAST_REQUESTS: Mutex<Option<HashMap<u128, BuildRequest>>> = Mutex::new(No
 static PENDING_JOBS: Mutex<Option<VecDeque<PendingBatchJob>>> = Mutex::new(None);
 static PLAYER_LANG: Mutex<Option<HashMap<u128, UiLang>>> = Mutex::new(None);
 static LAST_BUILD_AT: Mutex<Option<HashMap<u128, Instant>>> = Mutex::new(None);
+static ROAD_CONNECT_ANCHORS: Mutex<Option<HashMap<u128, (String, [i32; 3])>>> = Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) fn clear_history_memory_cache() {
@@ -77,6 +84,11 @@ pub(crate) fn clear_history_memory_cache() {
     *HISTORY_WORLD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if let Ok(mut g) = LOADED_HISTORY_OWNERS.lock() {
         g.get_or_insert_with(HashSet::new).clear();
+    }
+    if let Ok(mut r) = ROAD_CONNECT_ANCHORS.lock()
+        && let Some(m) = r.as_mut()
+    {
+        m.clear();
     }
 }
 
@@ -198,6 +210,7 @@ pub(crate) fn sanitize_build_request(mut req: BuildRequest) -> BuildRequest {
     req.biome_hint = req.biome_hint.trim().chars().take(96).collect();
     req.wear_pct = req.wear_pct.min(100);
     req.overgrowth_pct = req.overgrowth_pct.min(100);
+    req.blend_radius = req.blend_radius.min(10);
     req.palette.name = req.palette.name.chars().take(64).collect();
     let max_extra = MaterialPalette::MAX_BLOCKS_PER_SLOT.saturating_sub(1);
     req.palette
@@ -237,6 +250,10 @@ pub fn is_dependent_block(planned: &PlannedBlock) -> bool {
         || id.ends_with("_fence_gate")
         || id.ends_with("_pressure_plate")
         || id.ends_with("_hanging_sign")
+        || id.ends_with("_wall_sign")
+        || id.ends_with("_sign")
+        || id.ends_with("_wall_banner")
+        || id.ends_with("_banner")
         || id.ends_with("_shelf")
         || id.starts_with("minecraft:potted_")
         || matches!(
@@ -246,6 +263,9 @@ pub fn is_dependent_block(planned: &PlannedBlock) -> bool {
                 | "minecraft:sea_pickle"
                 | "minecraft:bell"
                 | "minecraft:ladder"
+                | "minecraft:lever"
+                | "minecraft:tripwire_hook"
+                | "minecraft:daylight_detector"
                 | "minecraft:torch"
                 | "minecraft:wall_torch"
                 | "minecraft:soul_wall_torch"
@@ -851,6 +871,603 @@ fn apply_post_build_containers(
     }
 }
 
+fn sign_lines_for_purpose(purpose: SignPurpose, lang: UiLang) -> [String; 4] {
+    let raw: [&str; 4] = match (purpose, lang) {
+        (SignPurpose::Tavern, UiLang::Ru) => ["", "ТАВЕРНА", "«Тёплый очаг»", "Открыто 24ч"],
+        (SignPurpose::Tavern, UiLang::En) => ["", "THE HEARTH", "& BARREL TAVERN", "Warm Ale & Beds"],
+        (SignPurpose::Bakery, UiLang::Ru) => ["", "ПЕКАРНЯ", "Свежий хлеб", "и выпечка"],
+        (SignPurpose::Bakery, UiLang::En) => ["", "ARTISAN", "BAKERY & MILL", "Fresh Daily"],
+        (SignPurpose::Library, UiLang::Ru) => ["", "БИБЛИОТЕКА", "Тишина и", "древние фолианты"],
+        (SignPurpose::Library, UiLang::En) => ["", "GRAND LIBRARY", "Archive & Lore", "Please Keep Quiet"],
+        (SignPurpose::Forge, UiLang::Ru) => ["", "КУЗНИЦА", "Клинки, щиты", "и наковальни"],
+        (SignPurpose::Forge, UiLang::En) => ["", "MASTER FORGE", "Blades & Armor", "Tempered Steel"],
+        (SignPurpose::Apothecary, UiLang::Ru) => ["", "АПТЕКАРЬ", "Зелья, травы", "и эликсиры"],
+        (SignPurpose::Apothecary, UiLang::En) => ["", "APOTHECARY", "Potions, Herbs", "& Rare Tonics"],
+        (SignPurpose::Station, UiLang::Ru) => ["", "ВОКЗАЛ", "Платформа 1", "Поезда по распис."],
+        (SignPurpose::Station, UiLang::En) => ["", "CENTRAL DEPOT", "Platform 1", "All Lines Board"],
+        (SignPurpose::Harbor, UiLang::Ru) => ["", "ГАВАНЬ", "Причал и шлюзы", "Счастливого пути"],
+        (SignPurpose::Harbor, UiLang::En) => ["", "HARBOR & LOCK", "Port Authority", "Fair Winds"],
+        (SignPurpose::PowerPlant, UiLang::Ru) => ["", "ОСТОРОЖНО!", "Подстанция", "Высокое напряж."],
+        (SignPurpose::PowerPlant, UiLang::En) => ["", "DANGER!", "HIGH VOLTAGE", "Substation Grid"],
+        (SignPurpose::FarmBarn, UiLang::Ru) => ["", "ФЕРМА", "Свежее зерно", "и урожай"],
+        (SignPurpose::FarmBarn, UiLang::En) => ["", "HOMESTEAD FARM", "Grain & Harvest", "Storehouse"],
+        (SignPurpose::Vineyard, UiLang::Ru) => ["", "ВИНОДЕЛЬНЯ", "Виноградник", "и прессовый дом"],
+        (SignPurpose::Vineyard, UiLang::En) => ["", "VINEYARD", "Estate Winery", "& Cellar Press"],
+        (SignPurpose::Apiary, UiLang::Ru) => ["", "ПАСЕКА", "Цветочный мёд", "и фруктовый сад"],
+        (SignPurpose::Apiary, UiLang::En) => ["", "ORCHARD APIARY", "Wildflower Honey", "& Blossom Grove"],
+        (SignPurpose::Stables, UiLang::Ru) => ["", "КОНЮШНЯ", "Рысаки, сёдла", "и тёплые стойла"],
+        (SignPurpose::Stables, UiLang::En) => ["", "ROYAL STABLES", "Horses, Feed", "& Saddlery"],
+        (SignPurpose::StatuePlaque, UiLang::Ru) => ["", "ПАМЯТНИК", "Страж этих", "древних земель"],
+        (SignPurpose::StatuePlaque, UiLang::En) => ["", "MONUMENT", "Guardian of the", "Realm Plaza"],
+        (SignPurpose::FountainPlaque, UiLang::Ru) => ["", "ФОНТАН", "Площадь мира", "и вдохновения"],
+        (SignPurpose::FountainPlaque, UiLang::En) => ["", "PLAZA FOUNTAIN", "Waters of Peace", "& Prosperity"],
+        (SignPurpose::StreetCorner, UiLang::Ru) => ["", "УЛ. РАССВЕТНАЯ", "К площади ->", "<- К воротам"],
+        (SignPurpose::StreetCorner, UiLang::En) => ["", "MARKET ROW", "Square ->", "<- City Gate"],
+        (SignPurpose::DungeonWarning, UiLang::Ru) => ["ОПАСНОСТЬ!", "Вход в подземелье", "Проверьте щит", "и факелы!"],
+        (SignPurpose::DungeonWarning, UiLang::En) => ["DANGER AHEAD!", "Crypt & Vaults", "Bring Shields,", "Food & Torches"],
+        (SignPurpose::Waypost, UiLang::Ru) => ["", "УКАЗАТЕЛЬ", "Безопасный путь", "построен модом"],
+        (SignPurpose::Waypost, UiLang::En) => ["", "WAYPOST", "Traveler's Road", "Keep to the Path"],
+    };
+    raw.map(str::to_owned)
+}
+
+fn lectern_book_content(kind: LecternBookKind, lang: UiLang) -> (&'static str, &'static str, Vec<&'static str>) {
+    match (kind, lang) {
+        (LecternBookKind::LibraryChronicle, UiLang::Ru) => (
+            "Хроники Архива",
+            "Главный Архивариус",
+            vec![
+                "Глава I\nВеликая летопись возведения городов, храмов и чудес света в этом краю.",
+                "Глава II\nБерегите древние манускрипты, изучайте ремёсла и поддерживайте свет в фонарях.",
+            ],
+        ),
+        (LecternBookKind::LibraryChronicle, UiLang::En) => (
+            "Chronicle of the Realm",
+            "Grand Archivist",
+            vec![
+                "Chapter I\nA record of ancient halls, soaring spires, and timber estates across these lands.",
+                "Chapter II\nPreserve old manuscripts, tend the shelves, and keep the reading lamps lit.",
+            ],
+        ),
+        (LecternBookKind::MageGrimoire, UiLang::Ru) => (
+            "Гримуар Арканы",
+            "Архимаг",
+            vec![
+                "Трактат о кристаллах\nАметистовые жилы резонируют с чарами на рассвете.",
+                "Алхимическая заметка\nНе оставляйте зелья ускорения без присмотра рядом с варочной стойкой.",
+            ],
+        ),
+        (LecternBookKind::MageGrimoire, UiLang::En) => (
+            "Arcane Grimoire",
+            "Archmage",
+            vec![
+                "On Amethyst Harmonics\nCrystal shards resonate with enchanting tables at dusk.",
+                "Brewing Caution\nKeep fermented spider eyes sealed inside the apothecary cellar.",
+            ],
+        ),
+        (LecternBookKind::ObservatoryStarChart, UiLang::Ru) => (
+            "Звёздный Атлас",
+            "Астроном",
+            vec![
+                "Наблюдение 42\nСозвездие Кузнеца восходит точно над северным хребтом.",
+                "Навигация\nКалибруйте медную подзорную трубу каждую новолунную ночь.",
+            ],
+        ),
+        (LecternBookKind::ObservatoryStarChart, UiLang::En) => (
+            "Celestial Star Chart",
+            "Royal Astronomer",
+            vec![
+                "Observation XLII\nThe Anvil constellation rises true above the northern ridge.",
+                "Calibration Log\nRealign the copper spyglass cradle after every eclipse.",
+            ],
+        ),
+        (LecternBookKind::TempleCodex, UiLang::Ru) => (
+            "Священный Кодекс",
+            "Хранитель Храма",
+            vec![
+                "Завет Света\nВсякий путник найдёт здесь укрытие, тишину и тепло очага.",
+                "Устав\nЗвоните в колокол лишь на рассвете или при приближении грозы.",
+            ],
+        ),
+        (LecternBookKind::TempleCodex, UiLang::En) => (
+            "Sacred Sanctuary Codex",
+            "Temple Keeper",
+            vec![
+                "Vow of Lanterns\nEvery traveler may find shelter, peace, and warm bread within.",
+                "Bell Rule\nRing the belfry at dawn or when gathering rainclouds approach.",
+            ],
+        ),
+        (LecternBookKind::CastleDecree, UiLang::Ru) => (
+            "Королевский Указ",
+            "Кастелян Цитадели",
+            vec![
+                "Гарнизонный приказ\nУкреплять стены, дежурить у ворот и поддерживать оружейную в чистоте.",
+                "Снабжение\nБочонки с припасами распределять на рассвете сменным стражам.",
+            ],
+        ),
+        (LecternBookKind::CastleDecree, UiLang::En) => (
+            "Royal Garrison Decree",
+            "Citadel Castellan",
+            vec![
+                "Standing Orders\nMan the gatehouse battlements and inspect the armory racks daily.",
+                "Quartermaster Note\nIssue iron rations and torches from the barrel stores at dawn.",
+            ],
+        ),
+        (LecternBookKind::TownCharter, UiLang::Ru) => (
+            "Городская Хартия",
+            "Бургомистр",
+            vec![
+                "Устав города\nМощёные улицы и ночные фонари поддерживаются общиной в порядке.",
+                "Ярмарочные дни\nТорговые ряды открываются на центральной площади по субботам.",
+            ],
+        ),
+        (LecternBookKind::TownCharter, UiLang::En) => (
+            "Municipal Town Charter",
+            "Mayor of the District",
+            vec![
+                "Civic By-Laws\nAll cobbled avenues and daylight lanterns are kept clear by the guild.",
+                "Market Days\nMerchants gather around the central plaza each morning.",
+            ],
+        ),
+        (LecternBookKind::EngineeringLog, UiLang::Ru) => (
+            "Инженерный Журнал",
+            "Главный Механик",
+            vec![
+                "Схема механизмов\nРедукторы, шлюзовые затворы и рельсовые пути прошли проверку нагрузки.",
+                "Техника безопасности\nПроверяйте редстоун-датчики освещения и предохранители.",
+            ],
+        ),
+        (LecternBookKind::EngineeringLog, UiLang::En) => (
+            "Engineering Field Log",
+            "Chief Machinist",
+            vec![
+                "Inspection Report\nLock gates, gantry hoists, and rail turntables passed load checks.",
+                "Safety Protocol\nVerify redstone daylight relays and insulator coils before nightfall.",
+            ],
+        ),
+        (LecternBookKind::FarmAlmanac, UiLang::Ru) => (
+            "Альманах Фермера",
+            "Староста Хутора",
+            vec![
+                "Посевной календарь\nОрошайте грядки каждые четыре блока и вовремя собирайте мёд из ульев.",
+                "Конюшня и скот\nНаполняйте поилки водой и пополняйте запас сена до зимы.",
+            ],
+        ),
+        (LecternBookKind::FarmAlmanac, UiLang::En) => (
+            "Homestead Farm Almanac",
+            "Master Grower",
+            vec![
+                "Harvest Calendar\nKeep irrigation ditches flowing and tend orchard beehives gently.",
+                "Livestock Care\nRefill water cauldrons and stack dry hay bales inside the barn loft.",
+            ],
+        ),
+        (LecternBookKind::DungeonJournal, UiLang::Ru) => (
+            "Дневник Исследователя",
+            "Пропавший Следопыт",
+            vec![
+                "Запись 7\nНиже второго яруса слышен звон костей и скрип каменных плит.",
+                "Предупреждение\nОстерегайтесь нажимных плит и раздатчиков у алтаря сокровищ!",
+            ],
+        ),
+        (LecternBookKind::DungeonJournal, UiLang::En) => (
+            "Explorer's Field Notes",
+            "Missing Delver",
+            vec![
+                "Entry VII\nBeyond the switchback stairs, echoes stir beneath the deeper deepslate vaults.",
+                "Trap Warning\nWatch for stone pressure plates and wall dispensers near the lower sanctum!",
+            ],
+        ),
+        (LecternBookKind::StudyNotes, UiLang::Ru) => (
+            "Заметки Мастера",
+            "Зодчий",
+            vec![
+                "Чертежи дома\nКаждый этаж спланирован с учётом дневного света, уюта и тёплого очага.",
+            ],
+        ),
+        (LecternBookKind::StudyNotes, UiLang::En) => (
+            "Architect's Notebook",
+            "Master Builder",
+            vec![
+                "Floor Plan Notes\nBuilt with warm hearths, sturdy timber frames, and sunlit windows.",
+            ],
+        ),
+    }
+}
+
+fn banner_layers_for_style(style: BannerStyle, accent: &str) -> Vec<(&'static str, &'static str)> {
+    match style {
+        BannerStyle::RoyalCastle => vec![
+            ("minecraft:border", "block.minecraft.banner.border"),
+            ("minecraft:flower", "block.minecraft.banner.flower"),
+        ],
+        BannerStyle::TempleSacred => vec![
+            ("minecraft:cross", "block.minecraft.banner.cross"),
+            ("minecraft:border", "block.minecraft.banner.border"),
+        ],
+        BannerStyle::GuildCraft => vec![
+            ("minecraft:bricks", "block.minecraft.banner.bricks"),
+            ("minecraft:stripe_center", "block.minecraft.banner.stripe_center"),
+        ],
+        BannerStyle::HarborNautical => vec![
+            ("minecraft:stripe_bottom", "block.minecraft.banner.stripe_bottom"),
+            ("minecraft:rhombus", "block.minecraft.banner.rhombus"),
+        ],
+        BannerStyle::ParkBotanical => vec![
+            ("minecraft:gradient_up", "block.minecraft.banner.gradient_up"),
+            ("minecraft:flower", "block.minecraft.banner.flower"),
+        ],
+        BannerStyle::EngineerCog => vec![
+            ("minecraft:creeper", "block.minecraft.banner.creeper"),
+            ("minecraft:border", "block.minecraft.banner.border"),
+        ],
+    }
+    .into_iter()
+    .map(|(id, tk)| {
+        let _ = accent;
+        (id, tk)
+    })
+    .collect()
+}
+
+fn facing_yaw(facing: CardinalFacing) -> f32 {
+    match facing {
+        CardinalFacing::South => 0.0,
+        CardinalFacing::West => 90.0,
+        CardinalFacing::North => 180.0,
+        CardinalFacing::East => -90.0,
+    }
+}
+
+fn mc_direction_from_facing(facing: CardinalFacing) -> Direction {
+    match facing {
+        CardinalFacing::North => Direction::North,
+        CardinalFacing::South => Direction::South,
+        CardinalFacing::East => Direction::East,
+        CardinalFacing::West => Direction::West,
+    }
+}
+
+fn biome_villager_type(biome_tag: &str) -> &'static str {
+    let b = biome_tag.to_ascii_lowercase();
+    if b.contains("desert") || b.contains("badlands") {
+        "minecraft:desert"
+    } else if b.contains("snow") || b.contains("ice") || b.contains("frozen") {
+        "minecraft:snow"
+    } else if b.contains("taiga") {
+        "minecraft:taiga"
+    } else if b.contains("savanna") {
+        "minecraft:savanna"
+    } else if b.contains("swamp") || b.contains("mangrove") {
+        "minecraft:swamp"
+    } else if b.contains("jungle") {
+        "minecraft:jungle"
+    } else {
+        "minecraft:plains"
+    }
+}
+
+fn apply_post_build_extras(
+    host: &mut dyn ServerHost,
+    dimension: &str,
+    origin: [i32; 3],
+    living: &LivingPlan,
+    lang: UiLang,
+) -> Vec<u32> {
+    let mut spawned_ids = Vec::new();
+    let Some(level) = host.level(dimension) else {
+        return spawned_ids;
+    };
+
+    // 1. Populate Lecterns with bilingual written books
+    for lec in &living.lecterns {
+        let wpos = [origin[0] + lec.pos[0], origin[1] + lec.pos[1], origin[2] + lec.pos[2]];
+        if let Some(be) = host.block_entity(level, wpos) {
+            let (title, author, pages) = lectern_book_content(lec.book, lang);
+            let page_tags: Vec<Tag> = pages.into_iter().map(|p| Tag::String(p.into())).collect();
+            let book_content = Tag::compound([
+                ("title", Tag::String(title.into())),
+                ("author", Tag::String(author.into())),
+                ("pages", Tag::List(page_tags)),
+            ]);
+            let book_item = Tag::compound([
+                ("id", Tag::String("minecraft:written_book".into())),
+                ("count", Tag::Int(1)),
+                (
+                    "components",
+                    Tag::compound([("minecraft:written_book_content", book_content)]),
+                ),
+            ]);
+            if let Tag::Compound(root) = Tag::compound([("Book", book_item), ("Page", Tag::Int(0))]) {
+                let _ = be.merge_data(host, root);
+            }
+        }
+    }
+
+    // 2. Populate Wall & Hanging Signs with localized text
+    for sign in &living.signs {
+        let wpos = [origin[0] + sign.pos[0], origin[1] + sign.pos[1], origin[2] + sign.pos[2]];
+        if let Some(be) = host.block_entity(level, wpos) {
+            let lines = match (lang, &sign.custom_en, &sign.custom_ru) {
+                (UiLang::Ru, _, Some(ru)) => ru.clone(),
+                (UiLang::En, Some(en), _) => en.clone(),
+                _ => sign_lines_for_purpose(sign.purpose, lang),
+            };
+            let msg_tags: Vec<Tag> = lines.iter().map(|s| Tag::String(s.as_str().into())).collect();
+            let front = Tag::compound([
+                ("messages", Tag::List(msg_tags)),
+                ("color", Tag::String("black".into())),
+                ("has_glowing_text", Tag::Byte(0)),
+            ]);
+            if let Tag::Compound(root) =
+                Tag::compound([("front_text", front), ("is_waxed", Tag::Byte(1))])
+            {
+                let _ = be.merge_data(host, root);
+            }
+        }
+    }
+
+    // 3. Populate Banners with Heraldic Inline Patterns
+    for ban in &living.banners {
+        let wpos = [origin[0] + ban.pos[0], origin[1] + ban.pos[1], origin[2] + ban.pos[2]];
+        if let Some(be) = host.block_entity(level, wpos) {
+            let layers = banner_layers_for_style(ban.style, ban.accent_color);
+            let pattern_list: Vec<Tag> = layers
+                .into_iter()
+                .map(|(asset_id, tkey)| {
+                    Tag::compound([
+                        (
+                            "pattern",
+                            Tag::compound([
+                                ("asset_id", Tag::String(asset_id.into())),
+                                ("translation_key", Tag::String(tkey.into())),
+                            ]),
+                        ),
+                        ("color", Tag::String(ban.accent_color.into())),
+                    ])
+                })
+                .collect();
+            if let Tag::Compound(root) = Tag::compound([("patterns", Tag::List(pattern_list))]) {
+                let _ = be.merge_data(host, root);
+            }
+        }
+    }
+
+    // 4. Summon Living Entities & Decor Entities (ArmorStands, ItemFrames, Paintings, Villagers, Mobs)
+    for ent in &living.entities {
+        let wx = origin[0] + ent.pos[0];
+        let wy = origin[1] + ent.pos[1];
+        let wz = origin[2] + ent.pos[2];
+        let spawn_xyz = [
+            f64::from(wx) + 0.5,
+            f64::from(wy) + match ent.kind {
+                LivingEntityKind::Painting
+                | LivingEntityKind::ItemFrame
+                | LivingEntityKind::GlowItemFrame => 0.5,
+                _ => 0.05,
+            },
+            f64::from(wz) + 0.5,
+        ];
+
+        let (kind_id, root_tag, set_dir) = match ent.kind {
+            LivingEntityKind::ArmorStand => {
+                let mat = if ent.detail.is_empty() { "iron" } else { ent.detail.as_str() };
+                let mut eq = vec![
+                    ("head", Tag::compound([("id", Tag::String(format!("minecraft:{mat}_helmet").as_str().into())), ("count", Tag::Int(1))])),
+                    ("chest", Tag::compound([("id", Tag::String(format!("minecraft:{mat}_chestplate").as_str().into())), ("count", Tag::Int(1))])),
+                    ("legs", Tag::compound([("id", Tag::String(format!("minecraft:{mat}_leggings").as_str().into())), ("count", Tag::Int(1))])),
+                    ("feet", Tag::compound([("id", Tag::String(format!("minecraft:{mat}_boots").as_str().into())), ("count", Tag::Int(1))])),
+                ];
+                if !ent.sub_detail.is_empty() {
+                    let wpn_id = if ent.sub_detail.starts_with("minecraft:") {
+                        ent.sub_detail.clone()
+                    } else {
+                        format!("minecraft:{}", ent.sub_detail)
+                    };
+                    eq.push(("mainhand", Tag::compound([("id", Tag::String(wpn_id.as_str().into())), ("count", Tag::Int(1))])));
+                }
+                let yaw = facing_yaw(ent.facing);
+                let nbt = Tag::compound([
+                    ("ShowArms", Tag::Byte(1)),
+                    ("Rotation", Tag::List(vec![Tag::Float(yaw.to_bits()), Tag::Float(0.0f32.to_bits())])),
+                    ("equipment", Tag::compound(eq)),
+                ]);
+                ("minecraft:armor_stand", nbt, false)
+            }
+            LivingEntityKind::ItemFrame | LivingEntityKind::GlowItemFrame => {
+                let id = if ent.kind == LivingEntityKind::GlowItemFrame {
+                    "minecraft:glow_item_frame"
+                } else {
+                    "minecraft:item_frame"
+                };
+                let item = if ent.detail.is_empty() {
+                    "minecraft:compass"
+                } else {
+                    ent.detail.as_str()
+                };
+                let nbt = Tag::compound([
+                    ("Fixed", Tag::Byte(1)),
+                    ("block_pos", Tag::IntArray(vec![wx, wy, wz])),
+                    (
+                        "Item",
+                        Tag::compound([("id", Tag::String(item.into())), ("count", Tag::Int(1))]),
+                    ),
+                ]);
+                (id, nbt, true)
+            }
+            LivingEntityKind::Painting => {
+                let variant = if ent.detail.is_empty() {
+                    "minecraft:kebab"
+                } else {
+                    ent.detail.as_str()
+                };
+                let nbt = Tag::compound([
+                    ("variant", Tag::String(variant.into())),
+                    ("block_pos", Tag::IntArray(vec![wx, wy, wz])),
+                ]);
+                ("minecraft:painting", nbt, true)
+            }
+            LivingEntityKind::Villager => {
+                let prof = if ent.detail.is_empty() {
+                    "minecraft:mason".to_owned()
+                } else if ent.detail.starts_with("minecraft:") {
+                    ent.detail.clone()
+                } else {
+                    format!("minecraft:{}", ent.detail)
+                };
+                let vtype = biome_villager_type(&ent.sub_detail);
+                let nbt = Tag::compound([
+                    (
+                        "VillagerData",
+                        Tag::compound([
+                            ("level", Tag::Int(2)),
+                            ("profession", Tag::String(prof.as_str().into())),
+                            ("type", Tag::String(vtype.into())),
+                        ]),
+                    ),
+                    ("VillagerDataFinalized", Tag::Byte(1)),
+                ]);
+                ("minecraft:villager", nbt, false)
+            }
+            LivingEntityKind::IronGolem => {
+                ("minecraft:iron_golem", Tag::compound([("PlayerCreated", Tag::Byte(1))]), false)
+            }
+            LivingEntityKind::Horse => {
+                ("minecraft:horse", Tag::compound([("Tame", Tag::Byte(1))]), false)
+            }
+            LivingEntityKind::Cow => ("minecraft:cow", Tag::Compound(Default::default()), false),
+            LivingEntityKind::Sheep => ("minecraft:sheep", Tag::Compound(Default::default()), false),
+            LivingEntityKind::Bee => ("minecraft:bee", Tag::Compound(Default::default()), false),
+            LivingEntityKind::Cat => ("minecraft:cat", Tag::Compound(Default::default()), false),
+            LivingEntityKind::Skeleton => ("minecraft:skeleton", Tag::Compound(Default::default()), false),
+            LivingEntityKind::Zombie => ("minecraft:zombie", Tag::Compound(Default::default()), false),
+        };
+
+        let Tag::Compound(comp) = root_tag else {
+            continue;
+        };
+        if let Some(eid) = host.summon(dimension, kind_id, spawn_xyz, comp) {
+            if set_dir && let Some(eref) = host.entity(eid) {
+                let _ = eref.set_hanging_direction(host, mc_direction_from_facing(ent.facing));
+            }
+            spawned_ids.push(eid);
+        }
+    }
+
+    spawned_ids
+}
+
+/// Extends radial biome-aware terrain blending outside the `[0..w, 0..d]` footprint (`blend_radius` 1..=10)
+/// into `bp.blocks` before `prepare_undo_and_filter_blueprint`, so Undo/Redo restores the full blended apron.
+fn apply_outer_halo_blend(
+    host: &dyn ServerHost,
+    req: &BuildRequest,
+    bp: &mut GeneratedBlueprint,
+) {
+    if !req.adapt_terrain
+        || req.blend_radius == 0
+        || bp.spec.on_stilts
+        || matches!(bp.spec.category, BuildCategory::Bridge)
+    {
+        return;
+    }
+    let r = i32::from(req.blend_radius.min(10));
+    let w = i32::from(bp.width);
+    let d = i32::from(bp.depth);
+    let h_lim = i32::from(bp.height) + 2;
+
+    // Map boundary columns of the generated structure to anchor height around base level.
+    let mut edge_anchors: HashMap<(i32, i32), i32> = HashMap::new();
+    for (&[lx, ly, lz], blk) in &bp.blocks {
+        if blk.block_id != "minecraft:air"
+            && (-6..=8).contains(&ly)
+            && (lx <= 1 || lx >= w - 2 || lz <= 1 || lz >= d - 2)
+        {
+            edge_anchors
+                .entry((lx, lz))
+                .and_modify(|y| *y = (*y).min(ly))
+                .or_insert(ly);
+        }
+    }
+    if edge_anchors.is_empty() {
+        return;
+    }
+
+    let mut halo_cols = Vec::new();
+    let mut query_xz = Vec::new();
+    for lz in (-r)..(d + r) {
+        for lx in (-r)..(w + r) {
+            if (0..w).contains(&lx) && (0..d).contains(&lz) {
+                continue;
+            }
+            if let Some([dx, _, dz]) = bp.door_pos
+                && (lx - dx).abs() <= 1
+                && (lz - dz).abs() <= 2
+            {
+                continue;
+            }
+            let mut best: Option<(i32, i32)> = None;
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if let Some(&ay) = edge_anchors.get(&(lx + dx, lz + dz)) {
+                        let d2 = dx * dx + dz * dz;
+                        if best.is_none_or(|(bd2, _)| d2 < bd2) {
+                            best = Some((d2, ay.clamp(-6, 6)));
+                        }
+                    }
+                }
+            }
+            let Some((d2, anchor_y)) = best else {
+                continue;
+            };
+            let dist = (d2 as f64).sqrt();
+            if dist <= f64::from(r) + 0.35 {
+                halo_cols.push((lx, lz, dist, anchor_y));
+                query_xz.push((bp.origin[0] + lx, bp.origin[2] + lz));
+            }
+        }
+    }
+    if query_xz.is_empty() {
+        return;
+    }
+
+    let Ok(surf_heights) =
+        host.surface_heights(&req.dimension, &query_xz, Heightmap::MotionBlockingNoLeaves)
+    else {
+        return;
+    };
+    let floor_heights = host
+        .surface_heights(&req.dimension, &query_xz, Heightmap::OceanFloor)
+        .ok();
+    let noise = crate::noise::NoiseField::new(req.seed as u64);
+
+    for (idx, (lx, lz, dist, anchor_y)) in halo_cols.into_iter().enumerate() {
+        let Some(Some(sy)) = surf_heights.get(idx).copied() else {
+            continue;
+        };
+        if let Some(Some(fy)) = floor_heights.as_ref().and_then(|v| v.get(idx).copied())
+            && sy > fy
+        {
+            continue;
+        }
+        let terr = ((sy - 1) - bp.origin[1]).clamp(-16, 16);
+        crate::generator::apply_radial_terrain_column(
+            &mut bp.blocks,
+            lx,
+            lz,
+            dist,
+            r,
+            terr,
+            anchor_y,
+            h_lim,
+            &bp.spec.biome_tag,
+            bp.spec.style,
+            &req.palette,
+            req.seed as u64,
+            noise.cell_hash(lx, 0, lz),
+        );
+    }
+}
+
 fn prepare_undo_and_filter_blueprint(
     host: &dyn ServerHost,
     dimension: &str,
@@ -889,6 +1506,7 @@ fn prepare_undo_and_filter_blueprint(
         Some(UndoEntry {
             dimension: dimension.to_owned(),
             previous_blocks,
+            spawned_entities: Vec::new(),
         })
     }
 }
@@ -911,6 +1529,7 @@ fn capture_positions_snapshot(
         Some(UndoEntry {
             dimension: dimension.to_owned(),
             previous_blocks: current,
+            spawned_entities: Vec::new(),
         })
     }
 }
@@ -1162,6 +1781,7 @@ fn decode_history_stack(host: &dyn ServerHost, bytes: &[u8]) -> Option<Vec<UndoE
             out.push(UndoEntry {
                 dimension: dim,
                 previous_blocks,
+                spawned_entities: Vec::new(),
             });
         }
     }
@@ -1316,14 +1936,32 @@ pub fn execute_build(
         terrain_offsets.as_deref(),
         water_depths.as_deref(),
     );
+    apply_outer_halo_blend(host, &req, &mut bp);
+    with_last_requests(|map| {
+        map.insert(player.map_or(0, PlayerRef::uuid), req.clone());
+    });
+    place_blueprint_with_history(host, player, &req.dimension, req.seed, req.air_only, &mut bp, lang, None)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn place_blueprint_with_history(
+    host: &mut dyn ServerHost,
+    player: Option<PlayerRef>,
+    dimension: &str,
+    seed: i64,
+    air_only: bool,
+    bp: &mut GeneratedBlueprint,
+    lang: UiLang,
+    custom_label: Option<String>,
+) -> BuildResponse {
     let owner_key = player.map_or(0, PlayerRef::uuid);
     ensure_history_loaded(host, owner_key);
-    let undo_snapshot =
-        prepare_undo_and_filter_blueprint(host, &req.dimension, &mut bp, req.air_only);
-    let post_containers = collect_post_build_containers(&bp, req.seed as u64, lang);
+    let undo_snapshot = prepare_undo_and_filter_blueprint(host, dimension, bp, air_only);
+    let post_containers = collect_post_build_containers(bp, seed as u64, lang);
+    let post_living = bp.living.clone();
+    let post_origin = bp.origin;
 
-    if req.air_only && bp.blocks.is_empty() {
+    if air_only && bp.blocks.is_empty() {
         return BuildResponse {
             ok: false,
             blocks_changed: 0,
@@ -1336,7 +1974,7 @@ pub fn execute_build(
         };
     }
 
-    let (palette, phase1_runs, phase2_runs) = match blueprint_to_phased_runs(host, &bp) {
+    let (palette, phase1_runs, phase2_runs) = match blueprint_to_phased_runs(host, bp) {
         Ok(res) => res,
         Err(err) => {
             return BuildResponse {
@@ -1368,9 +2006,6 @@ pub fn execute_build(
     with_redo_map(|map| {
         map.remove(&owner_key);
     });
-    with_last_requests(|map| {
-        map.insert(owner_key, req.clone());
-    });
     persist_owner_history(host, owner_key);
 
     if total_runs <= MAX_RUNS_PER_BATCH {
@@ -1381,7 +2016,7 @@ pub fn execute_build(
                 filters: Vec::new(),
                 runs: phase1_runs,
             };
-            match host.edit_blocks(&req.dimension, &edit1) {
+            match host.edit_blocks(dimension, &edit1) {
                 Ok(c) => changed += c,
                 Err(err) => {
                     return BuildResponse {
@@ -1401,7 +2036,7 @@ pub fn execute_build(
                 filters: Vec::new(),
                 runs: phase2_runs,
             };
-            match host.edit_blocks(&req.dimension, &edit2) {
+            match host.edit_blocks(dimension, &edit2) {
                 Ok(c) => changed += c,
                 Err(err) => {
                     return BuildResponse {
@@ -1415,38 +2050,53 @@ pub fn execute_build(
                 }
             }
         }
-        apply_post_build_containers(host, &req.dimension, &post_containers);
+        apply_post_build_containers(host, dimension, &post_containers);
+        let spawned = apply_post_build_extras(host, dimension, post_origin, &post_living, lang);
+        if !spawned.is_empty() {
+            with_undo_map(|map| {
+                if let Some(last) = map.get_mut(&owner_key).and_then(|s| s.last_mut()) {
+                    last.spawned_entities.extend(spawned);
+                }
+            });
+        }
         let undo_count = undo_depth(owner_key);
         BuildResponse {
             ok: true,
             blocks_changed: changed.min(i32::MAX as u64) as i32,
-            message: match lang {
-                UiLang::En => format!(
-                    "Ready: {} ({}) {}x{}x{} (seed {}, blocks changed: {}) [undo: {}/{} | redo: 0/{}].",
-                    bp.spec.category.label(UiLang::En),
-                    bp.spec.style.label(UiLang::En),
-                    bp.width,
-                    bp.depth,
-                    bp.height,
-                    req.seed,
-                    changed,
-                    undo_count,
-                    MAX_UNDO_HISTORY_PER_PLAYER,
-                    MAX_UNDO_HISTORY_PER_PLAYER
-                ),
-                UiLang::Ru => format!(
-                    "Готово: {} ({}) {}x{}x{} (сид {}, изменено блоков: {}) [отмен: {}/{} | возврат: 0/{}].",
-                    bp.spec.category.label_ru(),
-                    bp.spec.style.label_ru(),
-                    bp.width,
-                    bp.depth,
-                    bp.height,
-                    req.seed,
-                    changed,
-                    undo_count,
-                    MAX_UNDO_HISTORY_PER_PLAYER,
-                    MAX_UNDO_HISTORY_PER_PLAYER
-                ),
+            message: if let Some(lbl) = custom_label {
+                match lang {
+                    UiLang::En => format!("{lbl} ({changed} blocks) [undo: {undo_count}/{MAX_UNDO_HISTORY_PER_PLAYER} | redo: 0/{MAX_UNDO_HISTORY_PER_PLAYER}]."),
+                    UiLang::Ru => format!("{lbl} ({changed} бл.) [отмен: {undo_count}/{MAX_UNDO_HISTORY_PER_PLAYER} | возврат: 0/{MAX_UNDO_HISTORY_PER_PLAYER}]."),
+                }
+            } else {
+                match lang {
+                    UiLang::En => format!(
+                        "Ready: {} ({}) {}x{}x{} (seed {}, blocks changed: {}) [undo: {}/{} | redo: 0/{}].",
+                        bp.spec.category.label(UiLang::En),
+                        bp.spec.style.label(UiLang::En),
+                        bp.width,
+                        bp.depth,
+                        bp.height,
+                        seed,
+                        changed,
+                        undo_count,
+                        MAX_UNDO_HISTORY_PER_PLAYER,
+                        MAX_UNDO_HISTORY_PER_PLAYER
+                    ),
+                    UiLang::Ru => format!(
+                        "Готово: {} ({}) {}x{}x{} (сид {}, изменено блоков: {}) [отмен: {}/{} | возврат: 0/{}].",
+                        bp.spec.category.label_ru(),
+                        bp.spec.style.label_ru(),
+                        bp.width,
+                        bp.depth,
+                        bp.height,
+                        seed,
+                        changed,
+                        undo_count,
+                        MAX_UNDO_HISTORY_PER_PLAYER,
+                        MAX_UNDO_HISTORY_PER_PLAYER
+                    ),
+                }
             },
         }
     } else {
@@ -1479,16 +2129,28 @@ pub fn execute_build(
             filters: Vec::new(),
             runs: first,
         };
-        match host.edit_blocks(&req.dimension, &edit) {
+        match host.edit_blocks(dimension, &edit) {
             Ok(first_changed) => {
-                if !chunks.is_empty() {
+                if chunks.is_empty() {
+                    apply_post_build_containers(host, dimension, &post_containers);
+                    let spawned = apply_post_build_extras(host, dimension, post_origin, &post_living, lang);
+                    if !spawned.is_empty() {
+                        with_undo_map(|map| {
+                            if let Some(last) = map.get_mut(&owner_key).and_then(|s| s.last_mut()) {
+                                last.spawned_entities.extend(spawned);
+                            }
+                        });
+                    }
+                } else {
                     let job_seq = CMD_BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
-                    let label = format!(
-                        "{} {}x{}",
-                        bp.spec.category.label(lang),
-                        bp.width,
-                        bp.depth
-                    );
+                    let label = custom_label.unwrap_or_else(|| {
+                        format!(
+                            "{} {}x{}",
+                            bp.spec.category.label(lang),
+                            bp.width,
+                            bp.depth
+                        )
+                    });
                     let pct = ((first_count * 100) / total_runs.max(1)).min(99) as i32;
                     let boss_bar = if let Some(p) = player {
                         let bar_id = format!("building_generator:build_{job_seq}");
@@ -1524,7 +2186,7 @@ pub fn execute_build(
                     }
                     with_pending_jobs(|q| {
                         q.push_back(PendingBatchJob {
-                            dimension: req.dimension.clone(),
+                            dimension: dimension.to_owned(),
                             palette,
                             chunks,
                             completed_runs: first_count,
@@ -1534,6 +2196,8 @@ pub fn execute_build(
                             label,
                             lang,
                             post_containers,
+                            post_living,
+                            post_origin,
                         });
                     });
                     let _ = host.schedule_task(1, BATCH_TASK_TOKEN);
@@ -1544,11 +2208,11 @@ pub fn execute_build(
                     message: match lang {
                         UiLang::En => format!(
                             "Large build ({} blocks/segments) building per tick (seed {}) [undo: {}/{} | redo: 0/{}].",
-                            total_runs, req.seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER, MAX_UNDO_HISTORY_PER_PLAYER
+                            total_runs, seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER, MAX_UNDO_HISTORY_PER_PLAYER
                         ),
                         UiLang::Ru => format!(
                             "Крупная постройка ({} блоков/сегментов) строится по тикам (сид {}) [отмен: {}/{} | возврат: 0/{}].",
-                            total_runs, req.seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER, MAX_UNDO_HISTORY_PER_PLAYER
+                            total_runs, seed, undo_count, MAX_UNDO_HISTORY_PER_PLAYER, MAX_UNDO_HISTORY_PER_PLAYER
                         ),
                     },
                 }
@@ -1576,6 +2240,7 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
     let mut bars_to_remove: Vec<BossBarRef> = Vec::new();
     let mut finished_notifications: Vec<(Option<u128>, String)> = Vec::new();
     let mut finished_containers: Vec<(String, Vec<PostBuildContainer>)> = Vec::new();
+    let mut finished_living: Vec<(Option<u128>, String, [i32; 3], LivingPlan, UiLang)> = Vec::new();
 
     with_pending_jobs(|q| {
         while let Some(job) = q.front_mut() {
@@ -1586,8 +2251,15 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
             let Some(chunk) = job.chunks.pop_front() else {
                 let completed = q.pop_front().unwrap();
                 if !completed.post_containers.is_empty() {
-                    finished_containers.push((completed.dimension, completed.post_containers));
+                    finished_containers.push((completed.dimension.clone(), completed.post_containers));
                 }
+                finished_living.push((
+                    completed.player_uuid,
+                    completed.dimension,
+                    completed.post_origin,
+                    completed.post_living,
+                    completed.lang,
+                ));
                 if let Some(bar) = completed.boss_bar {
                     bars_to_remove.push(bar);
                 }
@@ -1616,8 +2288,15 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
             if job.chunks.is_empty() {
                 let completed = q.pop_front().unwrap();
                 if !completed.post_containers.is_empty() {
-                    finished_containers.push((completed.dimension, completed.post_containers));
+                    finished_containers.push((completed.dimension.clone(), completed.post_containers));
                 }
+                finished_living.push((
+                    completed.player_uuid,
+                    completed.dimension,
+                    completed.post_origin,
+                    completed.post_living,
+                    completed.lang,
+                ));
                 if let Some(bar) = completed.boss_bar {
                     bars_to_remove.push(bar);
                 }
@@ -1649,6 +2328,17 @@ pub fn process_scheduled_task(host: &mut dyn ServerHost, event: &mut ScheduledTa
 
     for (dim, containers) in finished_containers {
         apply_post_build_containers(host, &dim, &containers);
+    }
+    for (uuid_opt, dim, origin, living, lang) in finished_living {
+        let spawned = apply_post_build_extras(host, &dim, origin, &living, lang);
+        if !spawned.is_empty() {
+            let owner_key = uuid_opt.unwrap_or(0);
+            with_undo_map(|map| {
+                if let Some(last) = map.get_mut(&owner_key).and_then(|s| s.last_mut()) {
+                    last.spawned_entities.extend(spawned);
+                }
+            });
+        }
     }
 
     for (bar, pct, label) in bar_updates {
@@ -1771,6 +2461,14 @@ fn execute_history_step(
             };
         }
     };
+
+    if !is_redo {
+        for eid in &entry.spawned_entities {
+            if let Some(eref) = host.entity(*eid) {
+                let _ = eref.discard(host);
+            }
+        }
+    }
 
     if let Some(inv) = inverse {
         if is_redo {
@@ -1914,6 +2612,115 @@ pub fn handle_reroll_payload(req: RerollRequest, cx: &mut dyn IPayloadContext) -
     })
 }
 
+/// Executes 2-point terrain-conforming road and automatic bridge construction between `start` and `end`.
+pub fn execute_road_connect(
+    host: &mut dyn ServerHost,
+    player: Option<PlayerRef>,
+    mut req: RoadConnectRequest,
+) -> BuildResponse {
+    let lang = player_lang(player);
+    if let Some(p) = player
+        && !player_has_build_permission(host, p)
+    {
+        return deny_permission_response(lang);
+    }
+    if req.dimension.chars().count() > 128 || req.dimension.trim().is_empty() {
+        req.dimension = "minecraft:overworld".into();
+    }
+    if host.level(&req.dimension).is_none() {
+        return BuildResponse {
+            ok: false,
+            blocks_changed: 0,
+            message: match lang {
+                UiLang::En => format!("Unknown dimension: {}", req.dimension),
+                UiLang::Ru => format!("Неизвестное измерение: {}", req.dimension),
+            },
+        };
+    }
+
+    req.road_width = req.road_width.clamp(3, 5);
+    req.blend_radius = req.blend_radius.min(10);
+    let span_x = (req.end_x - req.start_x).abs();
+    let span_z = (req.end_z - req.start_z).abs();
+    if span_x > 160 || span_z > 160 {
+        return BuildResponse {
+            ok: false,
+            blocks_changed: 0,
+            message: tr(
+                lang,
+                "Road span exceeds 160 blocks; pick closer endpoints.",
+                "Длина дороги превышает 160 блоков; выберите точки ближе.",
+            )
+            .to_owned(),
+        };
+    }
+
+    let margin = i32::from(req.road_width) / 2 + i32::from(req.blend_radius) + 3;
+    let min_x = req.start_x.min(req.end_x) - margin;
+    let max_x = req.start_x.max(req.end_x) + margin;
+    let min_z = req.start_z.min(req.end_z) - margin;
+    let max_z = req.start_z.max(req.end_z) + margin;
+    let bw = (max_x - min_x + 1).clamp(7, 192) as u16;
+    let bd = (max_z - min_z + 1).clamp(7, 192) as u16;
+    let base_y = req.start_y.min(req.end_y);
+    let box_origin = [min_x, base_y, min_z];
+
+    let mut cols = Vec::with_capacity(usize::from(bw) * usize::from(bd));
+    for lz in 0..i32::from(bd) {
+        for lx in 0..i32::from(bw) {
+            cols.push((box_origin[0] + lx, box_origin[2] + lz));
+        }
+    }
+    let offsets = if let Ok(surf) =
+        host.surface_heights(&req.dimension, &cols, Heightmap::MotionBlockingNoLeaves)
+    {
+        surf.iter()
+            .map(|opt| opt.map_or(0, |sy| (sy - 1) - base_y))
+            .collect::<Vec<i32>>()
+    } else {
+        vec![0; cols.len()]
+    };
+    let depths = if let (Ok(surf), Ok(floor)) = (
+        host.surface_heights(&req.dimension, &cols, Heightmap::MotionBlockingNoLeaves),
+        host.surface_heights(&req.dimension, &cols, Heightmap::OceanFloor),
+    ) {
+        surf.iter()
+            .zip(floor.iter())
+            .map(|(s, f)| match (s, f) {
+                (Some(sy), Some(fy)) if sy > fy => (sy - fy).clamp(0, 20),
+                _ => 0,
+            })
+            .collect::<Vec<i32>>()
+    } else {
+        vec![0; cols.len()]
+    };
+
+    let mut bp = crate::gen_road::generate_road_connector(&req, &offsets, &depths, box_origin, bw, bd);
+    let label = match lang {
+        UiLang::En => format!("Road ({},{})->({},{}) [w={}]", req.start_x, req.start_z, req.end_x, req.end_z, req.road_width),
+        UiLang::Ru => format!("Дорога ({},{})->({},{}) [ш={}]", req.start_x, req.start_z, req.end_x, req.end_z, req.road_width),
+    };
+    place_blueprint_with_history(
+        host,
+        player,
+        &req.dimension,
+        req.seed,
+        req.air_only,
+        &mut bp,
+        lang,
+        Some(label),
+    )
+}
+
+pub fn handle_road_payload(
+    req: RoadConnectRequest,
+    cx: &mut dyn IPayloadContext,
+) -> Result<(), String> {
+    run_network_action(cx, true, |host, player| {
+        execute_road_connect(host, Some(player), req)
+    })
+}
+
 pub fn handle_lang_payload(req: SetLangRequest, cx: &mut dyn IPayloadContext) -> Result<(), String> {
     let player = cx.player().map_err(|e| format!("{e:?}"))?;
     set_player_lang(Some(player), req.lang);
@@ -2042,9 +2849,21 @@ pub const CLI_PRESETS: &[(&str, BuildCategory, crate::model::BuildStyle, u16, u1
     ("mine", BuildCategory::Dungeon, crate::model::BuildStyle::Medieval, 29, 29, 18, "глубокая заброшенная шахта штольня с рельсами, деревянными крепями и рудными жилами"),
     ("estate", BuildCategory::Estate, crate::model::BuildStyle::Cottage, 35, 33, 20, "загородная усадьба поместье с хозяйским домом, амбаром, грядками, загоном и садом"),
     ("vineyard_estate", BuildCategory::Estate, crate::model::BuildStyle::Medieval, 31, 29, 18, "средневековая загородная усадьба хутор с хозяйским домом, бочками, садом и огородом"),
+    ("canal_lock", BuildCategory::Engineering, crate::model::BuildStyle::Medieval, 23, 25, 16, "судоходный шлюз канал с двойными воротами и будкой смотрителя"),
+    ("roundhouse", BuildCategory::Engineering, crate::model::BuildStyle::Steampunk, 25, 25, 16, "железнодорожное веерное депо с поворотным кругом, рельсами и паровозными стойлами"),
+    ("drydock", BuildCategory::Engineering, crate::model::BuildStyle::Medieval, 21, 31, 18, "корабельный сухой док с портальным краном и кильблоками"),
+    ("substation", BuildCategory::Engineering, crate::model::BuildStyle::Modern, 21, 19, 16, "трансформаторная электроподстанция с громоотводами, катушками и датчиками"),
+    ("vineyard", BuildCategory::Agricultural, crate::model::BuildStyle::Cottage, 25, 23, 14, "террасный виноградник со шпалерами и прессовым домом с бочками"),
+    ("silo_farm", BuildCategory::Agricultural, crate::model::BuildStyle::Medieval, 23, 21, 20, "фермерский элеватор с высокой зерновой башней силосом и мельницей"),
+    ("apiary", BuildCategory::Agricultural, crate::model::BuildStyle::Cottage, 21, 19, 13, "пасека и фруктовый сад с цветущими деревьями и пчелиными ульями"),
+    ("stables", BuildCategory::Agricultural, crate::model::BuildStyle::Medieval, 23, 19, 14, "королевская конюшня и пастбище с денниками, водопоем и сеновалом"),
+    ("fountain", BuildCategory::DecorArt, crate::model::BuildStyle::Classical, 17, 17, 14, "торжественный городской фонтан на площади со скамьями и светильниками"),
+    ("statue", BuildCategory::DecorArt, crate::model::BuildStyle::Classical, 15, 15, 22, "монументальная статуя стража на гранитном постаменте с мечом"),
+    ("hedge_maze", BuildCategory::DecorArt, crate::model::BuildStyle::Cottage, 25, 25, 11, "парковый зелёный лабиринт из живой изгороди с беседкой в центре"),
+    ("zen_garden", BuildCategory::DecorArt, crate::model::BuildStyle::Japanese, 21, 19, 12, "японский сад камней карэсансуй с бонсай сакуры и мостиком"),
 ];
 
-pub const CLI_PRESET_DESCS_EN: [&str; 76] = [
+pub const CLI_PRESET_DESCS_EN: [&str; 88] = [
     "japanese two-story teahouse with terrace, stall, striped awning and lanterns",
     "medieval two-story tavern with fireplace and basement",
     "multi-tiered japanese pagoda with cherry blossom garden",
@@ -2121,6 +2940,18 @@ pub const CLI_PRESET_DESCS_EN: [&str; 76] = [
     "deep abandoned timber mineshaft dungeon with rails, ore veins and supply crates",
     "rural country manor estate compound with house, barn, irrigated crop fields, livestock paddock and orchard",
     "medieval countryside homestead estate with manor house, orchard well, irrigated fields and paddock",
+    "engineering canal navigation lock with stepped basin, double sluice gates and lockkeeper cabin",
+    "steampunk railway roundhouse depot with rotating turntable, radial rails and locomotive bays",
+    "maritime gantry drydock shipyard with overhead beam crane, scaffold cradles and slipway",
+    "modern electrical power substation with transformer coils, copper busbars and lightning rods",
+    "cottage hillside vineyard with grape trellises, stone winepress house and barrel cellar",
+    "medieval grain farmstead with tall circular masonry grain silos, loading chute and barn",
+    "peaceful blossom orchard apiary with fruit trees, raised flower beds and wooden beehives",
+    "timber royal horse stables and paddock with stall boxes, hay loft and watering troughs",
+    "grand classical tiered stone plaza fountain with spouts, perimeter benches and lanterns",
+    "monumental stone guardian statue on tiered plinth holding sword and raised lantern",
+    "botanical garden hedge maze park with evergreen topiary corridors and central gazebo",
+    "tranquil japanese zen garden karesansui with raked gravel waves, crooked sakura and torii bridge",
 ];
 
 pub fn cli_preset_desc(idx: usize, lang: UiLang) -> &'static str {
@@ -2241,6 +3072,9 @@ fn spawn_command_build(
         overgrowth_pct: 0,
         biome_hint,
         palette,
+        living_decor: true,
+        spawn_npcs: false,
+        blend_radius: 4,
     };
     execute_build(host, player_opt, req)
 }
@@ -2256,6 +3090,15 @@ pub fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event.commands.push(Command::op("buildgen generate <description:text>", 2));
     event.commands.push(Command::op(
         "buildgen size <width:integer> <depth:integer> <height:integer> <description:text>",
+        2,
+    ));
+    event.commands.push(Command::op("buildgen connect", 2));
+    event.commands.push(Command::op(
+        "buildgen road <x1:integer> <z1:integer> <x2:integer> <z2:integer>",
+        2,
+    ));
+    event.commands.push(Command::op(
+        "buildgen road <x1:integer> <z1:integer> <x2:integer> <z2:integer> <width:integer>",
         2,
     ));
 }
@@ -2275,7 +3118,7 @@ pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
         } else {
             ""
         };
-        for sub in ["help", "undo", "redo", "reroll", "lang", "preset", "generate", "size"] {
+        for sub in ["help", "undo", "redo", "reroll", "lang", "preset", "generate", "size", "road", "connect"] {
             if sub.starts_with(prefix) && !event.suggestions.iter().any(|s| s.text == sub) {
                 event.suggestions.push(mod_api::Suggestion::new(range, sub));
             }
@@ -2398,11 +3241,11 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
         Some("help") => {
             let _ = host.commands().feedback(Text::literal(match lang {
                 UiLang::En => format!(
-                    "Building Generator v{}: F8 or /buildgen | /buildgen lang <en|ru> | /buildgen preset <name> | /buildgen generate <desc> | /buildgen size <w> <d> <h> <desc> | /buildgen reroll | /buildgen undo | /buildgen redo",
+                    "Building Generator v{}: F8 or /buildgen | /buildgen lang <en|ru> | /buildgen preset <name> | /buildgen generate <desc> | /buildgen size <w> <d> <h> <desc> | /buildgen road <x1> <z1> <x2> <z2> [width] | /buildgen connect | /buildgen reroll | /buildgen undo | /buildgen redo",
                     crate::model::MOD_VERSION
                 ),
                 UiLang::Ru => format!(
-                    "Building Generator v{}: F8 или /buildgen | /buildgen lang <en|ru> | /buildgen preset <имя> | /buildgen generate <описание> | /buildgen size <w> <d> <h> <описание> | /buildgen reroll | /buildgen undo | /buildgen redo",
+                    "Building Generator v{}: F8 или /buildgen | /buildgen lang <en|ru> | /buildgen preset <имя> | /buildgen generate <описание> | /buildgen size <w> <d> <h> <описание> | /buildgen road <x1> <z1> <x2> <z2> [шир] | /buildgen connect | /buildgen reroll | /buildgen undo | /buildgen redo",
                     crate::model::MOD_VERSION
                 ),
             }));
@@ -2552,6 +3395,119 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
                 desc,
             );
             let _ = host.commands().feedback(Text::literal(resp.message));
+            Flow::Cancel
+        }
+        Some("road") => {
+            if !require_command_op(host, event, player_opt, lang) {
+                return Flow::Cancel;
+            }
+            let mut x1 = 0i32;
+            let mut z1 = 0i32;
+            let mut x2 = 0i32;
+            let mut z2 = 0i32;
+            let mut width = 3u8;
+            for arg in &event.command.arguments {
+                match (arg.name.as_str(), &arg.value) {
+                    ("x1", CommandArgumentValue::Integer(v)) => x1 = *v as i32,
+                    ("z1", CommandArgumentValue::Integer(v)) => z1 = *v as i32,
+                    ("x2", CommandArgumentValue::Integer(v)) => x2 = *v as i32,
+                    ("z2", CommandArgumentValue::Integer(v)) => z2 = *v as i32,
+                    ("width", CommandArgumentValue::Integer(v)) => width = (*v).clamp(3, 5) as u8,
+                    _ => {}
+                }
+            }
+            let dim = player_opt
+                .and_then(|p| p.dimension(host))
+                .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
+            let base_y = player_opt
+                .and_then(|p| p.entity().position(host))
+                .map_or(event.command.position[1].floor() as i32, |pos| pos[1].floor() as i32 - 1);
+            let seq = CMD_BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
+            let biome_hint = sample_biome_at(host, &dim, x1, base_y, z1);
+            let req = RoadConnectRequest {
+                dimension: dim,
+                start_x: x1,
+                start_y: base_y,
+                start_z: z1,
+                end_x: x2,
+                end_y: base_y,
+                end_z: z2,
+                road_width: width,
+                auto_bridge: true,
+                style: crate::model::BuildStyle::Medieval,
+                seed: crate::noise::fresh_entropy(seq, (x1 ^ z2) as u64) as i64,
+                air_only: false,
+                blend_radius: 4,
+                living_decor: true,
+                spawn_npcs: false,
+                biome_hint,
+                palette: MaterialPalette::preset(0),
+            };
+            let resp = execute_road_connect(host, player_opt, req);
+            let _ = host.commands().feedback(Text::literal(resp.message));
+            Flow::Cancel
+        }
+        Some("connect") => {
+            if !require_command_op(host, event, player_opt, lang) {
+                return Flow::Cancel;
+            }
+            let Some(player) = player_opt else {
+                let _ = host.commands().feedback(Text::literal(tr(
+                    lang,
+                    "/buildgen connect must be run by a player.",
+                    "/buildgen connect должен запускаться игроком.",
+                )));
+                return Flow::Cancel;
+            };
+            let dim = player
+                .dimension(host)
+                .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
+            let pos = player.entity().position(host).unwrap_or(event.command.position);
+            let cur = [pos[0].floor() as i32, pos[1].floor() as i32 - 1, pos[2].floor() as i32];
+            let uid = player.uuid();
+            let prev = {
+                let mut guard = ROAD_CONNECT_ANCHORS.lock().unwrap_or_else(|e| e.into_inner());
+                let map = guard.get_or_insert_with(HashMap::new);
+                if let Some((pdim, ppos)) = map.get(&uid).cloned()
+                    && pdim == dim
+                {
+                    map.remove(&uid);
+                    Some(ppos)
+                } else {
+                    map.insert(uid, (dim.clone(), cur));
+                    None
+                }
+            };
+            if let Some(start) = prev {
+                let seq = CMD_BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
+                let biome_hint = sample_biome_at(host, &dim, start[0], start[1], start[2]);
+                let req = RoadConnectRequest {
+                    dimension: dim,
+                    start_x: start[0],
+                    start_y: start[1],
+                    start_z: start[2],
+                    end_x: cur[0],
+                    end_y: cur[1],
+                    end_z: cur[2],
+                    road_width: 3,
+                    auto_bridge: true,
+                    style: crate::model::BuildStyle::Medieval,
+                    seed: crate::noise::fresh_entropy(seq, (start[0] ^ cur[2]) as u64) as i64,
+                    air_only: false,
+                    blend_radius: 4,
+                    living_decor: true,
+                    spawn_npcs: false,
+                    biome_hint,
+                    palette: MaterialPalette::preset(0),
+                };
+                let resp = execute_road_connect(host, player_opt, req);
+                let _ = host.commands().feedback(Text::literal(resp.message));
+            } else {
+                let _ = host.commands().feedback(Text::literal(match lang {
+                    UiLang::En => format!("Road start pinned at ({}, {}, {}). Walk to end and run /buildgen connect again.", cur[0], cur[1], cur[2]),
+                    UiLang::Ru => format!("Начало дороги зафиксировано ({}, {}, {}). Дойдите до второй точки и снова введите /buildgen connect.", cur[0], cur[1], cur[2]),
+                }));
+            }
             Flow::Cancel
         }
         _ => Flow::Continue,

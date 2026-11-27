@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
 use crate::gen_common::{
-    GeneratedBlueprint, LocalGrid, PlannedBlock, clamp_i32, make_beam_block_at, make_frame_block_at,
-    make_leaves, make_pillar_block_at, make_slab, make_stair, prune_map_unsupported,
-    resolve_connections_and_shapes, set_uv, terrain_rel_at,
+    BannerStyle, GeneratedBlueprint, LecternBookKind, LivingEntityKind, LivingPlan, LocalGrid,
+    PlannedBanner, PlannedBlock, PlannedEntity, PlannedLectern, PlannedSign, SignPurpose,
+    clamp_i32, make_beam_block_at, make_frame_block_at, make_leaves, make_pillar_block_at,
+    make_slab, make_stair, prune_map_unsupported, resolve_connections_and_shapes, set_uv,
+    terrain_rel_at,
 };
 use crate::model::{BuildCategory, BuildRequest, BuildStyle, CardinalFacing, MaterialPalette};
 use crate::noise::{NoiseField, SplitMix64};
@@ -80,13 +82,16 @@ fn dungeon_ore_block(seed: u64, u: i32, y: i32, v: i32, tier: usize) -> &'static
 /// anchored cleanly to a surface gatehouse with walkable switchback descending staircases (`y = -18..surface`).
 pub(crate) fn generate_dungeon_complex(
     req: &BuildRequest,
-    spec: BlueprintSpec,
+    mut spec: BlueprintSpec,
     grid: LocalGrid,
     height: u16,
     noise: NoiseField,
     terrain_offsets: Option<&[i32]>,
 ) -> GeneratedBlueprint {
+    spec.living_decor &= req.living_decor;
+    spec.spawn_npcs |= req.spawn_npcs;
     let mut blocks = BTreeMap::new();
+    let mut living = LivingPlan::default();
     let seed = req.seed as u64;
     let mut rng = SplitMix64::new(seed ^ 0xD046_E040_1234_5678);
     let pal = &req.palette;
@@ -295,6 +300,11 @@ pub(crate) fn generate_dungeon_complex(
                             set_uv(&mut blocks, grid, rx - 1, floor_y + 1, rz - 1, PlannedBlock::simple("minecraft:bookshelf"));
                             set_uv(&mut blocks, grid, rx - 1, floor_y + 2, rz - 1, PlannedBlock::simple("minecraft:bookshelf"));
                         }
+                        if is_carved(rx - 1, rz + 1) {
+                            set_uv(&mut blocks, grid, rx - 1, floor_y + 1, rz + 1, PlannedBlock::with_props("minecraft:lectern", vec![("facing", grid.dir_right()), ("has_book", "true")]));
+                            let [lx, lz] = grid.to_local_xz(rx - 1, rz + 1);
+                            living.lecterns.push(PlannedLectern { pos: [lx, floor_y + 1, lz], book: LecternBookKind::DungeonJournal });
+                        }
                         if is_carved(rx + 1, rz - 1) {
                             set_uv(&mut blocks, grid, rx + 1, floor_y + 1, rz - 1, PlannedBlock::with_props("minecraft:chest", vec![("facing", grid.dir_front()), ("type", "single")]));
                         }
@@ -311,6 +321,32 @@ pub(crate) fn generate_dungeon_complex(
                         if is_carved(rx, rz - 1) {
                             set_uv(&mut blocks, grid, rx, floor_y + 1, rz - 1, PlannedBlock::with_props("minecraft:chest", vec![("facing", grid.dir_front()), ("type", "single")]));
                         }
+                        if is_carved(rx + 1, rz + 1) {
+                            let [lx, lz] = grid.to_local_xz(rx + 1, rz + 1);
+                            living.entities.push(PlannedEntity {
+                                pos: [lx, floor_y + 1, lz],
+                                kind: LivingEntityKind::ArmorStand,
+                                facing: grid.facing,
+                                detail: "iron".into(),
+                                sub_detail: "iron_sword".into(),
+                                is_decor: true,
+                            });
+                        }
+                        if spec.spawn_npcs {
+                            let [lx, lz] = grid.to_local_xz(rx, floor_y + 1);
+                            let _ = (lx, lz);
+                            let [sx, sz] = grid.to_local_xz(rx - 1, rz + 1);
+                            if is_carved(rx - 1, rz + 1) {
+                                living.entities.push(PlannedEntity {
+                                    pos: [sx, floor_y + 1, sz],
+                                    kind: LivingEntityKind::Skeleton,
+                                    facing: grid.facing,
+                                    detail: String::new(),
+                                    sub_detail: String::new(),
+                                    is_decor: false,
+                                });
+                            }
+                        }
                     }
                     2 => {
                         // Subterranean Glow-Moss Water Cistern
@@ -324,7 +360,7 @@ pub(crate) fn generate_dungeon_complex(
                         }
                     }
                     _ => {
-                        // Deep Boss Sanctum & Alchemist Pedestal with Safe Trial Floor!
+                        // Deep Boss Sanctum & Alchemist Pedestal with Safe Trial Floor + Redstone Dispenser Trap!
                         set_uv(&mut blocks, grid, rx, floor_y + 1, rz, PlannedBlock::simple("minecraft:gilded_blackstone"));
                         set_uv(&mut blocks, grid, rx, floor_y + 2, rz, PlannedBlock::with_props("minecraft:brewing_stand", vec![("has_bottle_0", "true"), ("has_bottle_1", "true"), ("has_bottle_2", "true")]));
                         if is_carved(rx + 1, rz) {
@@ -333,9 +369,26 @@ pub(crate) fn generate_dungeon_complex(
                         if is_carved(rx - 1, rz) {
                             set_uv(&mut blocks, grid, rx - 1, floor_y + 1, rz, PlannedBlock::with_props("minecraft:chest", vec![("facing", grid.dir_right()), ("type", "single")]));
                         }
-                        // Flavor pressure plate warning step on approach!
+                        // Flavor pressure plate + recessed wall dispenser trap + tripwire hook!
                         if is_carved(rx, rz - 1) {
-                            set_uv(&mut blocks, grid, rx, floor_y + 1, rz - 1, PlannedBlock::simple("minecraft:stone_pressure_plate"));
+                            set_uv(&mut blocks, grid, rx, floor_y + 1, rz - 1, PlannedBlock::with_props("minecraft:stone_pressure_plate", vec![("powered", "false")]));
+                            if spec.living_decor {
+                                set_uv(&mut blocks, grid, rx + 2, floor_y + 2, rz - 1, PlannedBlock::with_props("minecraft:dispenser", vec![("facing", grid.dir_left()), ("triggered", "false")]));
+                                if is_carved(rx - 1, rz - 1) && !is_carved(rx - 2, rz - 1) {
+                                    set_uv(&mut blocks, grid, rx - 1, floor_y + 2, rz - 1, PlannedBlock::with_props("minecraft:tripwire_hook", vec![("facing", grid.dir_right()), ("attached", "false"), ("powered", "false")]));
+                                }
+                            }
+                        }
+                        if spec.spawn_npcs && is_carved(rx + 1, rz + 1) {
+                            let [zx, zz] = grid.to_local_xz(rx + 1, rz + 1);
+                            living.entities.push(PlannedEntity {
+                                pos: [zx, floor_y + 1, zz],
+                                kind: LivingEntityKind::Zombie,
+                                facing: grid.facing,
+                                detail: String::new(),
+                                sub_detail: String::new(),
+                                is_decor: false,
+                            });
                         }
                     }
                 }
@@ -345,7 +398,7 @@ pub(crate) fn generate_dungeon_complex(
                 }
             }
         } else {
-            // Compact dungeon chest & barrel right inside main chamber!
+            // Compact dungeon chest, barrel, lectern & armor stand right inside main chamber!
             let c_u = (cu + 1).min(max_x - 1);
             let c_v = (cv - 1).max(min_z + 1);
             if is_carved(c_u, c_v) {
@@ -353,6 +406,11 @@ pub(crate) fn generate_dungeon_complex(
             }
             if is_carved(cu - 1, c_v) {
                 set_uv(&mut blocks, grid, cu - 1, floor_y + 1, c_v, PlannedBlock::with_props("minecraft:barrel", vec![("facing", "up")]));
+            }
+            if is_carved(cu, c_v) {
+                set_uv(&mut blocks, grid, cu, floor_y + 1, c_v, PlannedBlock::with_props("minecraft:lectern", vec![("facing", grid.dir_front()), ("has_book", "true")]));
+                let [lx, lz] = grid.to_local_xz(cu, c_v);
+                living.lecterns.push(PlannedLectern { pos: [lx, floor_y + 1, lz], book: LecternBookKind::DungeonJournal });
             }
         }
     }
@@ -487,6 +545,39 @@ pub(crate) fn generate_dungeon_complex(
     }
 
     let _ = rng;
+    if spec.living_decor && grid.in_bounds(cu - 1, front_v + 1) {
+        set_uv(
+            &mut blocks,
+            grid,
+            cu - 1,
+            surface_base_y + 3,
+            front_v + 1,
+            PlannedBlock::with_props("minecraft:dark_oak_wall_sign", vec![("facing", grid.dir_front()), ("waterlogged", "false")]),
+        );
+        let [sx, sz] = grid.to_local_xz(cu - 1, front_v + 1);
+        living.signs.push(PlannedSign {
+            pos: [sx, surface_base_y + 3, sz],
+            purpose: SignPurpose::DungeonWarning,
+            custom_en: None,
+            custom_ru: None,
+        });
+        for side in [-2, 2] {
+            if grid.in_bounds(cu + side, front_v + 1) && (cu + side - (cu - gate_ru)).abs() >= 0 {
+                let bu = cu + side;
+                if (cu - gate_ru..=cu + gate_ru).contains(&bu) {
+                    set_uv(&mut blocks, grid, bu, surface_base_y + 3, front_v + 1, PlannedBlock::with_props("minecraft:black_wall_banner", vec![("facing", grid.dir_front())]));
+                    let [bx, bz] = grid.to_local_xz(bu, front_v + 1);
+                    living.banners.push(PlannedBanner {
+                        pos: [bx, surface_base_y + 3, bz],
+                        style: BannerStyle::RoyalCastle,
+                        primary_color: "black",
+                        accent_color: "red",
+                    });
+                }
+            }
+        }
+    }
+    living.apply_filters(spec.living_decor, spec.spawn_npcs);
     prune_map_unsupported(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
     let [dlx, dlz] = grid.to_local_xz(cu, front_v);
@@ -499,6 +590,7 @@ pub(crate) fn generate_dungeon_complex(
         height,
         blocks,
         door_pos: Some([dlx, surface_base_y + 1, dlz]),
+        living,
     }
 }
 
@@ -508,11 +600,13 @@ pub(crate) fn generate_dungeon_complex(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_estate_compound(
     req: &BuildRequest,
-    spec: BlueprintSpec,
+    mut spec: BlueprintSpec,
     _noise: NoiseField,
     terrain_offsets: Option<&[i32]>,
     water_depths: Option<&[i32]>,
 ) -> GeneratedBlueprint {
+    spec.living_decor &= req.living_decor;
+    spec.spawn_npcs |= req.spawn_npcs;
     let w = i32::from(req.width.clamp(7, 96));
     let d = i32::from(req.depth.clamp(7, 96));
     let h = req.height.clamp(5, 48);
@@ -593,6 +687,11 @@ pub(crate) fn generate_estate_compound(
                 height: h,
                 blocks,
                 door_pos: bp.door_pos.map(|[dx, dy, dz]| [ox + dx, base_y + dy, dz]),
+                living: {
+                    let mut lv = bp.living;
+                    lv.apply_filters(req.living_decor, req.spawn_npcs);
+                    lv
+                },
             };
         }
         let mut fallback = crate::generator::generate_blueprint_with_water(&sub_req, terrain_offsets, water_depths);
@@ -601,6 +700,7 @@ pub(crate) fn generate_estate_compound(
     }
 
     let mut blocks: BTreeMap<[i32; 3], PlannedBlock> = BTreeMap::new();
+    let mut living = LivingPlan::default();
 
     let cx = w / 2;
     let cz = d / 2;
@@ -673,7 +773,7 @@ pub(crate) fn generate_estate_compound(
     }
 
     // Helper closure to stamp a full procedural sub-building cleanly into an estate quadrant.
-    let mut stamp_building = |bx0: i32, bz0: i32, bw: u16, bd: u16, bh: u16, cat: BuildCategory, facing: CardinalFacing, prompt: &str, seed_salt: u64| {
+    let mut stamp_building = |bx0: i32, bz0: i32, bw: u16, bd: u16, bh: u16, cat: BuildCategory, facing: CardinalFacing, prompt: &str, seed_salt: u64, out_living: &mut LivingPlan| {
         let ilw = i32::from(bw);
         let ild = i32::from(bd);
         let base_y = terr_at(bx0 + ilw / 2, bz0 + ild - 1);
@@ -699,6 +799,9 @@ pub(crate) fn generate_estate_compound(
             overgrowth_pct: 0,
             biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
+            living_decor: req.living_decor,
+            spawn_npcs: false,
+            blend_radius: 0,
         };
         let _keep_desc_ref = req.description.len();
         let sub_bp = crate::generator::generate_blueprint_with_water(&sub_req, sub_off.as_deref(), sub_wd.as_deref());
@@ -710,6 +813,7 @@ pub(crate) fn generate_estate_compound(
                 blocks.insert([wx, wy, wz], blk);
             }
         }
+        out_living.merge_offset(sub_bp.living, bx0, base_y, bz0);
         // Connect building door to nearest estate avenue along facing axis!
         if let Some([dlx, dly, dlz]) = sub_bp.door_pos {
             let mut px = bx0 + dlx;
@@ -754,6 +858,7 @@ pub(crate) fn generate_estate_compound(
         CardinalFacing::South,
         "manor house with porch fireplace and kitchen",
         0x1111_2222_3333_4444,
+        &mut living,
     );
 
     let barn_avail_w = w - 2 - (cx + 2);
@@ -772,6 +877,7 @@ pub(crate) fn generate_estate_compound(
             CardinalFacing::South,
             "timber farm barn with loft and stables",
             0x5555_6666_7777_8888,
+            &mut living,
         );
     }
 
@@ -793,6 +899,7 @@ pub(crate) fn generate_estate_compound(
                 CardinalFacing::North,
                 "windmill with sails",
                 0x9999_AAAA_BBBB_CCCC,
+                &mut living,
             );
             windmill_x = Some(wm_x);
         }
@@ -926,15 +1033,48 @@ pub(crate) fn generate_estate_compound(
         if pen_x1 - 2 > pen_x0 {
             blocks.insert([pen_x1 - 2, pen_y + 1, pen_z1 - 1], PlannedBlock::simple("minecraft:hay_block"));
         }
+        if spec.spawn_npcs {
+            let lx = (pen_x0 + pen_x1) / 2;
+            let lz = (pen_z0 + pen_z1) / 2;
+            living.entities.push(PlannedEntity { pos: [lx, pen_y + 1, lz], kind: LivingEntityKind::Cow, facing: CardinalFacing::South, detail: String::new(), sub_detail: String::new(), is_decor: false });
+            if pen_x1 - pen_x0 >= 5 {
+                living.entities.push(PlannedEntity { pos: [lx + 1, pen_y + 1, lz], kind: LivingEntityKind::Sheep, facing: CardinalFacing::West, detail: String::new(), sub_detail: String::new(), is_decor: false });
+                living.entities.push(PlannedEntity { pos: [lx - 1, pen_y + 1, lz], kind: LivingEntityKind::Horse, facing: CardinalFacing::East, detail: String::new(), sub_detail: String::new(), is_decor: false });
+            }
+        }
     }
 
-    // 6. Central Crossroads Estate Lantern Post or Orchard Tree!
+    // 6. Central Crossroads Estate Daylight Lamp, Gate Banners/Sign, Orchard & Farmers!
     if w >= 23 && d >= 23 {
         let wy = terr_at(cx, cz);
         blocks.insert([cx, wy + 1, cz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, cx, wy + 1, cz)));
         blocks.insert([cx, wy + 2, cz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, cx, wy + 2, cz)));
         blocks.insert([cx, wy + 3, cz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, cx, wy + 3, cz)));
-        blocks.insert([cx, wy + 4, cz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, cx, wy + 4, cz)));
+        if spec.living_decor {
+            blocks.insert([cx, wy + 4, cz], PlannedBlock::with_props("minecraft:redstone_lamp", vec![("lit", "false")]));
+            blocks.insert([cx, wy + 5, cz], PlannedBlock::with_props("minecraft:daylight_detector", vec![("inverted", "true"), ("power", "0")]));
+        } else {
+            blocks.insert([cx, wy + 4, cz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, cx, wy + 4, cz)));
+        }
+        if spec.living_decor {
+            blocks.insert([cx + 1, wy + 1, cz], PlannedBlock::with_props("minecraft:lectern", vec![("facing", "east"), ("has_book", "true")]));
+            living.lecterns.push(PlannedLectern { pos: [cx + 1, wy + 1, cz], book: LecternBookKind::FarmAlmanac });
+        }
+    }
+    let gate_y = terr_at(cx, d - 1) + 1;
+    if spec.living_decor && cx >= 2 && cx + 2 < w {
+        let gy_left = terr_at(cx - 2, d - 1);
+        blocks.insert([cx - 2, gy_left + 2, d - 1], PlannedBlock::with_props("minecraft:oak_wall_sign", vec![("facing", "south"), ("waterlogged", "false")]));
+        living.signs.push(PlannedSign { pos: [cx - 2, gy_left + 2, d - 1], purpose: SignPurpose::FarmBarn, custom_en: None, custom_ru: None });
+        let gy_right = terr_at(cx + 2, d - 1);
+        blocks.insert([cx + 2, gy_right + 2, d - 1], PlannedBlock::with_props("minecraft:green_wall_banner", vec![("facing", "south")]));
+        living.banners.push(PlannedBanner { pos: [cx + 2, gy_right + 2, d - 1], style: BannerStyle::ParkBotanical, primary_color: "green", accent_color: "lime" });
+    }
+    if spec.spawn_npcs {
+        let fy = terr_at(cx - 2, cz + 2) + 1;
+        living.entities.push(PlannedEntity { pos: [cx - 2, fy, cz + 2], kind: LivingEntityKind::Villager, facing: CardinalFacing::South, detail: "farmer".into(), sub_detail: spec.biome_tag.clone(), is_decor: false });
+        living.entities.push(PlannedEntity { pos: [cx, gate_y, d - 2], kind: LivingEntityKind::IronGolem, facing: CardinalFacing::South, detail: String::new(), sub_detail: String::new(), is_decor: false });
+        living.entities.push(PlannedEntity { pos: [cx - 3, fy + 2, cz + 3], kind: LivingEntityKind::Bee, facing: CardinalFacing::South, detail: String::new(), sub_detail: String::new(), is_decor: false });
     }
     let orchard_spot = [w - 4, 2];
     if w >= 29 && d >= 29 && blocks.get(&[orchard_spot[0], terr_at(orchard_spot[0], orchard_spot[1]) + 1, orchard_spot[1]]).is_none() {
@@ -957,10 +1097,10 @@ pub(crate) fn generate_estate_compound(
     }
 
     let _ = rng;
+    living.apply_filters(spec.living_decor, spec.spawn_npcs);
     prune_map_unsupported(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
 
-    let gate_y = terr_at(cx, d - 1) + 1;
     GeneratedBlueprint {
         spec,
         origin: [req.origin_x, req.origin_y, req.origin_z],
@@ -969,5 +1109,6 @@ pub(crate) fn generate_estate_compound(
         height: h,
         blocks,
         door_pos: Some([cx, gate_y, d - 1]),
+        living,
     }
 }

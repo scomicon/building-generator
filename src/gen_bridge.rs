@@ -1869,5 +1869,6 @@ pub(crate) fn generate_bridge(
         height,
         blocks,
         door_pos: Some([dlx, door_y, dlz]),
+        living: crate::gen_common::LivingPlan::default(),
     }
 }

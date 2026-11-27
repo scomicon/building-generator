@@ -1,7 +1,7 @@
 id = "building_generator"
 name = "Building Generator"
-version = "0.6.1"
-description = "Bilingual (EN/RU) procedural architecture mod: live 3D hologram preview with collision highlights, [H] frame toggle & in-world Move 3D, multi-tier Dungeons & Mineshafts, Estate/Farm Compounds, persistent world-saved Undo/Redo, populated container loot, Settlement 2.0, Biome Auto-Style, Wear/Moss sliders, 61 themes, 76 presets, BOM, air-only, and OP security."
+version = "0.7.0"
+description = "Bilingual (EN/RU) procedural architecture mod: 4-tab UI, live 3D hologram with collision highlights, [H] frame toggle & Move 3D, Living Interiors 2.0 (banners, lecterns, redstone, NPCs/livestock), smooth radial terrain blend, 2-point Road/Auto-Bridge connector, 73 themes, 88 presets, 14 categories, persistent Undo/Redo, loot, and OP security."
 authors = ["Building Generator Contributors"]
 license = "MIT"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside data/ and assets/.

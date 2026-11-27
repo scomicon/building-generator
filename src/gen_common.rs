@@ -26,6 +26,141 @@ impl PlannedBlock {
 }
 
 /// Complete generated voxel blueprint ready for unit inspection or `edit_blocks` placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LivingEntityKind {
+    ArmorStand,
+    ItemFrame,
+    GlowItemFrame,
+    Painting,
+    Villager,
+    IronGolem,
+    Horse,
+    Cow,
+    Sheep,
+    Bee,
+    Cat,
+    Skeleton,
+    Zombie,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedEntity {
+    /// Local coordinates `[lx, ly, lz]` relative to `GeneratedBlueprint::origin`.
+    pub pos: [i32; 3],
+    pub kind: LivingEntityKind,
+    pub facing: CardinalFacing,
+    /// Item id (`ItemFrame`), villager profession, painting variant, or armor weapon hint.
+    pub detail: String,
+    /// Secondary customization (e.g. armor tier `"iron"`, `"gold"`, `"chainmail"`, `"leather"`).
+    pub sub_detail: String,
+    /// `true` for static decor entities (`ArmorStand`, `ItemFrame`, `Painting`), `false` for mobs/NPCs.
+    pub is_decor: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignPurpose {
+    Tavern,
+    Bakery,
+    Library,
+    Forge,
+    Apothecary,
+    Station,
+    Harbor,
+    PowerPlant,
+    FarmBarn,
+    Vineyard,
+    Apiary,
+    Stables,
+    StatuePlaque,
+    FountainPlaque,
+    StreetCorner,
+    DungeonWarning,
+    Waypost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedSign {
+    pub pos: [i32; 3],
+    pub purpose: SignPurpose,
+    pub custom_en: Option<[String; 4]>,
+    pub custom_ru: Option<[String; 4]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LecternBookKind {
+    LibraryChronicle,
+    MageGrimoire,
+    ObservatoryStarChart,
+    TempleCodex,
+    CastleDecree,
+    TownCharter,
+    EngineeringLog,
+    FarmAlmanac,
+    DungeonJournal,
+    StudyNotes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedLectern {
+    pub pos: [i32; 3],
+    pub book: LecternBookKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BannerStyle {
+    RoyalCastle,
+    TempleSacred,
+    GuildCraft,
+    HarborNautical,
+    ParkBotanical,
+    EngineerCog,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedBanner {
+    pub pos: [i32; 3],
+    pub style: BannerStyle,
+    pub primary_color: &'static str,
+    pub accent_color: &'static str,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LivingPlan {
+    pub signs: Vec<PlannedSign>,
+    pub lecterns: Vec<PlannedLectern>,
+    pub banners: Vec<PlannedBanner>,
+    pub entities: Vec<PlannedEntity>,
+}
+
+impl LivingPlan {
+    pub(crate) fn merge_offset(&mut self, mut other: Self, dx: i32, dy: i32, dz: i32) {
+        for mut s in other.signs.drain(..) {
+            s.pos[0] += dx;
+            s.pos[1] += dy;
+            s.pos[2] += dz;
+            self.signs.push(s);
+        }
+        for mut l in other.lecterns.drain(..) {
+            l.pos[0] += dx;
+            l.pos[1] += dy;
+            l.pos[2] += dz;
+            self.lecterns.push(l);
+        }
+        for mut b in other.banners.drain(..) {
+            b.pos[0] += dx;
+            b.pos[1] += dy;
+            b.pos[2] += dz;
+            self.banners.push(b);
+        }
+        for mut e in other.entities.drain(..) {
+            e.pos[0] += dx;
+            e.pos[1] += dy;
+            e.pos[2] += dz;
+            self.entities.push(e);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GeneratedBlueprint {
     pub spec: crate::parser::BlueprintSpec,
@@ -36,6 +171,7 @@ pub struct GeneratedBlueprint {
     /// Map from local `[lx, ly, lz]` (relative to `origin`) to block state spec.
     pub blocks: BTreeMap<[i32; 3], PlannedBlock>,
     pub door_pos: Option<[i32; 3]>,
+    pub living: LivingPlan,
 }
 
 impl GeneratedBlueprint {
@@ -162,6 +298,19 @@ impl LocalGrid {
         } else {
             self.dir_left()
         }
+    }
+
+    pub fn dir_str_to_facing(dir: &str) -> CardinalFacing {
+        match dir {
+            "north" => CardinalFacing::North,
+            "east" => CardinalFacing::East,
+            "west" => CardinalFacing::West,
+            _ => CardinalFacing::South,
+        }
+    }
+
+    pub fn uv_to_facing(&self, du: i32, dv: i32) -> CardinalFacing {
+        Self::dir_str_to_facing(self.uv_to_mc_dir(du, dv))
     }
 
     pub fn axis_u(&self) -> &'static str {
@@ -521,7 +670,10 @@ fn is_full_connect_solid(b: &PlannedBlock) -> bool {
         && !id.ends_with("glass_pane")
         && !id.ends_with("_leaves")
         && !id.ends_with("_pressure_plate")
+        && !id.ends_with("_banner")
+        && !id.ends_with("_sign")
         && !id.starts_with("minecraft:potted_")
+        && !matches!(id, "minecraft:lever" | "minecraft:tripwire_hook" | "minecraft:daylight_detector")
 }
 
 fn prop_val(b: &PlannedBlock, key: &str) -> Option<&'static str> {
@@ -652,4 +804,96 @@ pub(crate) fn resolve_connections_and_shapes(blocks: &mut BTreeMap<[i32; 3], Pla
 #[inline]
 pub(crate) fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
     if lo >= hi { hi } else { v.clamp(lo, hi) }
+}
+
+impl LivingPlan {
+    /// Filters signs, banners, and entities according to resolved `living_decor` & `spawn_npcs` flags.
+    pub(crate) fn apply_filters(&mut self, living_decor: bool, spawn_npcs: bool) {
+        if !living_decor {
+            self.signs.clear();
+            self.banners.clear();
+            self.entities.retain(|e| !e.is_decor);
+        }
+        if !spawn_npcs {
+            self.entities.retain(|e| e.is_decor);
+        }
+    }
+
+    /// Materializes any placeholder `air` sign/banner marker coordinates into real `*_wall_sign`/`*_sign`
+    /// and `*_wall_banner`/`*_banner` blocks attached to adjacent walls or solid floors underneath.
+    pub(crate) fn materialize_signs_and_banners(
+        &self,
+        blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+        wood_prefix: &str,
+    ) {
+        let wall_dirs = [
+            ("south", 0i32, -1i32),
+            ("north", 0, 1),
+            ("east", -1, 0),
+            ("west", 1, 0),
+        ];
+        let is_wall_back = |blocks: &BTreeMap<[i32; 3], PlannedBlock>, p: [i32; 3]| -> bool {
+            blocks
+                .get(&p)
+                .is_some_and(|b| is_full_connect_solid(b))
+        };
+
+        for s in &self.signs {
+            let needs_fill = blocks.get(&s.pos).is_none_or(|b| b.block_id == "minecraft:air");
+            if !needs_fill {
+                continue;
+            }
+            let [x, y, z] = s.pos;
+            if let Some(&(face, _, _)) = wall_dirs
+                .iter()
+                .find(|&&(_, bx, bz)| is_wall_back(blocks, [x + bx, y, z + bz]))
+            {
+                blocks.insert(
+                    s.pos,
+                    PlannedBlock::with_props(
+                        format!("minecraft:{wood_prefix}_wall_sign"),
+                        vec![("facing", face), ("waterlogged", "false")],
+                    ),
+                );
+            } else if blocks.get(&[x, y - 1, z]).is_some_and(|b| b.block_id != "minecraft:air") {
+                blocks.insert(
+                    s.pos,
+                    PlannedBlock::with_props(
+                        format!("minecraft:{wood_prefix}_sign"),
+                        vec![("rotation", "0"), ("waterlogged", "false")],
+                    ),
+                );
+            }
+        }
+
+        for b_plan in &self.banners {
+            let needs_fill = blocks
+                .get(&b_plan.pos)
+                .is_none_or(|b| b.block_id == "minecraft:air");
+            if !needs_fill {
+                continue;
+            }
+            let [x, y, z] = b_plan.pos;
+            if let Some(&(face, _, _)) = wall_dirs
+                .iter()
+                .find(|&&(_, bx, bz)| is_wall_back(blocks, [x + bx, y, z + bz]))
+            {
+                blocks.insert(
+                    b_plan.pos,
+                    PlannedBlock::with_props(
+                        format!("minecraft:{}_wall_banner", b_plan.primary_color),
+                        vec![("facing", face)],
+                    ),
+                );
+            } else if blocks.get(&[x, y - 1, z]).is_some_and(|b| b.block_id != "minecraft:air") {
+                blocks.insert(
+                    b_plan.pos,
+                    PlannedBlock::with_props(
+                        format!("minecraft:{}_banner", b_plan.primary_color),
+                        vec![("rotation", "0")],
+                    ),
+                );
+            }
+        }
+    }
 }

@@ -9,7 +9,9 @@ mod gen_fantasy_folk;
 mod gen_fortress;
 mod gen_landmarks;
 mod gen_modern_industrial;
+mod gen_new_categories;
 pub mod gen_preview;
+mod gen_road;
 mod gen_exterior;
 mod gen_interior;
 mod gen_roof;
@@ -187,6 +189,9 @@ mod tests {
             overgrowth_pct: 0,
             biome_hint: String::new(),
             palette: MaterialPalette::preset(0),
+            living_decor: true,
+            spawn_npcs: false,
+            blend_radius: 4,
         }
     }
 
@@ -753,6 +758,64 @@ mod tests {
         "minecraft:stone_pressure_plate",
         "minecraft:gilded_blackstone",
         "minecraft:jack_o_lantern",
+        "minecraft:daylight_detector",
+        "minecraft:tripwire_hook",
+        "minecraft:dispenser",
+        "minecraft:lever",
+        "minecraft:heavy_weighted_pressure_plate",
+        "minecraft:spruce_pressure_plate",
+        "minecraft:dark_oak_pressure_plate",
+        "minecraft:birch_pressure_plate",
+        "minecraft:cherry_pressure_plate",
+        "minecraft:bamboo_pressure_plate",
+        "minecraft:pale_oak_pressure_plate",
+        "minecraft:oak_sign",
+        "minecraft:oak_wall_sign",
+        "minecraft:dark_oak_wall_sign",
+        "minecraft:birch_wall_sign",
+        "minecraft:spruce_wall_sign",
+        "minecraft:cherry_wall_sign",
+        "minecraft:red_wall_banner",
+        "minecraft:red_banner",
+        "minecraft:blue_wall_banner",
+        "minecraft:blue_banner",
+        "minecraft:white_wall_banner",
+        "minecraft:green_wall_banner",
+        "minecraft:green_banner",
+        "minecraft:gray_wall_banner",
+        "minecraft:gray_banner",
+        "minecraft:purple_wall_banner",
+        "minecraft:cyan_wall_banner",
+        "minecraft:black_wall_banner",
+        "minecraft:brown_wall_banner",
+        "minecraft:rail",
+        "minecraft:powered_rail",
+        "minecraft:redstone_block",
+        "minecraft:beehive",
+        "minecraft:sweet_berry_bush",
+        "minecraft:melon",
+        "minecraft:oxeye_daisy",
+        "minecraft:cornflower",
+        "minecraft:rose_bush",
+        "minecraft:peony",
+        "minecraft:lilac",
+        "minecraft:sunflower",
+        "minecraft:allium",
+        "minecraft:blue_orchid",
+        "minecraft:lily_of_the_valley",
+        "minecraft:hopper",
+        "minecraft:cracked_bricks",
+        "minecraft:andesite",
+        "minecraft:smooth_stone",
+        "minecraft:smooth_stone_slab",
+        "minecraft:deepslate_tiles",
+        "minecraft:quartz_slab",
+        "minecraft:mud",
+        "minecraft:podzol",
+        "minecraft:mycelium",
+        "minecraft:iron_block",
+        "minecraft:scaffolding",
+        "minecraft:amethyst_cluster",
     ];
 
     static REGISTERED_KEYS: OnceLock<Mutex<HashMap<String, BlockKey>>> = OnceLock::new();
@@ -818,6 +881,9 @@ mod tests {
         biome_id: Option<String>,
         world_dir_path: Option<PathBuf>,
         world_files: MemWorldFiles,
+        summoned_entities: Vec<(u32, String, [f64; 3], mod_api::Compound, bool)>,
+        hanging_dirs: HashMap<u32, mod_api::Direction>,
+        next_entity_id: u32,
     }
 
     impl TestWorldHost {
@@ -839,6 +905,9 @@ mod tests {
                 biome_id: None,
                 world_dir_path: None,
                 world_files: MemWorldFiles::default(),
+                summoned_entities: Vec::new(),
+                hanging_dirs: HashMap::new(),
+                next_entity_id: 1000,
             };
             let grass = BlockStateRecord::new(grass_key, 0).into();
             for x in 0..40 {
@@ -948,6 +1017,17 @@ mod tests {
         }
     }
     impl EntitiesHost for TestWorldHost {
+        fn entity(&self, id: u32) -> Option<mod_api::EntityRef> {
+            let alive = self
+                .summoned_entities
+                .iter()
+                .any(|(eid, _, _, _, ok)| *eid == id && *ok);
+            if !alive {
+                return None;
+            }
+            let overworld = self.fake.level("minecraft:overworld")?;
+            Some(mod_api::EntityRef::new(overworld.epoch(), id))
+        }
         fn level(&self, dimension: &str) -> Option<LevelRef> {
             self.fake.level(dimension)
         }
@@ -983,7 +1063,23 @@ mod tests {
             Some(<BackendMutRef<'_> as BackendMutRefOf>::of(self))
         }
     }
-    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services, block_entities, config));
+    mod_api::impl_server_host_areas!(TestWorldHost, except(world_edit, services, block_entities, config, entities));
+
+    impl EntitiesServerHost for TestWorldHost {
+        fn summon(
+            &mut self,
+            _dimension: &str,
+            kind: &str,
+            pos: [f64; 3],
+            nbt: mod_api::Compound,
+        ) -> Option<u32> {
+            let id = self.next_entity_id;
+            self.next_entity_id += 1;
+            self.summoned_entities
+                .push((id, kind.to_owned(), pos, nbt, true));
+            Some(id)
+        }
+    }
 
     impl ConfigServerHost for TestWorldHost {
         fn game_tests_enabled(&self) -> bool {
@@ -1152,7 +1248,27 @@ mod tests {
     }
 
     impl BackendMut for TestWorldHost {}
-    mod_api::impl_backend_mut_areas!(TestWorldHost, except(payloads, players));
+    mod_api::impl_backend_mut_areas!(TestWorldHost, except(entities, payloads, players));
+
+    impl EntitiesBackendMut for TestWorldHost {
+        fn entity_discard(&mut self, entity: mod_api::EntityRef) -> bool {
+            let id = entity.id();
+            if let Some(entry) = self.summoned_entities.iter_mut().find(|e| e.0 == id && e.4) {
+                entry.4 = false;
+                true
+            } else {
+                false
+            }
+        }
+        fn entity_set_hanging_direction(
+            &mut self,
+            entity: mod_api::EntityRef,
+            direction: mod_api::Direction,
+        ) -> bool {
+            self.hanging_dirs.insert(entity.id(), direction);
+            true
+        }
+    }
 
     impl PlayersBackendMut for TestWorldHost {
         fn player_tell(
@@ -1619,6 +1735,9 @@ mod tests {
                     overgrowth_pct: 0,
                     biome_hint: String::new(),
                     palette: pal,
+                    living_decor: true,
+                    spawn_npcs: false,
+                    blend_radius: 0,
                 };
                 let pbp = generate_blueprint(&preq, None);
                 let res = blueprint_to_phased_runs(&host, &pbp);
@@ -1866,7 +1985,7 @@ mod tests {
         assert_eq!(find_cli_preset("village").map(|p| p.0), Some("village"));
         assert_eq!(find_cli_preset("квартал").map(|p| p.0), Some("village"));
         assert!(find_cli_preset("nonexistent_preset_xyz").is_none());
-        assert_eq!(CLI_PRESETS.len(), 76);
+        assert_eq!(CLI_PRESETS.len(), 88);
     }
 
     #[test]
@@ -2906,6 +3025,9 @@ mod tests {
             seed: 987_654_321,
             palette_manual: true,
             palette: MaterialPalette::preset_for_style(BuildStyle::Classical),
+            living_decor: true,
+            spawn_npcs: false,
+            blend_radius: 4,
         };
         let code = encode_share_code(&preset);
         assert!(code.starts_with("BG2:"), "Share code must use BG2 prefix");
@@ -3082,6 +3204,9 @@ mod tests {
             seed: 4242,
             palette_manual: true,
             palette: custom_pal.clone(),
+            living_decor: true,
+            spawn_npcs: false,
+            blend_radius: 4,
         };
         let code = encode_share_code(&p);
         let decoded = decode_share_code(&code, Some(&p.name)).expect("BG2 v2 share code roundtrip");
@@ -3400,6 +3525,9 @@ mod tests {
             seed: 987654,
             palette_manual: true,
             palette: pal.clone(),
+            living_decor: true,
+            spawn_npcs: false,
+            blend_radius: 4,
         };
         let code = encode_share_code(&preset);
         assert!(code.starts_with("BG2"));
@@ -3725,7 +3853,7 @@ mod tests {
         use crate::parser::StructureTheme;
         use crate::server_builder::{CLI_PRESETS, find_cli_preset};
 
-        assert_eq!(CLI_PRESETS.len(), 76);
+        assert_eq!(CLI_PRESETS.len(), 88);
         let mut seen_new_themes: HashMap<StructureTheme, &'static str> = HashMap::new();
 
         for (idx, &(slug, cat, style, w, d, h, desc)) in CLI_PRESETS.iter().enumerate() {
@@ -4311,6 +4439,9 @@ mod tests {
             seed: 123_456,
             palette_manual: false,
             palette: infer_palette_with_biome(BuildStyle::Gothic, "gothic castle keep", 123_456, ""),
+            living_decor: true,
+            spawn_npcs: false,
+            blend_radius: 4,
         };
         let v4_code = encode_share_code(&preset_v4);
         assert_eq!(
@@ -4977,7 +5108,7 @@ mod tests {
 
     #[test]
     fn v060_categories_dungeon_and_estate_parse_and_roundtrip() {
-        assert_eq!(BuildCategory::ALL.len(), 11);
+        assert_eq!(BuildCategory::ALL.len(), 14);
         assert_eq!(BuildCategory::from_slug("dungeon"), Some(BuildCategory::Dungeon));
         assert_eq!(BuildCategory::from_slug("шахта"), Some(BuildCategory::Dungeon));
         assert_eq!(BuildCategory::from_slug("estate"), Some(BuildCategory::Estate));
@@ -5040,6 +5171,9 @@ mod tests {
                 description: cat.slug().to_owned(),
                 palette_manual: false,
                 palette: MaterialPalette::preset(0),
+                living_decor: true,
+                spawn_npcs: false,
+                blend_radius: 4,
             };
             let code = crate::persist::encode_share_code(&p);
             let decoded = crate::persist::decode_share_code(&code, None).expect("decode BG2 share code");
@@ -5624,5 +5758,404 @@ mod tests {
         wing_req.height = 16;
         let wing_bp = generate_blueprint(&wing_req, None);
         assert!(wing_bp.non_air_count() > 250);
+    }
+
+    #[test]
+    fn v070_three_new_categories_12_themes_and_88_presets() {
+        use crate::model::{BuildCategory, RoofStyle};
+        use crate::parser::StructureTheme;
+        use crate::server_builder::{CLI_PRESETS, CLI_PRESET_DESCS_EN, find_cli_preset};
+
+        assert_eq!(BuildCategory::ALL.len(), 14);
+        assert_eq!(CLI_PRESETS.len(), 88);
+        assert_eq!(CLI_PRESET_DESCS_EN.len(), 88);
+
+        assert_eq!(BuildCategory::from_slug("engineering"), Some(BuildCategory::Engineering));
+        assert_eq!(BuildCategory::from_slug("инженер"), Some(BuildCategory::Engineering));
+        assert_eq!(BuildCategory::from_slug("agricultural"), Some(BuildCategory::Agricultural));
+        assert_eq!(BuildCategory::from_slug("сельск"), Some(BuildCategory::Agricultural));
+        assert_eq!(BuildCategory::from_slug("decor_art"), Some(BuildCategory::DecorArt));
+        assert_eq!(BuildCategory::from_slug("арт"), Some(BuildCategory::DecorArt));
+
+        let theme_cases = [
+            ("canal navigation lock", "судоходный шлюз канал", StructureTheme::CanalLock, BuildCategory::Engineering),
+            ("railway roundhouse turntable", "веерное депо паровозов", StructureTheme::RailwayRoundhouse, BuildCategory::Engineering),
+            ("gantry drydock slipway", "корабельный сухой док", StructureTheme::GantryDrydock, BuildCategory::Engineering),
+            ("electrical power substation", "трансформаторная подстанция", StructureTheme::PowerSubstation, BuildCategory::Engineering),
+            ("vineyard wine press house", "террасный виноградник", StructureTheme::VineyardPress, BuildCategory::Agricultural),
+            ("grain farmstead with silos", "фермерский элеватор с силосом", StructureTheme::GrainSiloFarm, BuildCategory::Agricultural),
+            ("blossom orchard apiary", "пасека и ульи в саду", StructureTheme::OrchardApiary, BuildCategory::Agricultural),
+            ("royal horse stables", "королевская конюшня", StructureTheme::HorseStables, BuildCategory::Agricultural),
+            ("grand plaza fountain", "городской фонтан на площади", StructureTheme::PlazaFountain, BuildCategory::DecorArt),
+            ("monumental guardian statue", "монументальная статуя стража", StructureTheme::GuardianStatue, BuildCategory::DecorArt),
+            ("topiary hedge maze park", "парковый лабиринт из живой изгороди", StructureTheme::HedgeMazePark, BuildCategory::DecorArt),
+            ("japanese zen garden karesansui", "японский сад камней карэсансуй", StructureTheme::ZenKaresansui, BuildCategory::DecorArt),
+        ];
+
+        for (en, ru, expected_theme, expected_cat) in theme_cases {
+            let s_en = parse_description(expected_cat, BuildStyle::Auto, en, 21, 21, 14, NoiseLevel::Balanced, 70);
+            let s_ru = parse_description(expected_cat, BuildStyle::Auto, ru, 21, 21, 14, NoiseLevel::Balanced, 70);
+            assert_eq!(s_en.theme, expected_theme, "EN '{en}'");
+            assert_eq!(s_ru.theme, expected_theme, "RU '{ru}'");
+            assert_eq!(s_en.roof_style != RoofStyle::Flat || expected_theme == StructureTheme::PowerSubstation, true);
+        }
+
+        // Verify all 12 newly added presets [76..88] build cleanly with rich blocks & living plans.
+        for idx in 76..88 {
+            let (slug, cat, style, w, d, h, desc_ru) = CLI_PRESETS[idx];
+            assert_eq!(find_cli_preset(slug).map(|p| p.0), Some(slug));
+            let mut req = sample_request(desc_ru, 700 + idx as i64);
+            req.category = cat;
+            req.style = style;
+            req.width = w;
+            req.depth = d;
+            req.height = h;
+            req.living_decor = true;
+            req.spawn_npcs = true;
+            req.palette = crate::parser::infer_palette_with_style_and_seed(style, desc_ru, req.seed as u64);
+            let bp = generate_blueprint(&req, None);
+            assert!(
+                bp.non_air_count() >= 180,
+                "v0.7.0 preset '{slug}' generated too few blocks ({})",
+                bp.non_air_count()
+            );
+            assert!(
+                !bp.living.signs.is_empty() || !bp.living.banners.is_empty() || !bp.living.lecterns.is_empty(),
+                "v0.7.0 preset '{slug}' should populate LivingPlan"
+            );
+            for (pos, blk) in &bp.blocks {
+                assert_ne!(blk.block_id, "minecraft:chain", "Removed 26.3 block in '{slug}' at {pos:?}");
+                if blk.block_id.ends_with("_leaves") {
+                    assert!(
+                        blk.props.iter().any(|&(k, v)| k == "persistent" && v == "true"),
+                        "Decaying leaves in '{slug}' at {pos:?}"
+                    );
+                }
+                if blk.block_id.ends_with("_door") && !blk.block_id.ends_with("trapdoor") {
+                    let is_lower = blk.props.iter().any(|&(k, v)| k == "half" && v == "lower");
+                    let mate = [pos[0], if is_lower { pos[1] + 1 } else { pos[1] - 1 }, pos[2]];
+                    assert!(
+                        bp.blocks.get(&mate).is_some_and(|m| m.block_id.ends_with("_door")),
+                        "Incomplete door in '{slug}' at {pos:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v070_living_interiors_redstone_books_banners_npcs_and_bg2_v5() {
+        use crate::gen_common::LivingEntityKind;
+        use crate::persist::{SavedPreset, decode_share_code_lang, encode_share_code};
+
+        // 1. Castle / Tavern / House with Living Decor ON + NPCs ON vs OFF filtering
+        let mut req = sample_request("medieval castle keep with library and courtyard", 7101);
+        req.category = BuildCategory::Castle;
+        req.style = BuildStyle::Medieval;
+        req.width = 21;
+        req.depth = 19;
+        req.height = 18;
+        req.living_decor = true;
+        req.spawn_npcs = false;
+        let bp_decor = generate_blueprint(&req, None);
+        assert!(
+            bp_decor.blocks.values().any(|b| b.block_id.ends_with("_pressure_plate")),
+            "Threshold should place pressure plate"
+        );
+        assert!(
+            bp_decor.blocks.values().any(|b| b.block_id == "minecraft:lever"),
+            "Castle entrance should place gate lever"
+        );
+        assert!(
+            bp_decor.blocks.values().any(|b| b.block_id == "minecraft:daylight_detector"
+                && b.props.iter().any(|&(k, v)| k == "inverted" && v == "true")),
+            "Yard should include inverted daylight sensor lamp"
+        );
+        assert!(!bp_decor.living.banners.is_empty(), "Expected wall banners");
+        assert!(!bp_decor.living.signs.is_empty(), "Expected entrance/interior signs");
+        assert!(!bp_decor.living.lecterns.is_empty(), "Expected readable lectern book");
+        assert!(
+            bp_decor.living.entities.iter().any(|e| e.is_decor),
+            "Expected decor entities (ArmorStand / Painting / ItemFrame)"
+        );
+        assert!(
+            bp_decor.living.entities.iter().all(|e| e.is_decor),
+            "NPCs must NOT spawn when spawn_npcs=false"
+        );
+
+        let mut req_npcs = req.clone();
+        req_npcs.spawn_npcs = true;
+        let bp_npcs = generate_blueprint(&req_npcs, None);
+        assert!(
+            bp_npcs.living.entities.iter().any(|e| matches!(e.kind, LivingEntityKind::Villager | LivingEntityKind::IronGolem)),
+            "spawn_npcs=true should populate Villager/IronGolem"
+        );
+
+        let mut req_off = req.clone();
+        req_off.living_decor = false;
+        req_off.spawn_npcs = false;
+        let bp_off = generate_blueprint(&req_off, None);
+        assert!(bp_off.living.signs.is_empty());
+        assert!(bp_off.living.banners.is_empty());
+        assert!(bp_off.living.entities.is_empty());
+
+        // 2. Dungeon redstone trap + Estate livestock paddock & crops
+        let mut dreq = sample_request("multi-tier gothic dungeon vaults with traps", 7102);
+        dreq.category = BuildCategory::Dungeon;
+        dreq.style = BuildStyle::Gothic;
+        dreq.width = 25;
+        dreq.depth = 25;
+        dreq.height = 18;
+        dreq.living_decor = true;
+        dreq.spawn_npcs = true;
+        let dbp = generate_blueprint(&dreq, None);
+        assert!(dbp.blocks.values().any(|b| b.block_id == "minecraft:dispenser"));
+        assert!(dbp.living.entities.iter().any(|e| matches!(e.kind, LivingEntityKind::Skeleton | LivingEntityKind::Zombie)));
+
+        let mut ereq = sample_request("country manor estate with barn and livestock", 7103);
+        ereq.category = BuildCategory::Estate;
+        ereq.style = BuildStyle::Cottage;
+        ereq.width = 33;
+        ereq.depth = 31;
+        ereq.height = 18;
+        ereq.living_decor = true;
+        ereq.spawn_npcs = true;
+        let ebp = generate_blueprint(&ereq, None);
+        assert!(ebp.living.entities.iter().any(|e| matches!(e.kind, LivingEntityKind::Cow | LivingEntityKind::Sheep | LivingEntityKind::Horse)));
+        assert!(ebp.living.entities.iter().any(|e| e.kind == LivingEntityKind::Villager));
+
+        // 3. BG2 v5 share code roundtrip + backwards decode check
+        let preset = SavedPreset {
+            name: "LivingKeep".into(),
+            width: 21,
+            depth: 19,
+            height: 18,
+            category: BuildCategory::Castle,
+            style: BuildStyle::Medieval,
+            roof_raw: 1,
+            toggles: [1, 1, 1, 0, 1],
+            noise_level: NoiseLevel::Balanced,
+            adapt_terrain: true,
+            air_only: false,
+            wear_pct: 15,
+            overgrowth_pct: 20,
+            description: "castle keep".into(),
+            seed: 4242,
+            palette_manual: false,
+            palette: MaterialPalette::preset(0),
+            living_decor: false,
+            spawn_npcs: true,
+            blend_radius: 7,
+        };
+        let code = encode_share_code(&preset);
+        let decoded = decode_share_code_lang(&code, Some("LivingKeep"), crate::model::UiLang::En)
+            .expect("BG2 v5 roundtrip");
+        assert_eq!(decoded.living_decor, false);
+        assert_eq!(decoded.spawn_npcs, true);
+        assert_eq!(decoded.blend_radius, 7);
+        assert_eq!(decoded.wear_pct, 15);
+        assert_eq!(decoded.overgrowth_pct, 20);
+    }
+
+    #[test]
+    fn v070_radial_terrain_blend_and_biome_surfaces() {
+        use crate::generator::biome_surface_blocks;
+
+        assert_eq!(biome_surface_blocks("minecraft:badlands", BuildStyle::Auto).0, "minecraft:red_sand");
+        assert_eq!(biome_surface_blocks("minecraft:desert", BuildStyle::Auto).0, "minecraft:sand");
+        assert_eq!(biome_surface_blocks("minecraft:snowy_taiga", BuildStyle::Auto).0, "minecraft:snow_block");
+        assert_eq!(biome_surface_blocks("minecraft:taiga", BuildStyle::Auto).0, "minecraft:podzol");
+        assert_eq!(biome_surface_blocks("minecraft:mangrove_swamp", BuildStyle::Auto).1, "minecraft:mud");
+
+        // Steep cliff dropoff (-7) & high hill (+6) with Snowy Taiga biome and wide blend_radius=6
+        let mut req = sample_request("nordic cabin", 7201);
+        req.width = 23;
+        req.depth = 23;
+        req.height = 14;
+        req.style = BuildStyle::Nordic;
+        req.biome_hint = "minecraft:snowy_taiga".into();
+        req.adapt_terrain = true;
+        req.blend_radius = 6;
+
+        let mut offsets = vec![0i32; 23 * 23];
+        for z in 0..23 {
+            for x in 0..23 {
+                offsets[z * 23 + x] = if x >= 18 {
+                    -7
+                } else if z <= 3 {
+                    6
+                } else {
+                    0
+                };
+            }
+        }
+        let bp_wide = generate_blueprint(&req, Some(&offsets));
+        assert!(
+            bp_wide.blocks.iter().any(|(&[x, y, _], b)| x >= 18 && y < 0 && b.block_id == "minecraft:snow_block"),
+            "Snowy Taiga downhill apron should place snow_block ramps down to cliff"
+        );
+        assert!(
+            bp_wide.blocks.iter().any(|(&[_, y, z], b)| z <= 3 && y >= 1 && b.block_id == "minecraft:snow_block"),
+            "Snowy Taiga uphill cut should smoothly terrace snow_block"
+        );
+
+        let mut req_zero = req.clone();
+        req_zero.blend_radius = 0;
+        let bp_none = generate_blueprint(&req_zero, Some(&offsets));
+        let outer_wide_count = bp_wide.blocks.iter().filter(|(pos, b)| pos[0] >= 19 && b.block_id != "minecraft:air").count();
+        let outer_none_count = bp_none.blocks.iter().filter(|(pos, b)| pos[0] >= 19 && b.block_id != "minecraft:air").count();
+        assert!(
+            outer_wide_count > outer_none_count,
+            "blend_radius=6 must generate outer skirt blocks vs blend_radius=0 ({outer_wide_count} vs {outer_none_count})"
+        );
+
+        // Landmark smooth edges test on PlazaFountain
+        let mut lm_req = sample_request("grand plaza fountain", 7202);
+        lm_req.category = BuildCategory::DecorArt;
+        lm_req.width = 23;
+        lm_req.depth = 23;
+        lm_req.height = 14;
+        lm_req.biome_hint = "minecraft:badlands".into();
+        lm_req.blend_radius = 5;
+        let bp_lm = generate_blueprint(&lm_req, Some(&offsets));
+        assert!(
+            bp_lm.blocks.values().any(|b| b.block_id == "minecraft:red_sand" || b.block_id == "minecraft:red_sandstone"),
+            "Landmark edge blend in badlands should integrate red_sand/red_sandstone surfaces"
+        );
+    }
+
+    #[test]
+    fn v070_road_connector_auto_bridge_and_server_undo() {
+        use crate::gen_road::generate_road_connector;
+        use crate::model::RoadConnectRequest;
+        use crate::server_builder::{clear_history_memory_cache, clear_rate_limit_for_test, execute_road_connect};
+
+        let rreq = RoadConnectRequest {
+            dimension: "minecraft:overworld".into(),
+            start_x: 4,
+            start_y: 64,
+            start_z: 14,
+            end_x: 28,
+            end_y: 64,
+            end_z: 14,
+            road_width: 3,
+            auto_bridge: true,
+            style: BuildStyle::Medieval,
+            seed: 7301,
+            air_only: false,
+            blend_radius: 4,
+            living_decor: true,
+            spawn_npcs: true,
+            biome_hint: String::new(),
+            palette: MaterialPalette::preset(0),
+        };
+        let bytes = encode_payload(&rreq, 16_384).expect("encode RoadConnectRequest");
+        let rdec: RoadConnectRequest = decode_payload(&bytes).expect("decode RoadConnectRequest");
+        assert_eq!(rreq, rdec);
+
+        // Simulate river channel (`water_depths=3`) across x=14..=18 & gentle hill slope at x=22..32
+        let bw = 35u16;
+        let bd = 29u16;
+        let mut offsets = vec![0i32; usize::from(bw) * usize::from(bd)];
+        let mut depths = vec![0i32; usize::from(bw) * usize::from(bd)];
+        for z in 0..i32::from(bd) {
+            for x in 0..i32::from(bw) {
+                let idx = (z * i32::from(bw) + x) as usize;
+                if (14..=18).contains(&x) {
+                    offsets[idx] = -1;
+                    depths[idx] = 3;
+                } else if x >= 22 {
+                    offsets[idx] = ((x - 21) / 3).min(3);
+                }
+            }
+        }
+        let road_bp = generate_road_connector(&rreq, &offsets, &depths, [0, 64, 0], bw, bd);
+        assert!(!road_bp.blocks.is_empty());
+        assert!(!road_bp.living.signs.is_empty(), "Road should include waypost signs");
+        assert!(
+            road_bp.blocks.values().any(|b| b.block_id == "minecraft:daylight_detector"),
+            "Road shoulders should include automated daylight streetlamps"
+        );
+        // Check arched bridge over river (`x=16` has solid deck strictly above water `y >= 1` and fence rail)
+        let has_bridge_deck = road_bp
+            .blocks
+            .iter()
+            .any(|(&[x, y, z], b)| x == 16 && z == 14 && y >= 0 && b.block_id != "minecraft:air" && b.block_id != "minecraft:water");
+        assert!(has_bridge_deck, "Road with auto_bridge=true must build elevated bridge deck over water");
+
+        // End-to-end server test: Build with NPCs + Outer Blend -> Undo discards entities & restores all blocks!
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+            clear_history_memory_cache();
+            clear_rate_limit_for_test();
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let mut host = TestWorldHost::new(keys);
+            let hill_grass: BlockState = BlockStateRecord::new(host.id_to_key["minecraft:grass_block"], 0).into();
+            // Add sloped hill beside site [10..23, 20..31] so outer halo blends outside bounds too
+            for x in 23..30 {
+                for z in 18..34 {
+                    for y in 64..=66 {
+                        host.world_blocks.insert([x, y, z], hill_grass);
+                    }
+                }
+            }
+            host.fake.join(77, 100);
+            let player = host.player(77).unwrap();
+
+            let mut breq = sample_request("medieval castle with guards and villagers", 7302);
+            breq.category = BuildCategory::Castle;
+            breq.style = BuildStyle::Medieval;
+            breq.width = 15;
+            breq.depth = 15;
+            breq.height = 16;
+            breq.origin_x = 10;
+            breq.origin_y = 64;
+            breq.origin_z = 18;
+            breq.living_decor = true;
+            breq.spawn_npcs = true;
+            breq.blend_radius = 4;
+
+            let resp = execute_build(&mut host, Some(player), breq);
+            assert!(resp.ok, "Build failed: {}", resp.message);
+            assert!(
+                host.summoned_entities.iter().any(|e| e.4),
+                "Living Interiors + NPCs should summon entities on server"
+            );
+
+            let undo_resp = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(undo_resp.ok, "Undo failed: {}", undo_resp.message);
+            assert!(
+                host.summoned_entities.iter().all(|e| !e.4),
+                "Undo must discard all entities summoned for the undone build"
+            );
+
+            // Road Connect execution & Undo on server
+            clear_rate_limit_for_test();
+            let r_server = RoadConnectRequest {
+                start_x: 5,
+                start_y: 63,
+                start_z: 10,
+                end_x: 20,
+                end_y: 63,
+                end_z: 16,
+                blend_radius: 2,
+                ..rreq.clone()
+            };
+            let road_resp = execute_road_connect(&mut host, Some(player), r_server);
+            assert!(road_resp.ok, "Road build failed: {}", road_resp.message);
+            assert!(road_resp.blocks_changed > 15);
+            let road_undo = execute_undo(&mut host, Some(player), "minecraft:overworld");
+            assert!(road_undo.ok);
+        });
     }
 }

@@ -10,9 +10,11 @@ use crate::gen_exterior::{
     build_bay_windows, build_courtyard_and_landscaping, build_custom_yard_trees,
     build_downspouts_and_signs, build_entrance_and_porch, build_foundation_and_basement,
     build_lantern_cranes, build_market_awning_stall, build_windows_and_balcony,
+    decorate_living_exteriors,
 };
 use crate::gen_interior::{
     build_fireplace_and_chimney, build_interior_zoning, build_staircases,
+    decorate_living_interiors, wood_prefix_for_palette,
 };
 use crate::gen_roof::{
     build_first_floor_mokoshi_skirt, build_roof_and_dormers, build_wing_cross_gable_roof,
@@ -284,7 +286,13 @@ fn build_footprint(
             let b = compute_tight_bounds(grid, &fp);
             return (fp, b);
         }
-        BuildCategory::Bridge | BuildCategory::Settlement | BuildCategory::Dungeon | BuildCategory::Estate => {
+        BuildCategory::Bridge
+        | BuildCategory::Settlement
+        | BuildCategory::Dungeon
+        | BuildCategory::Estate
+        | BuildCategory::Engineering
+        | BuildCategory::Agricultural
+        | BuildCategory::DecorArt => {
             fill_rect(&mut fp, grid, 0, 0, grid.w - 1, grid.d - 1, true);
             return (fp, [0, 0, grid.w - 1, grid.d - 1]);
         }
@@ -1617,7 +1625,122 @@ fn build_arcade_gallery(
     }
 }
 
-/// Smooths jagged hillside cuts and braces slope terraces with masonry retaining walls around the footprint.
+/// Maps biome hints and architectural style to natural `(top, alt_top, sub_fill)` terrain blocks.
+pub(crate) fn biome_surface_blocks(
+    biome_tag: &str,
+    style: BuildStyle,
+) -> (&'static str, &'static str, &'static str) {
+    let b = biome_tag.to_ascii_lowercase();
+    if b.contains("badlands") {
+        ("minecraft:red_sand", "minecraft:red_sandstone", "minecraft:terracotta")
+    } else if b.contains("desert") || (b.is_empty() && style == BuildStyle::Desert) {
+        ("minecraft:sand", "minecraft:sandstone", "minecraft:sandstone")
+    } else if b.contains("swamp") || b.contains("mangrove") {
+        ("minecraft:grass_block", "minecraft:mud", "minecraft:mud")
+    } else if b.contains("snow")
+        || b.contains("ice")
+        || b.contains("frozen")
+        || b.contains("grove")
+        || b.contains("jagged")
+    {
+        ("minecraft:snow_block", "minecraft:grass_block", "minecraft:dirt")
+    } else if b.contains("taiga") {
+        ("minecraft:podzol", "minecraft:grass_block", "minecraft:dirt")
+    } else if b.contains("savanna") {
+        ("minecraft:grass_block", "minecraft:coarse_dirt", "minecraft:dirt")
+    } else if b.contains("mushroom") {
+        ("minecraft:mycelium", "minecraft:moss_block", "minecraft:dirt")
+    } else if b.contains("stony") {
+        ("minecraft:stone", "minecraft:gravel", "minecraft:stone")
+    } else if b.contains("beach") {
+        ("minecraft:sand", "minecraft:sandstone", "minecraft:sand")
+    } else {
+        ("minecraft:grass_block", "minecraft:moss_block", "minecraft:dirt")
+    }
+}
+
+/// Applies radial smoothstep terrain blending for a single local column `[lx, lz]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_radial_terrain_column(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    lx: i32,
+    lz: i32,
+    dist: f64,
+    radius: i32,
+    terr: i32,
+    base_y: i32,
+    height_lim: i32,
+    biome_tag: &str,
+    style: BuildStyle,
+    pal: &MaterialPalette,
+    seed: u64,
+    noise_hash: f64,
+) {
+    if radius <= 0 || dist > f64::from(radius) + 0.35 {
+        return;
+    }
+    let delta = terr - base_y;
+    if (-1..=1).contains(&delta) {
+        return;
+    }
+
+    let t = (dist / f64::from(radius)).clamp(0.0, 1.0);
+    let smooth_w = t * t * (3.0 - 2.0 * t);
+    let jitter = (noise_hash - 0.5) * 0.45 * (1.0 - (2.0 * t - 1.0).abs());
+    let (top_blk, alt_blk, sub_blk) = biome_surface_blocks(biome_tag, style);
+    let chosen_top = if noise_hash > 0.72 { alt_blk } else { top_blk };
+
+    if delta < -1 {
+        let target_top = ((base_y as f64) + (delta as f64) * smooth_w + jitter)
+            .round()
+            .clamp((terr + 1) as f64, (base_y - 1) as f64) as i32;
+        let lo_fill = (terr + 1).max(-16);
+        for y in lo_fill..target_top {
+            if blocks.get(&[lx, y, lz]).is_none_or(|b| b.block_id == "minecraft:air") {
+                let fill_blk = if dist <= 1.55 && delta <= -4 && y >= target_top - 1 {
+                    pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, y, lz)
+                } else {
+                    sub_blk.to_owned()
+                };
+                blocks.insert([lx, y, lz], PlannedBlock::simple(fill_blk));
+            }
+        }
+        if target_top > terr
+            && blocks
+                .get(&[lx, target_top, lz])
+                .is_none_or(|b| b.block_id == "minecraft:air")
+        {
+            blocks.insert([lx, target_top, lz], PlannedBlock::simple(chosen_top));
+        }
+    } else if delta >= 2 {
+        let target_top = ((base_y as f64) + (delta as f64) * smooth_w + jitter)
+            .round()
+            .clamp(base_y as f64, (terr - 1) as f64) as i32;
+        for y in (target_top + 1)..=(terr + 2).min(height_lim) {
+            if blocks
+                .get(&[lx, y, lz])
+                .is_none_or(|b| b.block_id == "minecraft:air")
+            {
+                blocks.insert([lx, y, lz], PlannedBlock::simple("minecraft:air"));
+            }
+        }
+        if target_top < terr
+            && blocks
+                .get(&[lx, target_top, lz])
+                .is_none_or(|b| b.block_id == "minecraft:air")
+        {
+            if target_top > base_y && dist <= 1.55 && delta >= 4 {
+                blocks.insert(
+                    [lx, target_top - 1, lz],
+                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, target_top - 1, lz)),
+                );
+            }
+            blocks.insert([lx, target_top, lz], PlannedBlock::simple(chosen_top));
+        }
+    }
+}
+
+/// Smooths jagged hillside cuts and dropoffs around the footprint using Euclidean radial smoothstep & biome terrain.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blend_surrounding_terrain(
     blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
@@ -1631,10 +1754,13 @@ pub(crate) fn blend_surrounding_terrain(
     terrain_offsets: &[i32],
     water_depths: Option<&[i32]>,
     noise: NoiseField,
+    blend_radius: u8,
 ) {
-    if spec.on_stilts {
+    if spec.on_stilts || blend_radius == 0 {
         return;
     }
+    let radius = i32::from(blend_radius.clamp(1, 10));
+    let height_lim = i32::from(height) + 2;
     for v in 0..grid.d {
         for u in 0..grid.w {
             if is_fp(grid, fp, u, v) || crate::gen_common::water_depth_at(water_depths, grid, u, v) > 0 {
@@ -1643,6 +1769,7 @@ pub(crate) fn blend_surrounding_terrain(
             if let Some((du, dv)) = best_door
                 && (u - du).abs() <= 1
                 && v >= dv
+                && v <= dv + 2
             {
                 continue;
             }
@@ -1650,110 +1777,115 @@ pub(crate) fn blend_surrounding_terrain(
                 continue;
             }
 
-            let mut ring_d = 99;
-            for dv in -3..=3 {
-                for du in -3..=3 {
+            let mut min_d2 = i32::MAX;
+            for dv in -radius..=radius {
+                for du in -radius..=radius {
                     if is_fp(grid, fp, u + du, v + dv) {
-                        ring_d = ring_d.min(du.abs().max(dv.abs()));
+                        min_d2 = min_d2.min(du * du + dv * dv);
                     }
                 }
             }
-            if ring_d > 3 {
+            if min_d2 == i32::MAX {
                 continue;
             }
-
+            let dist = (min_d2 as f64).sqrt();
+            if dist > f64::from(radius) + 0.35 {
+                continue;
+            }
             let terr = terrain_rel_at(Some(terrain_offsets), grid, u, v);
+            let [lx, lz] = grid.to_local_xz(u, v);
             let h = noise.cell_hash(u, 0, v);
-            let jitter = if h > 0.65 { 1 } else { 0 };
-            let is_badlands = spec.biome_tag.contains("badlands");
-            let is_arid = spec.style == BuildStyle::Desert
-                || spec.biome_tag.contains("desert")
-                || is_badlands;
-            let organic_top = if is_arid {
-                if is_badlands && h > 0.55 {
-                    "minecraft:red_sandstone"
-                } else if h > 0.72 {
-                    "minecraft:cut_sandstone"
-                } else {
-                    "minecraft:sandstone"
-                }
-            } else if h > 0.78 {
-                "minecraft:moss_block"
-            } else if h < 0.18 && ring_d >= 2 {
-                "minecraft:coarse_dirt"
-            } else {
-                "minecraft:grass_block"
-            };
-            if terr < -1 {
-                let target_top = (terr + (4 - ring_d) - jitter).min(-1).max(-14);
-                for y in (terr + 1).max(-14)..target_top {
-                    if !is_solid_or_occupied(blocks, grid, u, y, v) {
-                        let fill_blk = if ring_d == 1 && y == target_top - 1 {
-                            pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, y, v)
-                        } else if is_arid {
-                            "minecraft:sandstone".to_owned()
-                        } else {
-                            "minecraft:dirt".to_owned()
-                        };
-                        set_uv(blocks, grid, u, y, v, PlannedBlock::simple(fill_blk));
-                    }
-                }
-                if target_top > terr && !is_solid_or_occupied(blocks, grid, u, target_top, v) {
-                    set_uv(
-                        blocks,
-                        grid,
-                        u,
-                        target_top,
-                        v,
-                        PlannedBlock::simple(organic_top),
-                    );
-                    if ring_d == 1 && (u + v).abs() % 3 == 0 {
-                        set_uv(
-                            blocks,
-                            grid,
-                            u,
-                            target_top + 1,
-                            v,
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, target_top + 1, v)),
-                        );
-                    }
-                }
-            } else if terr >= 2 {
-                let step_top = (ring_d - 1 + jitter).max(0).min(terr);
-                for y in (step_top + 1)..=(terr + 1).min(i32::from(height) - 1) {
-                    set_uv(blocks, grid, u, y, v, PlannedBlock::simple("minecraft:air"));
-                }
-                if step_top < terr {
-                    if step_top >= 1 {
-                        set_uv(
-                            blocks,
-                            grid,
-                            u,
-                            step_top - 1,
-                            v,
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, step_top - 1, v)),
-                        );
-                    }
-                    set_uv(
-                        blocks,
-                        grid,
-                        u,
-                        step_top,
-                        v,
-                        PlannedBlock::simple(organic_top),
-                    );
-                    if ring_d == 2 && (u + v).abs() % 4 == 0 && step_top + 1 < i32::from(height) {
-                        set_uv(
-                            blocks,
-                            grid,
-                            u,
-                            step_top + 1,
-                            v,
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, step_top + 1, v)),
-                        );
+            apply_radial_terrain_column(
+                blocks,
+                lx,
+                lz,
+                dist,
+                radius,
+                terr,
+                0,
+                height_lim,
+                &spec.biome_tag,
+                spec.style,
+                pal,
+                seed,
+                h,
+            );
+        }
+    }
+}
+
+/// Applies radial Euclidean terrain blending around landmarks/monuments that sit inside a bounding box without a courtyard apron.
+pub(crate) fn smooth_landmark_edges(
+    bp: &mut GeneratedBlueprint,
+    req: &BuildRequest,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
+    noise: NoiseField,
+) {
+    if !req.adapt_terrain || bp.spec.on_stilts || req.blend_radius == 0 {
+        return;
+    }
+    let Some(offsets) = terrain_offsets else {
+        return;
+    };
+    let w = i32::from(bp.width);
+    let d = i32::from(bp.depth);
+    let h = i32::from(bp.height);
+    let radius = i32::from(req.blend_radius.clamp(1, 10));
+
+    let mut solid_cols: BTreeMap<(i32, i32), i32> = BTreeMap::new();
+    for (&[lx, ly, lz], blk) in &bp.blocks {
+        if blk.block_id != "minecraft:air" && ly >= -6 && ly <= 6 {
+            solid_cols
+                .entry((lx, lz))
+                .and_modify(|min_y| *min_y = (*min_y).min(ly))
+                .or_insert(ly);
+        }
+    }
+
+    for lz in 0..d {
+        for lx in 0..w {
+            if solid_cols.contains_key(&(lx, lz)) {
+                continue;
+            }
+            let idx = (lz * w + lx) as usize;
+            if water_depths.and_then(|wd| wd.get(idx).copied()).unwrap_or(0) > 0 {
+                continue;
+            }
+            let mut best: Option<(i32, i32)> = None; // (d2, anchor_y)
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if let Some(&anchor_y) = solid_cols.get(&(lx + dx, lz + dz)) {
+                        let d2 = dx * dx + dz * dz;
+                        if best.is_none_or(|(bd2, _)| d2 < bd2) {
+                            best = Some((d2, anchor_y.clamp(-4, 3)));
+                        }
                     }
                 }
             }
+            let Some((d2, anchor_y)) = best else {
+                continue;
+            };
+            let dist = (d2 as f64).sqrt();
+            if dist > f64::from(radius) + 0.35 {
+                continue;
+            }
+            let terr = offsets.get(idx).copied().unwrap_or(0).clamp(-14, 14);
+            apply_radial_terrain_column(
+                &mut bp.blocks,
+                lx,
+                lz,
+                dist,
+                radius,
+                terr,
+                anchor_y,
+                h + 2,
+                &bp.spec.biome_tag,
+                bp.spec.style,
+                &req.palette,
+                req.seed as u64,
+                noise.cell_hash(lx, 0, lz),
+            );
         }
     }
 }
@@ -1808,7 +1940,15 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
                 | "minecraft:wheat"
                 | "minecraft:azalea"
                 | "minecraft:flowering_azalea"
+                | "minecraft:lever"
+                | "minecraft:tripwire_hook"
+                | "minecraft:daylight_detector"
         ) && !id.ends_with("_carpet")
+            && !id.ends_with("_banner")
+            && !id.ends_with("_wall_banner")
+            && !id.ends_with("_sign")
+            && !id.ends_with("_wall_sign")
+            && !id.ends_with("_pressure_plate")
             && !id.starts_with("minecraft:potted_")
     }
 
@@ -1838,9 +1978,12 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
                 continue;
             }
 
-            if matches!(id, "minecraft:wall_torch" | "minecraft:soul_wall_torch")
+            if matches!(id, "minecraft:wall_torch" | "minecraft:soul_wall_torch" | "minecraft:tripwire_hook")
                 || id.ends_with("_shelf")
+                || id.ends_with("_wall_banner")
+                || id.ends_with("_wall_sign")
                 || id == "minecraft:ladder"
+                || (id == "minecraft:lever" && prop(b, "face") == Some("wall"))
             {
                 let d = dir_offset(prop(b, "facing").unwrap_or("north"));
                 let attach = [x - d[0], y, z - d[2]];
@@ -1923,11 +2066,17 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
                         | "minecraft:beacon"
                         | "minecraft:chest"
                         | "minecraft:barrel"
+                        | "minecraft:daylight_detector"
                 ) || id.starts_with("minecraft:potted_")
                     || id.ends_with("_carpet")
                     || id.ends_with("_pressure_plate")
                     || id.ends_with("_bed")
                     || id.ends_with("_fence_gate")
+                    || (!id.ends_with("_wall_banner") && id.ends_with("_banner"))
+                    || (!id.ends_with("_wall_sign")
+                        && !id.ends_with("_hanging_sign")
+                        && id.ends_with("_sign"))
+                    || (id == "minecraft:lever" && prop(b, "face") == Some("floor"))
                     || (id == "minecraft:grindstone" && prop(b, "face") == Some("floor"))
                     || (is_lantern(id) && prop(b, "hanging") != Some("true"))
                     || (id.ends_with("_door") && prop(b, "half") == Some("lower"));
@@ -2304,6 +2453,7 @@ fn generate_colosseum(
             offsets,
             None,
             noise,
+            req.blend_radius,
         );
     }
     prune_unsupported_floating_blocks(&mut blocks);
@@ -2317,6 +2467,7 @@ fn generate_colosseum(
         height,
         blocks,
         door_pos,
+        living: crate::gen_common::LivingPlan::default(),
     }
 }
 
@@ -2339,7 +2490,7 @@ pub fn generate_blueprint_with_water(
     let height = req.height.clamp(5, 48);
     let grid = LocalGrid::new(width, depth, req.facing);
 
-    let spec = crate::parser::parse_description_with_biome(
+    let mut spec = crate::parser::parse_description_with_biome(
         req.category,
         req.style,
         &req.description,
@@ -2350,9 +2501,14 @@ pub fn generate_blueprint_with_water(
         req.seed as u64,
         &req.biome_hint,
     );
+    spec.living_decor &= req.living_decor;
+    spec.spawn_npcs |= req.spawn_npcs;
+    spec.blend_radius = if req.adapt_terrain { req.blend_radius.min(10) } else { 0 };
     let noise = NoiseField::new(req.seed as u64);
 
+    let is_landmark_or_colosseum;
     let mut bp = if spec.category == BuildCategory::Dungeon {
+        is_landmark_or_colosseum = false;
         crate::gen_dungeon_estate::generate_dungeon_complex(
             req,
             spec,
@@ -2362,6 +2518,7 @@ pub fn generate_blueprint_with_water(
             terrain_offsets,
         )
     } else if spec.category == BuildCategory::Estate {
+        is_landmark_or_colosseum = false;
         crate::gen_dungeon_estate::generate_estate_compound(
             req,
             spec,
@@ -2370,6 +2527,7 @@ pub fn generate_blueprint_with_water(
             water_depths,
         )
     } else if spec.theme == StructureTheme::Colosseum {
+        is_landmark_or_colosseum = true;
         generate_colosseum(req, spec, grid, height, noise, terrain_offsets)
     } else if let Some(landmark) = crate::gen_landmarks::try_generate_landmark(
         req,
@@ -2379,10 +2537,13 @@ pub fn generate_blueprint_with_water(
         noise,
         terrain_offsets,
     ) {
+        is_landmark_or_colosseum = true;
         landmark
     } else if spec.category == BuildCategory::Bridge {
+        is_landmark_or_colosseum = false;
         crate::gen_bridge::generate_bridge(req, spec, grid, height, noise, terrain_offsets)
     } else if spec.category == BuildCategory::Settlement {
+        is_landmark_or_colosseum = false;
         crate::gen_settlement::generate_settlement(
             req,
             spec,
@@ -2391,8 +2552,13 @@ pub fn generate_blueprint_with_water(
             water_depths,
         )
     } else {
+        is_landmark_or_colosseum = false;
         generate_standard_structure(req, spec, grid, height, noise, terrain_offsets, water_depths)
     };
+
+    if is_landmark_or_colosseum {
+        smooth_landmark_edges(&mut bp, req, terrain_offsets, water_depths, noise);
+    }
 
     if crate::gen_weathering::apply_weathering_and_overgrowth(&mut bp, req, noise) {
         prune_unsupported_floating_blocks(&mut bp.blocks);
@@ -2676,6 +2842,9 @@ fn generate_standard_structure(
         pal,
         seed,
         noise,
+        req.adapt_terrain,
+        terrain_offsets,
+        water_depths,
     );
 
     // 11a. Cantilevered upper lantern cranes, custom yard trees & downspouts/signs.
@@ -2709,7 +2878,7 @@ fn generate_standard_structure(
         build_custom_yard_trees(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed, height);
     }
 
-    // 11b. Smooth perimeter hillside terraces & retaining walls outside footprint.
+    // 11b. Smooth perimeter hillside terraces & radial biome blending outside footprint.
     if req.adapt_terrain
         && let Some(offsets) = terrain_offsets
     {
@@ -2725,6 +2894,7 @@ fn generate_standard_structure(
             offsets,
             water_depths,
             noise,
+            req.blend_radius,
         );
     }
 
@@ -2798,11 +2968,55 @@ fn generate_standard_structure(
     // Enforce complete 2-high doors, solid supports, solid lintels, and non-window jambs.
     enforce_door_invariants(&mut blocks, &pal, seed, &spec);
 
+    // 11d. Living Interiors 2.0 (banners, lecterns, signs, paintings, armor stands, item frames, redstone & optional NPCs).
+    let mut living = decorate_living_interiors(
+        &mut blocks,
+        grid,
+        &fp,
+        bounds,
+        best_door,
+        &stairwell_uv,
+        &spec,
+        pal,
+        seed,
+    );
+    let ext_living = decorate_living_exteriors(
+        &mut blocks,
+        grid,
+        &fp,
+        best_door,
+        &spec,
+        pal,
+        seed,
+        req.adapt_terrain,
+        terrain_offsets,
+        water_depths,
+    );
+    living.merge_offset(ext_living, 0, 0, 0);
+    living.apply_filters(spec.living_decor, spec.spawn_npcs);
+    if spec.living_decor {
+        living.materialize_signs_and_banners(&mut blocks, wood_prefix_for_palette(pal));
+    }
+
     // 12. Structural Anti-Floating Sanitizer Pass.
     prune_unsupported_floating_blocks(&mut blocks);
 
     // 13. Connect glass panes, fences, stone walls, iron bars & miter stair corners cleanly.
     resolve_connections_and_shapes(&mut blocks);
+
+    living
+        .lecterns
+        .retain(|l| blocks.get(&l.pos).is_some_and(|b| b.block_id == "minecraft:lectern"));
+    living.banners.retain(|b| {
+        blocks
+            .get(&b.pos)
+            .is_some_and(|blk| blk.block_id.ends_with("_banner"))
+    });
+    living.signs.retain(|s| {
+        blocks
+            .get(&s.pos)
+            .is_some_and(|blk| blk.block_id.ends_with("_sign"))
+    });
 
     GeneratedBlueprint {
         spec,
@@ -2812,6 +3026,7 @@ fn generate_standard_structure(
         height,
         blocks,
         door_pos,
+        living,
     }
 }
 

@@ -2,7 +2,7 @@
 
 **Building Generator** (`building_generator`) is an MIT-licensed bilingual (**English / Russian**) procedural architecture native mod for **Horizon** (Minecraft: Java Edition `26.3`, Horizon Native Mod API `0.2`).
 
-Generate detailed multi-room buildings, monuments, bridges, airship docks, castles, temples, **Multi-Level Dungeons & Mineshafts**, **Estate & Farm Compounds**, and **Settlement 2.0** multi-district cities from English or Russian text prompts, world biomes, noise seeds, or the 76-structure catalog — complete with an interactive `F8` GUI featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), **live translucent bluish 3D hologram preview in the world before placement**, **Biome Auto-Style**, **0–100% Wear/Ruin & Overgrowth**, **Material Estimate (BOM)**, **Air Only** placement filter, 30-slot block lists, two-phase construction, **world-saved persistent 5-step Undo/Redo**, and **server OP security**.
+Generate detailed multi-room buildings, monuments, bridges, airship docks, castles, temples, **Multi-Level Dungeons & Mineshafts**, **Estate & Farm Compounds**, and **Settlement 2.0** multi-district cities from English or Russian text prompts, world biomes, noise seeds, **Living Interiors 2.0**, **Smooth Radial Terrain Blending**, **2-Point Road & Auto-Bridge Connector**, or the 88-structure catalog — complete with an interactive `F8` GUI featuring one-click **EN / RU** language switching (`Lang: EN` / `Язык: RU`), **live translucent bluish 3D hologram preview in the world before placement**, **Biome Auto-Style**, **0–100% Wear/Ruin & Overgrowth**, **Material Estimate (BOM)**, **Air Only** placement filter, 30-slot block lists, two-phase construction, **world-saved persistent 5-step Undo/Redo**, and **server OP security**.
 
 ---
 
@@ -12,7 +12,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
   - Starts in **English** by default; click the **`Lang: EN` / `Язык: RU`** button in the top header bar (or run `/buildgen lang <en|ru>`) at any time to switch the entire GUI, catalog, material slots, BOM estimate, HUD overlays, BossBar progress, and chat feedback between English and Russian.
   - Selected language persists locally in `.horizon-mod-data/building_generator/lang.txt`.
   - Prompt parser, Preset Catalog search, and Material Block search accept both English and Russian queries simultaneously.
-- **61 Architectural Themes & 76 Built-in Presets (across 11 Categories):**
+- **73 Architectural Themes & 88 Built-in Presets (across 14 Categories):**
   - **Multi-Level Subterranean Dungeons & Mineshafts (`Dungeon`, `dungeon` / `mine` presets):** Carves 1–3 branching underground vaults (`y = -18..surface`) connected by walkable switchback stairs (`>= 3`-block headroom), surface ruined/crypt gatehouse entrances, corner armories/libraries/alchemy vaults with chests & barrels, Dwarven lava foundry sanctums, or abandoned timbered mineshafts with minecart rails and ore veins.
   - **Rural Estate & Farm Compounds (`Estate`, `estate` / `vineyard_estate` presets):** Fenced countryside manor homesteads combining a procedural Manor House, Timber Barn, optional Windmill (`>= 34×34`), irrigated crop fields (`farmland` + water channels + crops + scarecrow), fenced livestock paddock (`water_cauldron` + shelter), orchard trees, and lantern-lit crossroads.
   - **Houses, Taverns & Civic:** tea houses, medieval taverns, French mansards, modern villas, treehouses, libraries, apothecaries, bakeries/wineries, town halls, opera houses, museums, marble banks/vaults, magical academies.
@@ -20,18 +20,22 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
   - **Fortresses, Castles & Guilds:** Gothic citadels, Concentric Motte & Bailey castles, fortified Barbican city gates, monasteries & cloisters, jousting arenas, military outposts, Vauban star forts, Japanese Tenshu castles, Big Ben clock towers, steampunk observatories, lighthouses, windmills, watermills.
   - **Bridges, Transport & Maritime (`gen_bridge`, `gen_civic_transport`):** 9 varied bridge archetypes across seeds (single arch, multi-arch viaduct, Gothic ribbed, Roman aqueduct, cable-stayed suspension, covered timber, Japanese Taiko moon bridge, fortified gate bridge, pontoon pier), 3-masted galleons, harbor shipyards, Victorian train stations with steam locomotives, airship docks with zeppelins, hydroelectric dams, circus big tops.
   - **Industrial, Modern & Fantasy:** glass curtain skyscrapers, saw-tooth steampunk factories, football stadiums, reinforced bunkers, rocket launchpads, offshore oil rigs, archmage towers, Hobbit holes, mushroom cottages, underground catacombs & mausoleums, dwarven halls, dragon bone sanctuaries, Stonehenge rune portals, Viking longhouses, alpine chalets, Moroccan kasbahs.
+  - **Engineering & Transport (`Engineering`):** canal locks (`canal_lock`), railway roundhouses with turntables (`roundhouse`), gantry ship drydocks (`drydock`), and electrical power substations (`substation`).
+  - **Agricultural (`Agricultural`):** terracotta hillside vineyards & wine presses (`vineyard`), grain farmsteads with silos (`grain_silo`), blossom orchard apiaries (`apiary`), and royal horse stables (`stables`).
+  - **Decor & Art (`DecorArt`):** grand plaza fountains (`fountain`), monumental guardian statues (`statue`), topiary hedge maze parks (`hedge_maze`), and Zen dry rock gardens (`zen_garden`).
   - **Procedural Settlements 2.0 (`gen_settlement`):** Up to `96×96×48`, smooth road slope grading, secondary ring avenues up to **8–12 town districts**, automatic **bridges over natural rivers**, fortified perimeter ramparts with **corner bastion towers & arched gatehouses**, pocket parks with biome-matched trees & lakeside piers, plus the Venetian **Floating Village** (`FloatingVillage`).
 - **Biome Auto-Style & Universal Wear / Overgrowth (`F8` Tab 2):**
   - **Biome Auto-Adaptation (`Biome: ... ✓` / `Биом: ... ✓`):** Automatically reads world biome on server & live GUI (`cherry_grove`, `desert`, `badlands`, `snowy_taiga`, `pale_garden`, `mangrove_swamp`, `bamboo_jungle`, `mushroom_fields`, `nether`, `the_end`, etc.) when Style is `Auto`, choosing cohesive styles, materials, and trees.
-  - **Wear / Ruin (`0–100%`) & Overgrowth (`0–100%`):** Applies masonry cracking, copper oxidation stages, shattered panes, structural skyline collapse, fallen rubble, cobwebs, biome flora/moss carpets, clinging leaves, and hanging directional vines across all 61 themes, landmarks, bridges, and cities (`BG2:...` share codes & `favorites.txt` compatible).
+  - **Wear / Ruin (`0–100%`) & Overgrowth (`0–100%`):** Applies masonry cracking, copper oxidation stages, shattered panes, structural skyline collapse, fallen rubble, cobwebs, biome flora/moss carpets, clinging leaves, and hanging directional vines across all 73 themes, landmarks, bridges, and cities (`BG2:...` share codes & `favorites.txt` compatible).
 - **Interactive In-Game UI (`F8`):**
   - **Header Material Estimate (`Blocks: N` / `Смета: N`):** live block-count & stack breakdown (`xN (st+rem)`) across all required block types (with doors/beds counted per 2-block item) and one-click **Copy List** to clipboard.
   - **1. Size & Area:** up to `96×96×48`, `-Y`/`+Y` nudging, in-world click/two-corner selection (`R` rotate facing, `PgUp`/`PgDn` height), terrain adaptation, **Air Only** toggle (replaces air blocks only — and accurately hides occluded blocks in the 3D hologram), persistent disk favorites (`favorites.txt`), `BG2:...` share codes (preserving `air_only`, `wear_pct`, and `overgrowth_pct`), plus a real-time **semi-transparent bluish 3D architectural hologram** featuring:
     - **Independent Blue Frame & Post-Build Inspection (`Frame: ON/OFF`, `Hide@Build`, `[H]` / `[Shift+H]`):** hide only the outer blue wireframe box or toggle all overlays with one keypress (`H` in-world) to admire finished builds unobstructed.
     - **Live Collision Highlighting (`Colls: ON/OFF`):** inspects existing world blocks around the target site and highlights intersecting obstacles in translucent warm amber-coral.
     - **Free In-World `Move 3D` Mode:** nudge hologram `X/Z` (`Arrows`/`IJKL`, `+Shift` for `4` blocks), adjust height `Y` (`PgUp`/`PgDn`), rotate (`R`), slice (`[`/`]`), toggle collisions (`C`), snap with a click, and press `Enter` to build directly without reopening `F8`.
-  - **2. Style & Noise + 76-Preset Catalog:** category/style/roof overrides, **Biome Auto**, **Wear %**, **Moss %**, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
+  - **2. Style & Noise + 88-Preset Catalog:** category/style/roof overrides, **Biome Auto**, **Wear %**, **Moss %**, 5 tri-state toggles (porch, balcony, cellar, awning, garden), seed history, quick navigation (`◀` / `▶`), and a full-panel searchable **Preset Catalog** browser (`preset_picker_open`).
   - **3. Materials (30 Architectural Slots):** scrollable slot inspector, per-slot ordered block lists (`Patches` / `Scatter` / `Stripes` / `Checker` mix modes), and a dedicated searchable block picker with item icons (`Rec.` / `All` world blocks).
+  - **4. World & Decor (Living 2.0, Radial Blend & 2-Point Road Connector):** toggle Living Interiors/Exteriors, optional NPC & livestock spawning, adjust Euclidean **Radial Terrain Blend (`0..=10`)**, and launch the interactive **2-Point Road & Auto-Bridge Connector** (`Pick Start` -> `Pick End`, live 3D bluish corridor preview, width `2..7`, automated arched bridges over water).
 - **Living Interiors, Curated Container Supplies & Smart World Integration:**
   - Automatically populates placed `chest`, `barrel`, `smoker`, `furnace`, `blast_furnace`, and `brewing_stand` block entities with themed item stacks & stylized bilingual container names tailored to the structure's category/theme and seed.
   - Multi-arm hanging chandeliers in tall halls (`floor_height >= 5`), wizard/alchemy workstations (`MageTower` / `Apothecary`), automatic hillside entrance stairs when ground sits above doorway steps, flat threshold stone aprons, and stepped settlement walkways connecting entrances directly to roads.
@@ -48,11 +52,13 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
 |---|---|
 | `/buildgen` | Open the interactive mod menu (or press `F8`) |
 | `/buildgen lang <en\|ru>` | Switch GUI & chat feedback language between English (`en`) and Russian (`ru`) |
-| `/buildgen preset <name>` | Instantly build any of the 76 presets (OP 2+, supports Tab completion and EN/RU search) |
+| `/buildgen preset <name>` | Instantly build any of the 88 presets (OP 2+, supports Tab completion and EN/RU search) |
 | `/buildgen generate <text>` | Generate a building from an EN/RU description in front of you (OP 2+) |
 | `/buildgen size <w> <d> <h> <text>` | Generate with explicit bounding dimensions (`7..96 × 7..96 × 5..48`, OP 2+) |
+| `/buildgen road <x1> <z1> <x2> <z2> [width]` | Build a terrain-smoothed 2-point road with automatic arched bridges over water (OP 2+) |
+| `/buildgen connect` | Connect the player's current position to the last build origin with a road (OP 2+) |
 | `/buildgen reroll` | Undo the last build and regenerate at the same spot with a fresh seed (OP 2+) |
-| `/buildgen undo` | Revert your last build (up to 5 stored in history, OP 2+) |
+| `/buildgen undo` | Revert your last build & despawn its summoned entities (up to 5 stored in history, OP 2+) |
 | `/buildgen redo` | Re-apply the last undone build edit (up to 5 steps, OP 2+) |
 | `/buildgen help` | Show concise command and keybind help |
 
@@ -61,7 +67,7 @@ Generate detailed multi-room buildings, monuments, bridges, airship docks, castl
 ## Installation
 
 ### From Release (`.hmod`)
-1. Download `building_generator-0.6.1.hmod` from the release artifacts.
+1. Download `building_generator-0.7.0.hmod` from the release artifacts.
 2. Place it in your Horizon instance's `horizon-mods/` (or `horizon-native-mods/`) folder, or add it via the Horizon Launcher Native Mods tab.
 3. Rebuild the instance with native code trusted (`--trust-native-code`) in Horizon Launcher.
 

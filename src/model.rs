@@ -3,7 +3,7 @@ use mod_api::PayloadCodec;
 /// Mod version string, falling back when Horizon's prebuilt-api rustc compiles without Cargo env vars.
 pub const MOD_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(ver) => ver,
-    None => "0.6.1",
+    None => "0.7.0",
 };
 
 /// UI and chat feedback language supported by the mod (`En` default, switchable to `Ru`).
@@ -59,10 +59,13 @@ pub enum BuildCategory {
     Settlement,
     Dungeon,
     Estate,
+    Engineering,
+    Agricultural,
+    DecorArt,
 }
 
 impl BuildCategory {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 14] = [
         Self::House,
         Self::Tower,
         Self::Barn,
@@ -74,6 +77,9 @@ impl BuildCategory {
         Self::Settlement,
         Self::Dungeon,
         Self::Estate,
+        Self::Engineering,
+        Self::Agricultural,
+        Self::DecorArt,
     ];
 
     pub fn label(self, lang: UiLang) -> &'static str {
@@ -90,6 +96,9 @@ impl BuildCategory {
                 Self::Settlement => "District",
                 Self::Dungeon => "Dungeon",
                 Self::Estate => "Estate",
+                Self::Engineering => "Eng & Transp",
+                Self::Agricultural => "Agricultural",
+                Self::DecorArt => "Decor & Art",
             },
             UiLang::Ru => self.label_ru(),
         }
@@ -108,6 +117,9 @@ impl BuildCategory {
             Self::Settlement => "Квартал",
             Self::Dungeon => "Данж",
             Self::Estate => "Усадьба",
+            Self::Engineering => "Инж. и Трансп.",
+            Self::Agricultural => "Сельхоз",
+            Self::DecorArt => "Декор и Арт",
         }
     }
 
@@ -124,6 +136,9 @@ impl BuildCategory {
             Self::Settlement => "settlement",
             Self::Dungeon => "dungeon",
             Self::Estate => "estate",
+            Self::Engineering => "engineering",
+            Self::Agricultural => "agricultural",
+            Self::DecorArt => "decor",
         }
     }
 
@@ -146,6 +161,16 @@ impl BuildCategory {
             "estate" | "homestead" | "farmstead" | "усадьба" | "поместье" => {
                 Some(Self::Estate)
             }
+            "engineering" | "transport" | "industrial" | "railway" | "factory" | "инж"
+            | "инженер" | "инженерная" | "транспорт" | "промышленность" => Some(Self::Engineering),
+            "agricultural" | "agriculture" | "farm" | "agro" | "сельхоз" | "сельск"
+            | "сельскохозяйственная" | "ферма" | "агро" => {
+                Some(Self::Agricultural)
+            }
+            "decor" | "decor_art" | "decor-art" | "art" | "sculpture" | "statue" | "fountain"
+            | "декор" | "декор_арт" | "арт" | "арт_декор" | "памятник" | "скульптура" => {
+                Some(Self::DecorArt)
+            }
             _ => None,
         }
     }
@@ -162,7 +187,10 @@ impl BuildCategory {
             Self::Bridge => Self::Settlement,
             Self::Settlement => Self::Dungeon,
             Self::Dungeon => Self::Estate,
-            Self::Estate => Self::House,
+            Self::Estate => Self::Engineering,
+            Self::Engineering => Self::Agricultural,
+            Self::Agricultural => Self::DecorArt,
+            Self::DecorArt => Self::House,
         }
     }
 
@@ -179,6 +207,9 @@ impl BuildCategory {
             Self::Settlement => 8,
             Self::Dungeon => 9,
             Self::Estate => 10,
+            Self::Engineering => 11,
+            Self::Agricultural => 12,
+            Self::DecorArt => 13,
         }
     }
 
@@ -2330,6 +2361,31 @@ pub struct BuildRequest {
     pub air_only: bool,
     pub wear_pct: u8,
     pub overgrowth_pct: u8,
+    pub biome_hint: String,
+    pub palette: MaterialPalette,
+    pub living_decor: bool,
+    pub spawn_npcs: bool,
+    pub blend_radius: u8,
+}
+
+/// Client-to-server 2-point road & auto-bridge connector request.
+#[derive(Clone, Debug, PartialEq, Eq, PayloadCodec)]
+pub struct RoadConnectRequest {
+    pub dimension: String,
+    pub start_x: i32,
+    pub start_y: i32,
+    pub start_z: i32,
+    pub end_x: i32,
+    pub end_y: i32,
+    pub end_z: i32,
+    pub road_width: u8,
+    pub auto_bridge: bool,
+    pub style: BuildStyle,
+    pub seed: i64,
+    pub air_only: bool,
+    pub blend_radius: u8,
+    pub living_decor: bool,
+    pub spawn_npcs: bool,
     pub biome_hint: String,
     pub palette: MaterialPalette,
 }

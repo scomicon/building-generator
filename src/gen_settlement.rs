@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::gen_common::{
-    GeneratedBlueprint, PlannedBlock, make_leaves, make_slab, make_stair,
+    GeneratedBlueprint, LecternBookKind, LivingEntityKind, LivingPlan, PlannedBanner, PlannedBlock,
+    PlannedEntity, PlannedLectern, PlannedSign, SignPurpose, make_leaves, make_slab, make_stair,
     prune_map_unsupported, resolve_connections_and_shapes,
 };
 use crate::model::{BuildCategory, BuildRequest, BuildStyle, CardinalFacing, MaterialPalette};
@@ -268,6 +269,7 @@ pub fn generate_settlement(
     let seed = req.seed as u64;
     let mut rng = SplitMix64::new(seed ^ 0x5E77_1E00_9911_2233);
     let mut blocks: BTreeMap<[i32; 3], PlannedBlock> = BTreeMap::new();
+    let mut living = LivingPlan::default();
 
     let cx = w / 2;
     let cz = d / 2;
@@ -637,6 +639,9 @@ pub fn generate_settlement(
             overgrowth_pct: 0,
             biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
+            living_decor: req.living_decor,
+            spawn_npcs: false,
+            blend_radius: 0,
         };
         let bbp = crate::generator::generate_blueprint_with_water(
             &bridge_req,
@@ -715,6 +720,9 @@ pub fn generate_settlement(
             overgrowth_pct: 0,
             biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
+            living_decor: req.living_decor,
+            spawn_npcs: false,
+            blend_radius: 0,
         };
         let bridge_bp = crate::generator::generate_blueprint_with_water(&bridge_req, None, None);
         let bx0 = cx - i32::from(bw) / 2;
@@ -756,6 +764,9 @@ pub fn generate_settlement(
             overgrowth_pct: 0,
             biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
+            living_decor: req.living_decor,
+            spawn_npcs: false,
+            blend_radius: 0,
         };
         let mon_bp = crate::generator::generate_blueprint_with_water(&mon_req, None, None);
         let mx0 = cx - 4;
@@ -1006,6 +1017,9 @@ pub fn generate_settlement(
             overgrowth_pct: 0,
             biome_hint: req.biome_hint.clone(),
             palette: pal.clone(),
+            living_decor: req.living_decor,
+            spawn_npcs: false,
+            blend_radius: 0,
         };
         let sub_bp = crate::generator::generate_blueprint_with_water(
             &sub_req,
@@ -1024,6 +1038,12 @@ pub fn generate_settlement(
                 blocks.insert([wx, wy, wz], blk);
             }
         }
+        let mut lot_living = sub_bp.living;
+        lot_living.signs.retain(|s| (0..w).contains(&(lot.x0 + s.pos[0])) && (0..d).contains(&(lot.z0 + s.pos[2])));
+        lot_living.banners.retain(|b| (0..w).contains(&(lot.x0 + b.pos[0])) && (0..d).contains(&(lot.z0 + b.pos[2])));
+        lot_living.lecterns.retain(|l| (0..w).contains(&(lot.x0 + l.pos[0])) && (0..d).contains(&(lot.z0 + l.pos[2])));
+        lot_living.entities.retain(|e| (0..w).contains(&(lot.x0 + e.pos[0])) && (0..d).contains(&(lot.z0 + e.pos[2])));
+        living.merge_offset(lot_living, lot.x0, lot_base_y, lot.z0);
 
         // Link building entrance smoothly to nearest street along facing axis (including gentle terrain steps).
         if let Some([dlx, dl_y, dlz]) = sub_bp.door_pos {
@@ -1111,6 +1131,48 @@ pub fn generate_settlement(
                 px += sx_step;
                 pz += sz_step;
                 steps += 1;
+            }
+            // L-bend perpendicular fallback if straight walk did not reach an avenue.
+            if (1..(w - 1)).contains(&px)
+                && (1..(d - 1)).contains(&pz)
+                && !is_road[(pz * w + px) as usize]
+            {
+                let (bx_step, bz_step) = if sx_step == 0 {
+                    (if px < cx { 1 } else { -1 }, 0)
+                } else {
+                    (0, if pz < cz { 1 } else { -1 })
+                };
+                for _ in 0..8 {
+                    if !(1..(w - 1)).contains(&px)
+                        || !(1..(d - 1)).contains(&pz)
+                        || is_road[(pz * w + px) as usize]
+                    {
+                        break;
+                    }
+                    let local_surf = if req.adapt_terrain {
+                        terrain_at_wxz(terrain_offsets, w, px, pz).clamp(-12, 12)
+                    } else {
+                        0
+                    };
+                    let sy = if local_surf > prev_y {
+                        prev_y + 1
+                    } else if local_surf < prev_y {
+                        prev_y - 1
+                    } else {
+                        local_surf
+                    };
+                    if blocks.get(&[px, sy + 1, pz]).is_none_or(|b| b.block_id == "minecraft:air") {
+                        blocks.insert(
+                            [px, sy, pz],
+                            pave_block_for_style(spec.style, pal, seed, px, sy, pz, rng.next_f64(), false),
+                        );
+                        blocks.insert([px, sy + 1, pz], PlannedBlock::simple("minecraft:air"));
+                        blocks.insert([px, sy + 2, pz], PlannedBlock::simple("minecraft:air"));
+                    }
+                    prev_y = sy;
+                    px += bx_step;
+                    pz += bz_step;
+                }
             }
         }
     }
@@ -1253,7 +1315,12 @@ pub fn generate_settlement(
             blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 1, lz)));
             blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lx, base_y + 2, lz)));
             blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lx, base_y + 3, lz)));
-            blocks.insert([lx, base_y + 4, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 4, lz)));
+            if spec.living_decor && !is_floating {
+                blocks.insert([lx, base_y + 4, lz], PlannedBlock::with_props("minecraft:redstone_lamp", vec![("lit", "false")]));
+                blocks.insert([lx, base_y + 5, lz], PlannedBlock::with_props("minecraft:daylight_detector", vec![("inverted", "true"), ("power", "0")]));
+            } else {
+                blocks.insert([lx, base_y + 4, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, lx, base_y + 4, lz)));
+            }
         }
     }
 
@@ -1436,6 +1503,101 @@ pub fn generate_settlement(
         }
     }
 
+    if spec.living_decor {
+        let wood = crate::gen_interior::wood_prefix_for_palette(pal);
+        let lx = cx - 1;
+        let lz = (cz + plaza_r - 1).min(d - 2);
+        if (1..(w - 1)).contains(&lx)
+            && blocks.get(&[lx, plaza_y + 1, lz]).is_none_or(|b| b.block_id == "minecraft:air")
+        {
+            blocks.insert([lx, plaza_y + 1, lz], PlannedBlock::with_props("minecraft:lectern", vec![("facing", "north"), ("has_book", "true")]));
+            living.lecterns.push(PlannedLectern { pos: [lx, plaza_y + 1, lz], book: LecternBookKind::TownCharter });
+        }
+        let sx = (cx + 1).min(w - 2);
+        let sz = (cz + plaza_r).min(d - 2);
+        if blocks.get(&[sx, plaza_y + 1, sz]).is_none_or(|b| b.block_id == "minecraft:air") {
+            blocks.insert([sx, plaza_y + 1, sz], PlannedBlock::with_props(format!("minecraft:{wood}_sign"), vec![("rotation", "0"), ("waterlogged", "false")]));
+            living.signs.push(PlannedSign { pos: [sx, plaza_y + 1, sz], purpose: SignPurpose::Waypost, custom_en: None, custom_ru: None });
+        }
+        if !is_floating && w >= 25 && d >= 25 {
+            let (b_style, pri, acc) = crate::gen_interior::banner_theme_for_spec(&spec);
+            for side in [-road_half - 2, road_half + 2] {
+                let bx = cx + side;
+                if (1..(w - 1)).contains(&bx) {
+                    let by = terrain_at_wxz(terrain_offsets, w, bx, d - 1).clamp(-12, 12);
+                    if blocks.get(&[bx, by + 3, d - 1]).is_none_or(|b| b.block_id == "minecraft:air") {
+                        living.banners.push(PlannedBanner { pos: [bx, by + 3, d - 1], style: b_style, primary_color: pri, accent_color: acc });
+                    }
+                }
+            }
+        }
+    }
+
+    if spec.spawn_npcs {
+        let npc_profs = ["librarian", "weaponsmith", "farmer", "cleric", "mason"];
+        let mut spawned = 0usize;
+        let candidate_offsets = [
+            (cx - 2, cz + plaza_r),
+            (cx + 2, cz + plaza_r),
+            (cx - 4, cz + 1),
+            (cx + 4, cz - 1),
+            (cx, (cz + d - 4) / 2),
+            (cx - 1, (cz + 4) / 2),
+        ];
+        for (vx, vz) in candidate_offsets {
+            if !(2..(w - 2)).contains(&vx) || !(2..(d - 2)).contains(&vz) {
+                continue;
+            }
+            if is_floating && !is_road[(vz * w + vx) as usize] {
+                continue;
+            }
+            let vy = if is_road[(vz * w + vx) as usize] || is_plaza[(vz * w + vx) as usize] {
+                plaza_y
+            } else {
+                terrain_at_wxz(terrain_offsets, w, vx, vz).clamp(-12, 12)
+            };
+            let solid_below = blocks.get(&[vx, vy, vz]).is_some_and(|b| b.block_id != "minecraft:air" && b.block_id != "minecraft:water");
+            let clear_above = blocks.get(&[vx, vy + 1, vz]).is_none_or(|b| b.block_id == "minecraft:air")
+                && blocks.get(&[vx, vy + 2, vz]).is_none_or(|b| b.block_id == "minecraft:air");
+            if solid_below && clear_above {
+                if spawned < 4 {
+                    living.entities.push(PlannedEntity {
+                        pos: [vx, vy + 1, vz],
+                        kind: LivingEntityKind::Villager,
+                        facing: CardinalFacing::South,
+                        detail: npc_profs[spawned % npc_profs.len()].into(),
+                        sub_detail: spec.biome_tag.clone(),
+                        is_decor: false,
+                    });
+                } else if spawned == 4 {
+                    living.entities.push(PlannedEntity {
+                        pos: [vx, vy + 1, vz],
+                        kind: LivingEntityKind::IronGolem,
+                        facing: CardinalFacing::South,
+                        detail: String::new(),
+                        sub_detail: String::new(),
+                        is_decor: false,
+                    });
+                } else {
+                    living.entities.push(PlannedEntity {
+                        pos: [vx, vy + 1, vz],
+                        kind: LivingEntityKind::Cat,
+                        facing: CardinalFacing::South,
+                        detail: String::new(),
+                        sub_detail: String::new(),
+                        is_decor: false,
+                    });
+                    break;
+                }
+                spawned += 1;
+            }
+        }
+    }
+
+    living.apply_filters(spec.living_decor, req.spawn_npcs);
+    if spec.living_decor {
+        living.materialize_signs_and_banners(&mut blocks, crate::gen_interior::wood_prefix_for_palette(pal));
+    }
     prune_map_unsupported(&mut blocks);
     resolve_connections_and_shapes(&mut blocks);
 
@@ -1447,5 +1609,6 @@ pub fn generate_settlement(
         height,
         blocks,
         door_pos: Some([cx, plaza_y + 1, cz + plaza_r]),
+        living,
     }
 }

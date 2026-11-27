@@ -4,13 +4,14 @@ use mod_api::{PayloadId, Registrar, ToClient, ToServer};
 
 use crate::model::{
     BiomeQueryRequest, BiomeQueryResponse, BuildRequest, BuildResponse, RedoRequest, RerollRequest,
-    SetLangRequest, UndoRequest,
+    RoadConnectRequest, SetLangRequest, UndoRequest,
 };
 use crate::{client_ui, server_builder};
 
 #[derive(Clone)]
 pub struct PayloadChannels {
     pub to_server_build: ToServer<BuildRequest>,
+    pub to_server_road: ToServer<RoadConnectRequest>,
     pub to_server_undo: ToServer<UndoRequest>,
     pub to_server_redo: ToServer<RedoRequest>,
     pub to_server_reroll: ToServer<RerollRequest>,
@@ -29,6 +30,10 @@ pub fn register_channels(registrar: &mut dyn Registrar) {
     let to_server_build = reg.play_to_server_typed::<BuildRequest>(
         PayloadId("building_generator:build".into()),
         |req, cx| server_builder::handle_build_payload(req, cx),
+    );
+    let to_server_road = reg.play_to_server_typed::<RoadConnectRequest>(
+        PayloadId("building_generator:connect_road".into()),
+        |req, cx| server_builder::handle_road_payload(req, cx),
     );
     let to_server_undo = reg.play_to_server_typed::<UndoRequest>(
         PayloadId("building_generator:undo".into()),
@@ -68,6 +73,7 @@ pub fn register_channels(registrar: &mut dyn Registrar) {
     if let Ok(mut guard) = CHANNELS.write() {
         *guard = Some(PayloadChannels {
             to_server_build,
+            to_server_road,
             to_server_undo,
             to_server_redo,
             to_server_reroll,
