@@ -6619,4 +6619,60 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn v073_menu_tooltips_cover_all_buttons_categories_and_exclude_materials_blocks() {
+        use std::collections::HashSet;
+        use mod_api::client::widgets::{Button, Widgets};
+        use crate::client_ui::{
+            HOVER_TOOLTIP_DELAY_MS, category_tooltip_desc, clamp_tooltip_pos, hover_tooltip_ready,
+            style_tooltip_desc, test_audit_menu_tooltips, wrap_tooltip_lines,
+        };
+
+        // 1. All 14 categories and all 10 styles have distinct, non-empty EN/RU tooltips
+        let mut seen_cat_en = HashSet::new();
+        let mut seen_cat_ru = HashSet::new();
+        for cat in BuildCategory::ALL {
+            let en = category_tooltip_desc(cat, crate::model::UiLang::En);
+            let ru = category_tooltip_desc(cat, crate::model::UiLang::Ru);
+            assert!(en.len() > 20 && ru.len() > 20, "Category {:?} tooltip too short", cat);
+            assert!(seen_cat_en.insert(en), "Duplicate EN category tooltip for {:?}", cat);
+            assert!(seen_cat_ru.insert(ru), "Duplicate RU category tooltip for {:?}", cat);
+        }
+        for style in BuildStyle::ALL {
+            let en = style_tooltip_desc(style, crate::model::UiLang::En);
+            let ru = style_tooltip_desc(style, crate::model::UiLang::Ru);
+            assert!(en.len() > 20 && ru.len() > 20, "Style {:?} tooltip too short", style);
+        }
+
+        // 2. 1-second (1000 ms) hover delay behavior & switching resets timer
+        assert_eq!(HOVER_TOOLTIP_DELAY_MS, 1000);
+        let mut dummy_w = Widgets::new();
+        let b1 = dummy_w.add_button(Button::new([0.0, 0.0, 10.0, 10.0], mod_api::Text::literal("A")));
+        let b2 = dummy_w.add_button(Button::new([20.0, 0.0, 10.0, 10.0], mod_api::Text::literal("B")));
+        let mut hover_id = None;
+        let mut hover_ms = 0u64;
+        assert!(!hover_tooltip_ready(&mut hover_id, &mut hover_ms, Some(b1), 5000));
+        assert!(!hover_tooltip_ready(&mut hover_id, &mut hover_ms, Some(b1), 5999));
+        assert!(hover_tooltip_ready(&mut hover_id, &mut hover_ms, Some(b1), 6000));
+        assert!(!hover_tooltip_ready(&mut hover_id, &mut hover_ms, Some(b2), 6500));
+        assert!(!hover_tooltip_ready(&mut hover_id, &mut hover_ms, Some(b2), 7499));
+        assert!(hover_tooltip_ready(&mut hover_id, &mut hover_ms, Some(b2), 7500));
+        assert!(!hover_tooltip_ready(&mut hover_id, &mut hover_ms, None, 8000));
+        assert!(hover_id.is_none());
+
+        // 3. Word-wrapping and screen-edge clamping
+        let lines = wrap_tooltip_lines(
+            "Жилые дома, коттеджи, виллы, таверны и особняки с многокомнатной меблировкой.",
+            100.0,
+            |s| (s.chars().count() as f32) * 5.0,
+        );
+        assert!(lines.len() >= 3);
+        let [tx, ty] = clamp_tooltip_pos([475.0, 285.0], 160.0, 48.0, [480.0, 290.0]);
+        assert!(tx >= 4.0 && tx + 160.0 <= 476.0);
+        assert!(ty >= 4.0 && ty + 48.0 <= 286.0);
+
+        // 4. Full GUI widget tooltip coverage audit across all 4 tabs & modals (EN/RU)
+        test_audit_menu_tooltips();
+    }
 }

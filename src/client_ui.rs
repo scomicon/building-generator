@@ -24,7 +24,7 @@ use mod_api::ConfigPath;
 
 pub const SCREEN_ID: &str = "building_generator";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiTab {
     SizeArea,
     DescNoise,
@@ -383,11 +383,20 @@ struct WidgetHandles {
     close_btn: WidgetId,
 }
 
+#[derive(Clone, Debug)]
+struct TooltipEntry {
+    id: WidgetId,
+    rect: [f32; 4],
+    title: String,
+    desc: String,
+}
+
 struct BuiltScreen {
     size: [f32; 2],
     panel: [f32; 4],
     widgets: Widgets,
     handles: WidgetHandles,
+    tooltips: Vec<TooltipEntry>,
     slot_scroll_zone: Option<ScrollZone>,
     list_scroll_zone: Option<ScrollZone>,
     picker_scroll_zone: Option<ScrollZone>,
@@ -527,6 +536,8 @@ struct ClientUiState {
     pending: Option<PendingAction>,
     dirty: bool,
     screen: Option<BuiltScreen>,
+    hover_widget: Option<WidgetId>,
+    hover_since_ms: u64,
 }
 
 impl Default for ClientUiState {
@@ -626,6 +637,8 @@ impl Default for ClientUiState {
             pending: None,
             dirty: true,
             screen: None,
+            hover_widget: None,
+            hover_since_ms: 0,
         }
     }
 }
@@ -971,11 +984,291 @@ fn palette_fingerprint(pal: &MaterialPalette) -> u64 {
     h
 }
 
+pub(crate) const HOVER_TOOLTIP_DELAY_MS: u64 = 1000;
+
 fn point_in_rect(pt: [f32; 2], rect: [f32; 4]) -> bool {
     pt[0] >= rect[0]
         && pt[1] >= rect[1]
         && pt[0] < rect[0] + rect[2]
         && pt[1] < rect[1] + rect[3]
+}
+
+pub(crate) fn category_tooltip_desc(cat: BuildCategory, lang: UiLang) -> &'static str {
+    match (lang, cat) {
+        (UiLang::En, BuildCategory::House) => "Residential homes, cottages, villas, taverns & multi-room living quarters with full interiors.",
+        (UiLang::En, BuildCategory::Tower) => "Vertical landmarks: watchtowers, mage spires, pagodas, lighthouses, windmills & clock towers.",
+        (UiLang::En, BuildCategory::Barn) => "Rural barns, grain storehouses, lofts, stables & covered timber storage halls.",
+        (UiLang::En, BuildCategory::Pavilion) => "Open-air market stalls, gazebos, teahouses, train stations, ships, airships & civic halls.",
+        (UiLang::En, BuildCategory::Castle) => "Fortified citadels, bailey keeps, bastions, colosseums, city gates & defensive walls.",
+        (UiLang::En, BuildCategory::Forge) => "Blacksmith workshops, smelteries, watermills, steam foundries & crafting yards.",
+        (UiLang::En, BuildCategory::Temple) => "Cathedrals, shrines, pyramids, pantheons, mosques, monasteries & monumental arches.",
+        (UiLang::En, BuildCategory::Bridge) => "River and ravine bridges across 9 archetypes with walkable ramps, steps & full headroom.",
+        (UiLang::En, BuildCategory::Settlement) => "Entire terrain-following walled cities with plazas, avenues, canals, bridges & lots.",
+        (UiLang::En, BuildCategory::Dungeon) => "Multi-tier subterranean dungeons & mineshafts with switchback stairs, vaults & loot.",
+        (UiLang::En, BuildCategory::Estate) => "Full country estates combining manor house, barn, irrigated crops, windmill & paddock.",
+        (UiLang::En, BuildCategory::Engineering) => "Canal locks, railway roundhouses, gantry drydocks & electrical power substations.",
+        (UiLang::En, BuildCategory::Agricultural) => "Hillside vineyards, masonry grain silos, orchard apiaries & royal horse stables.",
+        (UiLang::En, BuildCategory::DecorArt) => "Tiered plaza fountains, guardian statues, evergreen hedge mazes & zen karesansui gardens.",
+        (UiLang::Ru, BuildCategory::House) => "Жилые дома, коттеджи, виллы, таверны и особняки с многокомнатной меблировкой.",
+        (UiLang::Ru, BuildCategory::Tower) => "Высокие башни, шпили магов, пагоды, маяки, ветряные мельницы и башни с часами.",
+        (UiLang::Ru, BuildCategory::Barn) => "Амбары, сеновалы, склады припасов и деревянные хозяйственные постройки.",
+        (UiLang::Ru, BuildCategory::Pavilion) => "Павильоны, беседки, вокзалы, корабли, дирижабли, базары и общественные залы.",
+        (UiLang::Ru, BuildCategory::Castle) => "Цитадели, замки, бастионы, колизеи, городские ворота и крепостные стены.",
+        (UiLang::Ru, BuildCategory::Forge) => "Кузницы, плавильни, водяные мельницы, мастерские и ремесленные дворы.",
+        (UiLang::Ru, BuildCategory::Temple) => "Соборы, святилища, пирамиды, пантеоны, мечети, монастыри и триумфальные арки.",
+        (UiLang::Ru, BuildCategory::Bridge) => "Мосты и виадуки 9 типов через реки и ущелья со ступенями и высоким проходом.",
+        (UiLang::Ru, BuildCategory::Settlement) => "Целые города и деревни по рельефу с улицами, каналами, площадями, стенами и домами.",
+        (UiLang::Ru, BuildCategory::Dungeon) => "Многоуровневые подземные данжи и шахты с лестницами, ловушками и добычей.",
+        (UiLang::Ru, BuildCategory::Estate) => "Поместья: усадебный дом, амбар, мельница, орошаемые грядки и загон со скотом.",
+        (UiLang::Ru, BuildCategory::Engineering) => "Судоходные шлюзы, веерные депо поездов, стапели с краном и электроподстанции.",
+        (UiLang::Ru, BuildCategory::Agricultural) => "Виноградники с прессом, зерновые силосы, пасеки в цветущем саду и конюшни.",
+        (UiLang::Ru, BuildCategory::DecorArt) => "Фонтаны, монументальные статуи стражей, садовые лабиринты и дзен-сады камней.",
+    }
+}
+
+pub(crate) fn style_tooltip_desc(style: BuildStyle, lang: UiLang) -> &'static str {
+    match (lang, style) {
+        (UiLang::En, BuildStyle::Auto) => "Infers architecture & road style from prompt text, seed noise, or detected world biome.",
+        (UiLang::En, BuildStyle::Medieval) => "Timber-framed stone, half-timber facades, cobble roads & spruce roofs.",
+        (UiLang::En, BuildStyle::Cottage) => "Warm rustic wood, mossy stone, packed-mud garden paths & lush flowerboxes.",
+        (UiLang::En, BuildStyle::Japanese) => "Curved pagoda eaves, engawa verandas, bamboo, sakura & andesite paths.",
+        (UiLang::En, BuildStyle::Gothic) => "Pointed arches, deep slate masonry, dark oak, stained glass & soul lanterns.",
+        (UiLang::En, BuildStyle::Nordic) => "Heavy spruce logs, steep A-frame roofs, tuff bricks & cobbled highland roads.",
+        (UiLang::En, BuildStyle::Modern) => "Clean concrete volumes, panoramic glass, iron bars & striped asphalt roads.",
+        (UiLang::En, BuildStyle::Desert) => "Carved sandstone terraces, domes, arches & terracotta-accented roads.",
+        (UiLang::En, BuildStyle::Steampunk) => "Oxidized copper domes, brass pipes, mud bricks, grates & copper lanterns.",
+        (UiLang::En, BuildStyle::Classical) => "Greco-Roman quartz columns, portico pediments, domes & marble avenues.",
+        (UiLang::Ru, BuildStyle::Auto) => "Автоподбор архитектуры и стиля дорог по тексту описания, сиду или биому мира.",
+        (UiLang::Ru, BuildStyle::Medieval) => "Средневековый фахверк, каменная кладка, брусчатка и еловые крыши.",
+        (UiLang::Ru, BuildStyle::Cottage) => "Уютное дерево, кирпич, мшистый камень, тёплые садовые тропы и цветники.",
+        (UiLang::Ru, BuildStyle::Japanese) => "Изогнутые кровли пагод, веранды энгава, бамбук, сакура и андезитовые аллеи.",
+        (UiLang::Ru, BuildStyle::Gothic) => "Стрельчатые своды, глубинный сланец, тёмный дуб, витражи и фонари душ.",
+        (UiLang::Ru, BuildStyle::Nordic) => "Северный сруб из ели, крутые двускатные крыши, туф и булыжные дороги.",
+        (UiLang::Ru, BuildStyle::Modern) => "Бетон, панорамное остекление, металлические перила и асфальт с разметкой.",
+        (UiLang::Ru, BuildStyle::Desert) => "Восточный песчаник, купола, террасы и дороги с терракотовым бордюром.",
+        (UiLang::Ru, BuildStyle::Steampunk) => "Окисленная медь, решётки, туф, медные фонари и индустриальный шарм.",
+        (UiLang::Ru, BuildStyle::Classical) => "Античный мрамор и кварцевые колоннады, портики, купола и мощёные проспекты.",
+    }
+}
+
+fn roof_tooltip_desc(roof: RoofChoice, lang: UiLang) -> &'static str {
+    match (lang, roof) {
+        (UiLang::En, RoofChoice::Auto) => "Automatically chooses a roof geometry matching the current category and style.",
+        (UiLang::En, RoofChoice::Gable) => "Classic pitched two-slope roof with sealed triangular gable ends.",
+        (UiLang::En, RoofChoice::Hip) => "Four-sided sloped pyramid hip roof tapering cleanly to a ridge.",
+        (UiLang::En, RoofChoice::Steep) => "High-pitched Alpine/Gothic roof with dramatic vertical silhouette.",
+        (UiLang::En, RoofChoice::Pagoda) => "Flared East Asian curved eaves with upturned corner tips.",
+        (UiLang::En, RoofChoice::Dome) => "Circular vaulted stone/copper dome crowned with a cupola lantern.",
+        (UiLang::En, RoofChoice::Mansard) => "Two-slope French mansard crown framing spacious attic rooms.",
+        (UiLang::En, RoofChoice::Flat) => "Clean parapet rooftop terrace suited for Modern and Desert builds.",
+        (UiLang::Ru, RoofChoice::Auto) => "Автоматически выбирает форму крыши под текущую категорию и стиль.",
+        (UiLang::Ru, RoofChoice::Gable) => "Классическая двускатная кровля с зашитыми треугольными фронтонами.",
+        (UiLang::Ru, RoofChoice::Hip) => "Четырёхскатная шатровая крыша с плавным схождением к коньку.",
+        (UiLang::Ru, RoofChoice::Steep) => "Крутая высокая кровля в альпийском или готическом стиле.",
+        (UiLang::Ru, RoofChoice::Pagoda) => "Вогнутые восточные скаты с приподнятыми уголками карниза.",
+        (UiLang::Ru, RoofChoice::Dome) => "Сводчатый купол с венчающим световым фонарём на вершине.",
+        (UiLang::Ru, RoofChoice::Mansard) => "Французская мансардная крыша с просторным чердачным этажом.",
+        (UiLang::Ru, RoofChoice::Flat) => "Плоская террасная крыша с парапетом для модерна и пустыни.",
+    }
+}
+
+fn noise_tooltip_desc(noise: NoiseLevel, lang: UiLang) -> &'static str {
+    match (lang, noise) {
+        (UiLang::En, NoiseLevel::Calm) => "Clean, symmetrical walls and minimal organic wing asymmetry.",
+        (UiLang::En, NoiseLevel::Balanced) => "Natural mix of wings, porches, bays & varied surface accents.",
+        (UiLang::En, NoiseLevel::Wild) => "Bold asymmetric wings, towers & rich procedural silhouette variations.",
+        (UiLang::Ru, NoiseLevel::Calm) => "Строгие симметричные фасады с минимальными случайными выступами.",
+        (UiLang::Ru, NoiseLevel::Balanced) => "Сбалансированное сочетание флигелей, эркеров и фактуры стен.",
+        (UiLang::Ru, NoiseLevel::Wild) => "Смелая асимметрия, пристройки, башенки и богатая вариативность форм.",
+    }
+}
+
+fn filter_tooltip_desc(filt: MatFilter, lang: UiLang) -> &'static str {
+    match (lang, filt) {
+        (UiLang::En, MatFilter::All) => "Filter category: show every block matching the selected slot.",
+        (UiLang::En, MatFilter::Wood) => "Filter category: logs, planks, doors, fences, bamboo & timber trim.",
+        (UiLang::En, MatFilter::Stone) => "Filter category: stone bricks, deepslate, tuff, sandstone & masonry.",
+        (UiLang::En, MatFilter::ColorGlass) => "Filter category: concrete, terracotta, wool & stained glass panes.",
+        (UiLang::En, MatFilter::Special) => "Filter category: lanterns, leaves, grates, bars, copper & special decor.",
+        (UiLang::Ru, MatFilter::All) => "Категория фильтра: показать все подходящие блоки для слота.",
+        (UiLang::Ru, MatFilter::Wood) => "Категория фильтра: брёвна, доски, двери, заборы, бамбук и люки.",
+        (UiLang::Ru, MatFilter::Stone) => "Категория фильтра: каменная кладка, сланец, туф, песчаник и кирпич.",
+        (UiLang::Ru, MatFilter::ColorGlass) => "Категория фильтра: бетон, терракота, шерсть и цветные витражи.",
+        (UiLang::Ru, MatFilter::Special) => "Категория фильтра: фонари, листва, решётки, медь и декор.",
+    }
+}
+
+fn toggle_tooltip_desc(idx: usize, tri: TriToggle, lang: UiLang) -> String {
+    let base = match (lang, idx) {
+        (UiLang::En, 0) => "Toggle entrance porch stairs & canopy: Auto (A), Force ON (+), or OFF (-).",
+        (UiLang::En, 1) => "Toggle upper-floor protruding balcony: Auto (A), Force ON (+), or OFF (-).",
+        (UiLang::En, 2) => "Toggle subterranean stone cellar/basement room: Auto (A), Force ON (+), or OFF (-).",
+        (UiLang::En, 3) => "Toggle market awning & roadside stall outside: Auto (A), Force ON (+), or OFF (-).",
+        (UiLang::En, _) => "Toggle courtyard trees, planters, well & fences: Auto (A), Force ON (+), or OFF (-).",
+        (UiLang::Ru, 0) => "Переключатель крыльца у входа: Авто (А), ВКЛ (+) или ВЫКЛ (-).",
+        (UiLang::Ru, 1) => "Переключатель балкона на верхнем этаже: Авто (А), ВКЛ (+) или ВЫКЛ (-).",
+        (UiLang::Ru, 2) => "Переключатель подземного каменного подвала: Авто (А), ВКЛ (+) или ВЫКЛ (-).",
+        (UiLang::Ru, 3) => "Переключатель уличного навеса-лавки: Авто (А), ВКЛ (+) или ВЫКЛ (-).",
+        (UiLang::Ru, _) => "Переключатель двора с деревьями, клумбами и оградой: Авто (А), ВКЛ (+) или ВЫКЛ (-).",
+    };
+    let state = match (lang, tri) {
+        (UiLang::En, TriToggle::Auto) => "State: Auto",
+        (UiLang::En, TriToggle::On) => "State: Forced ON",
+        (UiLang::En, TriToggle::Off) => "State: Forced OFF",
+        (UiLang::Ru, TriToggle::Auto) => "Сейчас: Авто",
+        (UiLang::Ru, TriToggle::On) => "Сейчас: Включено",
+        (UiLang::Ru, TriToggle::Off) => "Сейчас: Выключено",
+    };
+    format!("{base} {state}.")
+}
+
+fn add_tip_btn(
+    w: &mut Widgets,
+    tooltips: &mut Vec<TooltipEntry>,
+    rect: [f32; 4],
+    label: impl Into<String>,
+    active: bool,
+    title: impl Into<String>,
+    desc: impl Into<String>,
+) -> WidgetId {
+    let mut b = Button::new(rect, Text::literal(label.into()));
+    b.active = active;
+    let id = w.add_button(b);
+    let d = desc.into();
+    if !d.is_empty() {
+        tooltips.push(TooltipEntry {
+            id,
+            rect,
+            title: title.into(),
+            desc: d,
+        });
+    }
+    id
+}
+
+pub(crate) fn wrap_tooltip_lines(
+    text: &str,
+    max_w: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            if measure(word) <= max_w {
+                cur.push_str(word);
+            } else {
+                for ch in word.chars() {
+                    let mut cand = cur.clone();
+                    cand.push(ch);
+                    if !cur.is_empty() && measure(&cand) > max_w {
+                        lines.push(std::mem::take(&mut cur));
+                    }
+                    cur.push(ch);
+                }
+            }
+        } else {
+            let cand = format!("{cur} {word}");
+            if measure(&cand) <= max_w {
+                cur = cand;
+            } else {
+                lines.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+pub(crate) fn clamp_tooltip_pos(
+    mouse: [f32; 2],
+    box_w: f32,
+    box_h: f32,
+    screen_size: [f32; 2],
+) -> [f32; 2] {
+    let margin = 4.0;
+    let mut tx = mouse[0] + 9.0;
+    let mut ty = mouse[1] + 11.0;
+    if tx + box_w > screen_size[0] - margin {
+        tx = mouse[0] - box_w - 6.0;
+    }
+    if ty + box_h > screen_size[1] - margin {
+        ty = mouse[1] - box_h - 6.0;
+    }
+    let max_x = (screen_size[0] - box_w - margin).max(margin);
+    let max_y = (screen_size[1] - box_h - margin).max(margin);
+    [tx.clamp(margin, max_x), ty.clamp(margin, max_y)]
+}
+
+fn resolve_hovered_tooltip(tooltips: &[TooltipEntry], mouse: [f32; 2]) -> Option<&TooltipEntry> {
+    tooltips.iter().rev().find(|t| point_in_rect(mouse, t.rect))
+}
+
+pub(crate) fn hover_tooltip_ready(
+    hover_widget: &mut Option<WidgetId>,
+    hover_since_ms: &mut u64,
+    hovered_id: Option<WidgetId>,
+    now_ms: u64,
+) -> bool {
+    let Some(id) = hovered_id else {
+        *hover_widget = None;
+        return false;
+    };
+    if *hover_widget != Some(id) {
+        *hover_widget = Some(id);
+        *hover_since_ms = now_ms;
+        return false;
+    }
+    now_ms.saturating_sub(*hover_since_ms) >= HOVER_TOOLTIP_DELAY_MS
+}
+
+fn draw_tooltip_popup(
+    draw: &mut dyn mod_api::DrawContext,
+    mouse: [f32; 2],
+    screen_size: [f32; 2],
+    title: &str,
+    desc: &str,
+) {
+    let max_text_w = (screen_size[0] - 24.0).clamp(110.0, 196.0);
+    let body_lines = wrap_tooltip_lines(desc, max_text_w, |s| draw.text_width(s));
+    let mut content_w = if title.is_empty() {
+        0.0
+    } else {
+        draw.text_width(title) + 8.0
+    };
+    for line in &body_lines {
+        content_w = content_w.max(draw.text_width(line));
+    }
+    if content_w <= 1.0 {
+        return;
+    }
+    let has_title = !title.is_empty();
+    let title_h = if has_title { 13.0 } else { 0.0 };
+    let line_h = 10.0;
+    let box_w = (content_w + 12.0).min(screen_size[0] - 8.0);
+    let box_h = 8.0 + title_h + (body_lines.len() as f32) * line_h;
+    let [tx, ty] = clamp_tooltip_pos(mouse, box_w, box_h, screen_size);
+
+    draw.fill([tx + 2.0, ty + 2.0, box_w, box_h], 0x7702_0617);
+    draw.fill([tx, ty, box_w, box_h], 0xF20B_1120);
+    draw.fill([tx, ty, box_w, 1.0], 0xFF38_BDF8);
+    draw.fill([tx, ty + box_h - 1.0, box_w, 1.0], 0xFF38_BDF8);
+    draw.fill([tx, ty, 1.0, box_h], 0xFF38_BDF8);
+    draw.fill([tx + box_w - 1.0, ty, 1.0, box_h], 0xFF38_BDF8);
+
+    let mut cur_y = ty + 4.5;
+    if has_title {
+        draw.text(title, [tx + 6.0, cur_y], 0xFF38_BDF8, true);
+        draw.fill([tx + 5.0, cur_y + 10.0, box_w - 10.0, 1.0], 0x5538_BDF8);
+        cur_y += title_h;
+    }
+    for line in &body_lines {
+        draw.text(line, [tx + 6.0, cur_y], 0xFFE2_E8F0, false);
+        cur_y += line_h;
+    }
 }
 
 const QUICK_TAGS_EN: [(&str, &str); 8] = [
@@ -1138,6 +1431,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let panel = [px, py, pw, ph];
 
     let mut w = Widgets::new();
+    let mut tooltips: Vec<TooltipEntry> = Vec::new();
     let pad = 10.0;
     let inner_w = pw - pad * 2.0;
 
@@ -1145,14 +1439,32 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         UiLang::En => format!("Blocks: {}", st.preview_total_blocks),
         UiLang::Ru => format!("Смета: {}", st.preview_total_blocks),
     };
-    let bom_btn = w.add_button(Button::new(
+    let bom_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [px + pw - pad - 184.0, py + 2.0, 82.0, 16.0],
-        Text::literal(bom_lbl),
-    ));
-    let lang_btn = w.add_button(Button::new(
+        bom_lbl,
+        true,
+        tr(lang, "Material Estimate (BOM)", "Смета блоков (BOM)"),
+        tr(
+            lang,
+            "Open detailed block count breakdown with stacks and clipboard export.",
+            "Открыть смету блоков с подсчётом стаков и копированием списка.",
+        ),
+    );
+    let lang_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [px + pw - pad - 98.0, py + 2.0, 56.0, 16.0],
-        Text::literal(lang.button_label()),
-    ));
+        lang.button_label(),
+        true,
+        tr(lang, "Interface Language", "Язык интерфейса"),
+        tr(
+            lang,
+            "Switch GUI labels, presets & /buildgen messages between English and Russian.",
+            "Переключить язык меню, каталога и команд /buildgen (EN / RU).",
+        ),
+    );
 
     let mut tab_size = None;
     let mut tab_desc = None;
@@ -1164,33 +1476,58 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     if !st.picker_open && !st.preset_picker_open && !st.bom_open {
         let tab_w = ((inner_w - 12.0) / 4.0).floor();
         let tab_w4 = inner_w - (tab_w + 4.0) * 3.0;
-        let mut b1 = Button::new(
+        tab_size = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [px + pad, tab_y, tab_w, 18.0],
-            Text::literal(tr(lang, "1. Size & Area", "1. Размер")),
-        );
-        b1.active = st.tab != UiTab::SizeArea;
-        tab_size = Some(w.add_button(b1));
-
-        let mut b2 = Button::new(
+            tr(lang, "1. Size & Area", "1. Размер"),
+            st.tab != UiTab::SizeArea,
+            tr(lang, "Tab 1: Size & Area", "Вкладка 1: Размер и область"),
+            tr(
+                lang,
+                "Area dimensions (7-96), world selection, 3D hologram, cutaway slice, favorites & BG2 codes.",
+                "Габариты (7-96), выделение области, 3D-голограмма, срез, избранное и коды BG2.",
+            ),
+        ));
+        tab_desc = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [px + pad + tab_w + 4.0, tab_y, tab_w, 18.0],
-            Text::literal(tr(lang, "2. Style & Noise", "2. Стиль")),
-        );
-        b2.active = st.tab != UiTab::DescNoise;
-        tab_desc = Some(w.add_button(b2));
-
-        let mut b3 = Button::new(
+            tr(lang, "2. Style & Noise", "2. Стиль"),
+            st.tab != UiTab::DescNoise,
+            tr(lang, "Tab 2: Style & Catalog", "Вкладка 2: Стиль и каталог"),
+            tr(
+                lang,
+                "Categories, styles, roof profile, text prompt, seed, 88 presets, biome, wear & moss.",
+                "Категории, стили, форма крыши, описание, сид, 88 пресетов, биом, износ и зелень.",
+            ),
+        ));
+        tab_mats = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [px + pad + (tab_w + 4.0) * 2.0, tab_y, tab_w, 18.0],
-            Text::literal(tr(lang, "3. Materials", "3. Материалы")),
-        );
-        b3.active = st.tab != UiTab::Materials;
-        tab_mats = Some(w.add_button(b3));
-
-        let mut b4 = Button::new(
+            tr(lang, "3. Materials", "3. Материалы"),
+            st.tab != UiTab::Materials,
+            tr(lang, "Tab 3: Palette & Mix", "Вкладка 3: Палитра и микс"),
+            tr(
+                lang,
+                "Architectural palette presets, 30 building slots, mixing modes & custom block lists.",
+                "Пресеты палитр, 30 слотов архитектуры, режимы смешивания и списки блоков.",
+            ),
+        ));
+        tab_world = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [px + pad + (tab_w + 4.0) * 3.0, tab_y, tab_w4, 18.0],
-            Text::literal(tr(lang, "4. World & Decor", "4. Мир и Декор")),
-        );
-        b4.active = st.tab != UiTab::WorldDecor;
-        tab_world = Some(w.add_button(b4));
+            tr(lang, "4. World & Decor", "4. Мир и Декор"),
+            st.tab != UiTab::WorldDecor,
+            tr(lang, "Tab 4: World & Decor", "Вкладка 4: Мир и декор"),
+            tr(
+                lang,
+                "Living Interiors 2.0, NPC/livestock spawning, terrain smoothing & 2-point roads.",
+                "Живые интерьеры 2.0, спавн NPC/животных, сглаживание краёв и дороги по 2 точкам.",
+            ),
+        ));
     }
 
     let mut w_dec = None;
@@ -1316,10 +1653,19 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         let cat_w = (inner_w * 0.30).floor();
         let mix_w = inner_w - back_w - mode_w - cat_w - 9.0;
 
-        picker_back_btn = Some(w.add_button(Button::new(
+        picker_back_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx, r1_y, back_w, 17.0],
-            Text::literal(tr(lang, "← Back", "← Назад")),
-        )));
+            tr(lang, "← Back", "← Назад"),
+            true,
+            tr(lang, "Back to Materials", "Назад к материалам"),
+            tr(
+                lang,
+                "Close the block picker and return to architectural slots.",
+                "Закрыть окно выбора блоков и вернуться ко вкладке материалов.",
+            ),
+        ));
         let mode_lbl = if let Some(idx) = st.picker_replace_idx {
             match lang {
                 UiLang::En => format!("Mode: Replace #{}", idx + 1),
@@ -1328,10 +1674,19 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         } else {
             tr(lang, "Mode: + Add to list", "Режим: + В список").to_owned()
         };
-        picker_mode_btn = Some(w.add_button(Button::new(
+        picker_mode_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx + back_w + 3.0, r1_y, mode_w, 17.0],
-            Text::literal(mode_lbl),
-        )));
+            mode_lbl,
+            true,
+            tr(lang, "Selection Mode", "Режим выбора"),
+            tr(
+                lang,
+                "Switch between adding blocks to the slot list or replacing a chosen block chip.",
+                "Переключение между добавлением блоков в список и заменой выбранного элемента.",
+            ),
+        ));
         let cat_lbl = if st.picker_all_blocks {
             if st.world_blocks.is_empty() {
                 tr(lang, "Catalog: All", "Каталог: Все").to_owned()
@@ -1344,29 +1699,51 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         } else {
             tr(lang, "Catalog: Rec.", "Каталог: Рекоменд.").to_owned()
         };
-        picker_catalog_btn = Some(w.add_button(Button::new(
+        picker_catalog_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx + back_w + mode_w + 6.0, r1_y, cat_w, 17.0],
-            Text::literal(cat_lbl),
-        )));
-        mat_mix_mode_btn = Some(w.add_button(Button::new(
+            cat_lbl,
+            true,
+            tr(lang, "Block Source Catalog", "Источник блоков"),
+            tr(
+                lang,
+                "Toggle between curated recommended blocks for this slot and all registered world blocks.",
+                "Переключает список между рекомендованными блоками слота и всеми блоками игры.",
+            ),
+        ));
+        mat_mix_mode_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx + back_w + mode_w + cat_w + 9.0, r1_y, mix_w, 17.0],
-            Text::literal(match lang {
+            match lang {
                 UiLang::En => format!("Mix: {}", st.palette.mix_mode.label(lang)),
                 UiLang::Ru => format!("Микс: {}", st.palette.mix_mode.label(lang)),
-            }),
-        )));
+            },
+            true,
+            tr(lang, "Multi-Block Mix Pattern", "Алгоритм смешивания"),
+            tr(
+                lang,
+                "Cycles how multiple blocks in one slot blend: Patches, Scatter, Horizontal Stripes, or Checker.",
+                "Режим чередования блоков внутри слота: Пятна, Россыпь, Полосы или Шахматка.",
+            ),
+        ));
 
         // Row 2: Filters (left 54%) + Search box (right 46%)
         let r2_y = r1_y + 20.0;
         let filters_w = (inner_w * 0.54).floor();
         let fw = ((filters_w - 8.0) / 5.0).floor();
         for (fi, &filt) in MatFilter::ALL.iter().enumerate() {
-            let mut fb = Button::new(
+            let id = add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx + fi as f32 * (fw + 2.0), r2_y, fw, 15.0],
-                Text::literal(filt.label(lang)),
+                filt.label(lang),
+                st.mat_filter != filt,
+                filt.label(lang),
+                filter_tooltip_desc(filt, lang),
             );
-            fb.active = st.mat_filter != filt;
-            mat_filter_btns.push((w.add_button(fb), filt));
+            mat_filter_btns.push((id, filt));
         }
 
         let sx = lx + filters_w + 6.0;
@@ -1376,9 +1753,19 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         sf.set_value(&st.mat_search);
         sf.suggestion = Some(tr(lang, "search EN/RU: oak, glass...", "поиск RU/EN: сланец, glass...").into());
         mat_search_field = Some(w.add_text_field(sf));
-        let mut cb = Button::new([sx + sw - clr_w, r2_y, clr_w, 15.0], Text::literal("✕"));
-        cb.active = !st.mat_search.is_empty();
-        mat_search_clear_btn = Some(w.add_button(cb));
+        mat_search_clear_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sx + sw - clr_w, r2_y, clr_w, 15.0],
+            "✕",
+            !st.mat_search.is_empty(),
+            tr(lang, "Clear Search", "Сброс поиска"),
+            tr(
+                lang,
+                "Clear block search filter text.",
+                "Очистить строку поиска по блокам.",
+            ),
+        ));
 
         // Bottom active slot block list strip above status & footer
         let strip_y = foot_y - 43.0;
@@ -1410,14 +1797,21 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             ));
             picker_chip_btns.push((btn, idx));
         }
-        let mut clr_list_b = Button::new(
+        list_clear_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx + chips_area_w + 4.0, chip_y, reset_w, 16.0],
-            Text::literal(tr(lang, "Reset to 1", "Сброс до 1")),
-        );
-        clr_list_b.active = slot_blocks.len() > 1;
-        list_clear_btn = Some(w.add_button(clr_list_b));
+            tr(lang, "Reset to 1", "Сброс до 1"),
+            slot_blocks.len() > 1,
+            tr(lang, "Reset Slot List", "Сбросить список"),
+            tr(
+                lang,
+                "Keep only the primary block in this slot and remove extra variants.",
+                "Оставить в слоте только главный блок и удалить дополнительные варианты.",
+            ),
+        ));
 
-        // Main 3-col scrollable block icon grid
+        // Main 3-col scrollable block icon grid (NO tooltips on block tiles)
         let grid_y = r2_y + 19.0;
         let grid_avail_h = (strip_y - 3.0 - grid_y).max(74.0);
         let row_h = 18.0;
@@ -1469,12 +1863,24 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
 
         let sb_x = lx + grid_inner_w + 3.0;
         let sb_h = (vis_rows as f32) * row_h - 1.0;
-        let mut up_b = Button::new([sb_x, grid_y, sb_w, 12.0], Text::literal("▲"));
-        up_b.active = scroll > 0;
-        picker_up_btn = Some(w.add_button(up_b));
-        let mut dn_b = Button::new([sb_x, grid_y + sb_h - 12.0, sb_w, 12.0], Text::literal("▼"));
-        dn_b.active = scroll < max_scroll;
-        picker_down_btn = Some(w.add_button(dn_b));
+        picker_up_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sb_x, grid_y, sb_w, 12.0],
+            "▲",
+            scroll > 0,
+            tr(lang, "Scroll Up", "Вверх"),
+            tr(lang, "Scroll picker grid up.", "Прокрутить список вверх."),
+        ));
+        picker_down_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sb_x, grid_y + sb_h - 12.0, sb_w, 12.0],
+            "▼",
+            scroll < max_scroll,
+            tr(lang, "Scroll Down", "Вниз"),
+            tr(lang, "Scroll picker grid down.", "Прокрутить список вниз."),
+        ));
         picker_scroll_zone = Some(ScrollZone {
             viewport: [lx, grid_y, inner_w, sb_h],
             track: [sb_x, grid_y + 13.0, sb_w, (sb_h - 26.0).max(8.0)],
@@ -1491,27 +1897,61 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         let search_x = lx + back_w + cat_w + 6.0;
         let search_w = (inner_w - back_w - cat_w - clr_w - 10.0).max(80.0);
 
-        preset_back_btn = Some(w.add_button(Button::new(
+        preset_back_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx, r1_y, back_w, 17.0],
-            Text::literal(tr(lang, "← Back", "← Назад")),
-        )));
+            tr(lang, "← Back", "← Назад"),
+            true,
+            tr(lang, "Back to Style Tab", "Назад в меню"),
+            tr(
+                lang,
+                "Close the preset catalog and keep current settings.",
+                "Закрыть каталог пресетов без сброса настроек.",
+            ),
+        ));
         let cat_lbl = match (lang, st.preset_cat_filter) {
             (UiLang::En, None) => "Type: All".to_owned(),
             (UiLang::Ru, None) => "Тип: Все".to_owned(),
             (UiLang::En, Some(c)) => format!("Type: {}", c.label(lang)),
             (UiLang::Ru, Some(c)) => format!("Тип: {}", c.label(lang)),
         };
-        preset_cat_btn = Some(w.add_button(Button::new(
+        let cat_tip = if let Some(c) = st.preset_cat_filter {
+            format!(
+                "{} — {}",
+                c.label(lang),
+                category_tooltip_desc(c, lang)
+            )
+        } else {
+            tr(
+                lang,
+                "Filter presets across all 14 architectural categories (click to cycle).",
+                "Фильтр по всем 14 категориям построек (нажмите для перебора).",
+            )
+            .to_owned()
+        };
+        preset_cat_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx + back_w + 3.0, r1_y, cat_w, 17.0],
-            Text::literal(cat_lbl),
-        )));
+            cat_lbl,
+            true,
+            tr(lang, "Category Filter", "Фильтр категорий"),
+            cat_tip,
+        ));
         let mut psf = TextField::new([search_x, r1_y, search_w, 17.0], 40);
         psf.set_value(&st.preset_search);
         psf.suggestion = Some(tr(lang, "search: bridge, castle, ship...", "поиск: мост, замок, храм, ship...").into());
         preset_search_field = Some(w.add_text_field(psf));
-        let mut pclr = Button::new([search_x + search_w + 3.0, r1_y, clr_w, 17.0], Text::literal("✕"));
-        pclr.active = !st.preset_search.is_empty();
-        preset_search_clear_btn = Some(w.add_button(pclr));
+        preset_search_clear_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [search_x + search_w + 3.0, r1_y, clr_w, 17.0],
+            "✕",
+            !st.preset_search.is_empty(),
+            tr(lang, "Clear Filter", "Сброс поиска"),
+            tr(lang, "Clear preset search query.", "Очистить строку поиска по каталогу."),
+        ));
 
         let grid_y = r1_y + 21.0;
         let grid_avail_h = (foot_y - 26.0 - grid_y).max(96.0);
@@ -1534,10 +1974,21 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                 let tx = lx + (c as f32) * (col_w + col_gap);
                 let ty = grid_y + (r as f32) * row_h;
                 if let Some(&preset_idx) = matches.get(m_idx) {
-                    let btn = w.add_button(Button::new(
+                    let (slug, cat, style, pw_u, pd_u, ph_u, _) = CLI_PRESETS[preset_idx];
+                    let btn = add_tip_btn(
+                        &mut w,
+                        &mut tooltips,
                         [tx, ty, col_w, 17.5],
-                        Text::literal(preset_card_label(preset_idx, active_idx, lang)),
-                    ));
+                        preset_card_label(preset_idx, active_idx, lang),
+                        true,
+                        format!("#{} {slug} ({pw_u}x{pd_u}x{ph_u})", preset_idx + 1),
+                        format!(
+                            "{} · {}: {}",
+                            cat.label(lang),
+                            style.label(lang),
+                            cli_preset_desc(preset_idx, lang)
+                        ),
+                    );
                     preset_grid_btns.push((btn, preset_idx));
                 } else {
                     let mut btn_spec = Button::new([tx, ty, col_w, 17.5], Text::literal(""));
@@ -1549,12 +2000,24 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
 
         let sb_x = lx + grid_inner_w + 3.0;
         let sb_h = (vis_rows as f32) * row_h - 1.5;
-        let mut up_b = Button::new([sb_x, grid_y, sb_w, 12.0], Text::literal("▲"));
-        up_b.active = scroll > 0;
-        preset_up_btn = Some(w.add_button(up_b));
-        let mut dn_b = Button::new([sb_x, grid_y + sb_h - 12.0, sb_w, 12.0], Text::literal("▼"));
-        dn_b.active = scroll < max_scroll;
-        preset_down_btn = Some(w.add_button(dn_b));
+        preset_up_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sb_x, grid_y, sb_w, 12.0],
+            "▲",
+            scroll > 0,
+            tr(lang, "Scroll Up", "Вверх"),
+            tr(lang, "Scroll preset catalog up.", "Прокрутить каталог пресетов вверх."),
+        ));
+        preset_down_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sb_x, grid_y + sb_h - 12.0, sb_w, 12.0],
+            "▼",
+            scroll < max_scroll,
+            tr(lang, "Scroll Down", "Вниз"),
+            tr(lang, "Scroll preset catalog down.", "Прокрутить каталог пресетов вниз."),
+        ));
         preset_scroll_zone = Some(ScrollZone {
             viewport: [lx, grid_y, inner_w, sb_h],
             track: [sb_x, grid_y + 13.0, sb_w, (sb_h - 26.0).max(8.0)],
@@ -1567,14 +2030,28 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
         let r1_y = py + 23.0;
         let back_w = 64.0;
         let copy_w = 108.0;
-        bom_back_btn = Some(w.add_button(Button::new(
+        bom_back_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx, r1_y, back_w, 17.0],
-            Text::literal(tr(lang, "← Back", "← Назад")),
-        )));
-        bom_copy_btn = Some(w.add_button(Button::new(
+            tr(lang, "← Back", "← Назад"),
+            true,
+            tr(lang, "Close Estimate", "Закрыть смету"),
+            tr(lang, "Return to main Building Generator menu.", "Вернуться в главное меню генератора."),
+        ));
+        bom_copy_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
             [lx + inner_w - copy_w, r1_y, copy_w, 17.0],
-            Text::literal(tr(lang, "Copy List", "Копир. смету")),
-        )));
+            tr(lang, "Copy List", "Копир. смету"),
+            true,
+            tr(lang, "Copy Estimate", "Копировать смету"),
+            tr(
+                lang,
+                "Copy full block count breakdown with stacks to your clipboard.",
+                "Скопировать список всех требуемых блоков со стаками в буфер обмена.",
+            ),
+        ));
 
         let grid_y = r1_y + 22.0;
         let grid_avail_h = (foot_y - 26.0 - grid_y).max(90.0);
@@ -1602,12 +2079,24 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
 
         let sb_x = lx + grid_inner_w + 3.0;
         let sb_h = (vis_rows as f32) * row_h - 1.5;
-        let mut up_b = Button::new([sb_x, grid_y, sb_w, 12.0], Text::literal("▲"));
-        up_b.active = scroll > 0;
-        bom_up_btn = Some(w.add_button(up_b));
-        let mut dn_b = Button::new([sb_x, grid_y + sb_h - 12.0, sb_w, 12.0], Text::literal("▼"));
-        dn_b.active = scroll < max_scroll;
-        bom_down_btn = Some(w.add_button(dn_b));
+        bom_up_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sb_x, grid_y, sb_w, 12.0],
+            "▲",
+            scroll > 0,
+            tr(lang, "Scroll Up", "Вверх"),
+            tr(lang, "Scroll block estimate list up.", "Прокрутить смету блоков вверх."),
+        ));
+        bom_down_btn = Some(add_tip_btn(
+            &mut w,
+            &mut tooltips,
+            [sb_x, grid_y + sb_h - 12.0, sb_w, 12.0],
+            "▼",
+            scroll < max_scroll,
+            tr(lang, "Scroll Down", "Вниз"),
+            tr(lang, "Scroll block estimate list down.", "Прокрутить смету блоков вниз."),
+        ));
         bom_scroll_zone = Some(ScrollZone {
             viewport: [lx, grid_y, inner_w, sb_h],
             track: [sb_x, grid_y + 13.0, sb_w, (sb_h - 26.0).max(8.0)],
@@ -1623,26 +2112,26 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let rx = px + pad + col_w + 10.0;
 
             // Left column: W, D, H steppers + Presets + Disk Favorites + Share Code
-            w_dec = Some(w.add_button(Button::new([lx + 86.0, body_y, 22.0, 18.0], Text::literal("-"))));
-            w_inc = Some(w.add_button(Button::new([lx + 144.0, body_y, 22.0, 18.0], Text::literal("+"))));
+            w_dec = Some(add_tip_btn(&mut w, &mut tooltips, [lx + 86.0, body_y, 22.0, 18.0], "-", true, tr(lang, "Decrease Width", "Уменьшить ширину"), tr(lang, "Shrink X width by 2 blocks (min 7).", "Уменьшить ширину (X) на 2 блока (мин. 7).")));
+            w_inc = Some(add_tip_btn(&mut w, &mut tooltips, [lx + 144.0, body_y, 22.0, 18.0], "+", true, tr(lang, "Increase Width", "Увеличить ширину"), tr(lang, "Expand X width by 2–4 blocks (max 96).", "Увеличить ширину (X) на 2–4 блока (макс. 96).")));
 
-            d_dec = Some(w.add_button(Button::new([lx + 86.0, body_y + 22.0, 22.0, 18.0], Text::literal("-"))));
-            d_inc = Some(w.add_button(Button::new([lx + 144.0, body_y + 22.0, 22.0, 18.0], Text::literal("+"))));
+            d_dec = Some(add_tip_btn(&mut w, &mut tooltips, [lx + 86.0, body_y + 22.0, 22.0, 18.0], "-", true, tr(lang, "Decrease Depth", "Уменьшить глубину"), tr(lang, "Shrink Z depth by 2 blocks (min 7).", "Уменьшить глубину (Z) на 2 блока (мин. 7).")));
+            d_inc = Some(add_tip_btn(&mut w, &mut tooltips, [lx + 144.0, body_y + 22.0, 22.0, 18.0], "+", true, tr(lang, "Increase Depth", "Увеличить глубину"), tr(lang, "Expand Z depth by 2–4 blocks (max 96).", "Увеличить глубину (Z) на 2–4 блока (макс. 96).")));
 
-            h_dec = Some(w.add_button(Button::new([lx + 86.0, body_y + 44.0, 22.0, 18.0], Text::literal("-"))));
-            h_inc = Some(w.add_button(Button::new([lx + 144.0, body_y + 44.0, 22.0, 18.0], Text::literal("+"))));
+            h_dec = Some(add_tip_btn(&mut w, &mut tooltips, [lx + 86.0, body_y + 44.0, 22.0, 18.0], "-", true, tr(lang, "Decrease Height", "Уменьшить высоту"), tr(lang, "Lower Y height limit by 1 block (min 5).", "Уменьшить высоту (Y) на 1 блок (мин. 5).")));
+            h_inc = Some(add_tip_btn(&mut w, &mut tooltips, [lx + 144.0, body_y + 44.0, 22.0, 18.0], "+", true, tr(lang, "Increase Height", "Увеличить высоту"), tr(lang, "Raise Y height limit by 1 block (max 48).", "Увеличить высоту (Y) на 1 блок (макс. 48).")));
 
             let half_p = ((col_w - 4.0) * 0.5).floor();
-            preset_small = Some(w.add_button(Button::new([lx, body_y + 68.0, half_p, 17.0], Text::literal(tr(lang, "Small 9x9x8", "Малый 9x9x8")))));
-            preset_med = Some(w.add_button(Button::new([lx + half_p + 4.0, body_y + 68.0, half_p, 17.0], Text::literal(tr(lang, "Med 13x11x12", "Средн. 13x11x12")))));
-            preset_large = Some(w.add_button(Button::new([lx, body_y + 88.0, half_p, 17.0], Text::literal(tr(lang, "Large 19x15x16", "Больш. 19x15x16")))));
-            preset_tower = Some(w.add_button(Button::new([lx + half_p + 4.0, body_y + 88.0, half_p, 17.0], Text::literal(tr(lang, "Tower 9x9x22", "Башня 9x9x22")))));
+            preset_small = Some(add_tip_btn(&mut w, &mut tooltips, [lx, body_y + 68.0, half_p, 17.0], tr(lang, "Small 9x9x8", "Малый 9x9x8"), true, tr(lang, "Compact Footprint", "Компактный размер"), tr(lang, "Set area dimensions to 9x9x8 (starter cabin, stall or hut).", "Установить габариты 9x9x8 (небольшой дом или лавка).")));
+            preset_med = Some(add_tip_btn(&mut w, &mut tooltips, [lx + half_p + 4.0, body_y + 68.0, half_p, 17.0], tr(lang, "Med 13x11x12", "Средн. 13x11x12"), true, tr(lang, "Standard House Size", "Стандартный размер"), tr(lang, "Set area dimensions to 13x11x12 (balanced house or shop).", "Установить габариты 13x11x12 (средний жилой дом).")));
+            preset_large = Some(add_tip_btn(&mut w, &mut tooltips, [lx, body_y + 88.0, half_p, 17.0], tr(lang, "Large 19x15x16", "Больш. 19x15x16"), true, tr(lang, "Grand Hall Footprint", "Крупное сооружение"), tr(lang, "Set area dimensions to 19x15x16 (mansion, temple or castle).", "Установить габариты 19x15x16 (особняк, храм или замок).")));
+            preset_tower = Some(add_tip_btn(&mut w, &mut tooltips, [lx + half_p + 4.0, body_y + 88.0, half_p, 17.0], tr(lang, "Tower 9x9x22", "Башня 9x9x22"), true, tr(lang, "Tall Tower Size", "Высокая башня"), tr(lang, "Set area dimensions to 9x9x22 (pagoda, spire or lighthouse).", "Установить габариты 9x9x22 (высокая башня, маяк или пагода).")));
 
             let del_w = 22.0;
             let rem_fav = col_w - del_w - 6.0;
             let fav_s_w = (rem_fav * 0.44).floor();
             let fav_l_w = rem_fav - fav_s_w;
-            fav_save_btn = Some(w.add_button(Button::new([lx, body_y + 109.0, fav_s_w, 16.0], Text::literal(tr(lang, "★ Save", "★ Сохр.")))));
+            fav_save_btn = Some(add_tip_btn(&mut w, &mut tooltips, [lx, body_y + 109.0, fav_s_w, 16.0], tr(lang, "★ Save", "★ Сохр."), true, tr(lang, "Save Favorite", "В избранное"), tr(lang, "Save current size, style, prompt, wear & palette to favorites.txt.", "Сохранить текущие параметры, стиль и палитру в favorites.txt.")));
             let fav_lbl = if st.favorites.is_empty() {
                 tr(lang, "Favs (0)", "Избр. (0)").into()
             } else {
@@ -1651,53 +2140,71 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                     UiLang::Ru => format!("Избр. {}/{}", (st.fav_idx % st.favorites.len()) + 1, st.favorites.len()),
                 }
             };
-            fav_load_btn = Some(w.add_button(Button::new([lx + fav_s_w + 3.0, body_y + 109.0, fav_l_w, 16.0], Text::literal(fav_lbl))));
-            let mut del_b = Button::new([lx + fav_s_w + fav_l_w + 6.0, body_y + 109.0, del_w, 16.0], Text::literal("✕"));
-            del_b.active = !st.favorites.is_empty();
-            fav_del_btn = Some(w.add_button(del_b));
+            fav_load_btn = Some(add_tip_btn(&mut w, &mut tooltips, [lx + fav_s_w + 3.0, body_y + 109.0, fav_l_w, 16.0], fav_lbl, true, tr(lang, "Cycle Favorites", "Загрузить избранное"), tr(lang, "Cycle and load saved presets from favorites.txt.", "Переключать и применять сохранённые пресеты из favorites.txt.")));
+            fav_del_btn = Some(add_tip_btn(&mut w, &mut tooltips, [lx + fav_s_w + fav_l_w + 6.0, body_y + 109.0, del_w, 16.0], "✕", !st.favorites.is_empty(), tr(lang, "Delete Favorite", "Удалить избранное"), tr(lang, "Delete the currently selected saved favorite.", "Удалить текущий выбранный пресет из списка избранного.")));
 
-            share_copy_btn = Some(w.add_button(Button::new([lx, body_y + 128.0, half_p, 16.0], Text::literal(tr(lang, "Copy Code", "Копир. код")))));
-            share_paste_btn = Some(w.add_button(Button::new([lx + half_p + 4.0, body_y + 128.0, half_p, 16.0], Text::literal(tr(lang, "Paste Code", "Вставить код")))));
+            share_copy_btn = Some(add_tip_btn(&mut w, &mut tooltips, [lx, body_y + 128.0, half_p, 16.0], tr(lang, "Copy Code", "Копир. код"), true, tr(lang, "Copy BG2 Share Code", "Копировать код BG2"), tr(lang, "Copy full build configuration as a BG2 v5 share code to clipboard.", "Скопировать настройки постройки в виде кода обмена BG2 v5.")));
+            share_paste_btn = Some(add_tip_btn(&mut w, &mut tooltips, [lx + half_p + 4.0, body_y + 128.0, half_p, 16.0], tr(lang, "Paste Code", "Вставить код"), true, tr(lang, "Paste BG2 Share Code", "Вставить код BG2"), tr(lang, "Import and apply a BG2 share code from your clipboard.", "Загрузить настройки постройки из кода BG2 в буфере обмена.")));
 
             // Right column: Y nudge + Area buttons + Facing + Terrain + Preview + Slice 3D
-            y_dec_btn = Some(w.add_button(Button::new([rx + col_w - 46.0, body_y, 21.0, 16.0], Text::literal("-Y"))));
-            y_inc_btn = Some(w.add_button(Button::new([rx + col_w - 22.0, body_y, 22.0, 16.0], Text::literal("+Y"))));
-            place_front = Some(w.add_button(Button::new([rx, body_y + 19.0, col_w, 18.0], Text::literal(tr(lang, "Place in Front", "Поставить перед собой")))));
-            pick_world = Some(w.add_button(Button::new([rx, body_y + 39.0, col_w, 18.0], Text::literal(tr(lang, "Select Area in World", "Выделить область в мире")))));
-            rotate_btn = Some(w.add_button(Button::new(
+            y_dec_btn = Some(add_tip_btn(&mut w, &mut tooltips, [rx + col_w - 46.0, body_y, 21.0, 16.0], "-Y", true, tr(lang, "Lower Y Elevation", "Опустить уровень Y"), tr(lang, "Move origin down 1 block along Y.", "Сместить точку постройки на 1 блок вниз по вертикали.")));
+            y_inc_btn = Some(add_tip_btn(&mut w, &mut tooltips, [rx + col_w - 22.0, body_y, 22.0, 16.0], "+Y", true, tr(lang, "Raise Y Elevation", "Поднять уровень Y"), tr(lang, "Move origin up 1 block along Y.", "Сместить точку постройки на 1 блок вверх по вертикали.")));
+            place_front = Some(add_tip_btn(&mut w, &mut tooltips, [rx, body_y + 19.0, col_w, 18.0], tr(lang, "Place in Front", "Поставить перед собой"), true, tr(lang, "Place Box in Front", "Поставить перед собой"), tr(lang, "Anchor build area right in front of you using 5x5 terrain height sampling.", "Установить область перед игроком с замером высоты рельефа 5x5.")));
+            pick_world = Some(add_tip_btn(&mut w, &mut tooltips, [rx, body_y + 39.0, col_w, 18.0], tr(lang, "Select Area in World", "Выделить область в мире"), true, tr(lang, "Select Area in World", "Выделить область в мире"), tr(lang, "Pick two corner blocks interactively in the world to size & place the box.", "Выделить два противоположных угла зоны постройки прямо в мире.")));
+            rotate_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 60.0, half_p, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Front: {}", st.facing.label(lang)),
                     UiLang::Ru => format!("Вход: {}", st.facing.label(lang)),
-                }),
-            )));
-            terrain_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Entrance Facing", "Сторона фасада"),
+                tr(lang, "Rotate main entrance orientation (North, East, South, West).", "Повернуть главный вход здания по сторонам света (С/В/Ю/З)."),
+            ));
+            terrain_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx + half_p + 4.0, body_y + 60.0, half_p, 18.0],
-                Text::literal(match (lang, st.adapt_terrain) {
+                match (lang, st.adapt_terrain) {
                     (UiLang::En, true) => "Terrain: ON",
                     (UiLang::En, false) => "Terrain: OFF",
                     (UiLang::Ru, true) => "Рельеф: ВКЛ",
                     (UiLang::Ru, false) => "Рельеф: ВЫКЛ",
-                }),
-            )));
-            preview_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Terrain Adaptation", "Адаптация к рельефу"),
+                tr(lang, "Extend foundation skirts down slopes, add water stilts & step doorway approaches.", "Опускать фундамент и сваи к склону/воде и подгонять ступени у входа."),
+            ));
+            preview_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 81.0, half_p, 18.0],
-                Text::literal(match (lang, st.show_preview_box) {
+                match (lang, st.show_preview_box) {
                     (UiLang::En, true) => "3D View: ON",
                     (UiLang::En, false) => "3D View: OFF",
                     (UiLang::Ru, true) => "3D-обзор: ВКЛ",
                     (UiLang::Ru, false) => "3D-обзор: ВЫКЛ",
-                }),
-            )));
-            air_only_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "3D Hologram Preview", "3D-голограмма"),
+                tr(lang, "Toggle real-time semi-transparent 3D preview before building.", "Включить или выключить полупрозрачную 3D-голограмму будущей постройки."),
+            ));
+            air_only_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx + half_p + 4.0, body_y + 81.0, half_p, 18.0],
-                Text::literal(match (lang, st.air_only) {
+                match (lang, st.air_only) {
                     (UiLang::En, true) => "Air Only: ON",
                     (UiLang::En, false) => "Air Only: OFF",
                     (UiLang::Ru, true) => "Т.возд: ВКЛ",
                     (UiLang::Ru, false) => "Т.возд: ВЫКЛ",
-                }),
-            )));
+                },
+                true,
+                tr(lang, "Air Only Filter", "Только в воздух"),
+                tr(lang, "Only place blocks into air — preserves terrain and existing structures.", "Ставить блоки только в воздух, не разрушая рельеф и соседние постройки."),
+            ));
 
             let slice_lbl = match (lang, st.preview_slice_y) {
                 (UiLang::En, Some(sy)) => format!("3D Slice: Y<={sy}"),
@@ -1706,45 +2213,61 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                 (UiLang::Ru, None) => "Срез 3D: Весь".into(),
             };
             let slice_w = col_w - 48.0;
-            slice_toggle_btn = Some(w.add_button(Button::new([rx, body_y + 102.0, slice_w, 17.0], Text::literal(slice_lbl))));
-            let mut s_dec = Button::new([rx + slice_w + 3.0, body_y + 102.0, 21.0, 17.0], Text::literal("-"));
-            s_dec.active = st.preview_slice_y.is_some();
-            slice_dec_btn = Some(w.add_button(s_dec));
-            let mut s_inc = Button::new([rx + slice_w + 26.0, body_y + 102.0, 22.0, 17.0], Text::literal("+"));
-            s_inc.active = st.preview_slice_y.is_some();
-            slice_inc_btn = Some(w.add_button(s_inc));
+            slice_toggle_btn = Some(add_tip_btn(&mut w, &mut tooltips, [rx, body_y + 102.0, slice_w, 17.0], slice_lbl, true, tr(lang, "Hologram Y Slice", "Поэтажный срез 3D"), tr(lang, "Cut the 3D hologram horizontally to inspect interior rooms and floors.", "Включить горизонтальный срез голограммы для просмотра комнат и этажей.")));
+            slice_dec_btn = Some(add_tip_btn(&mut w, &mut tooltips, [rx + slice_w + 3.0, body_y + 102.0, 21.0, 17.0], "-", st.preview_slice_y.is_some(), tr(lang, "Lower Slice Y", "Срез ниже"), tr(lang, "Move 3D cutaway height down by 1 block.", "Опустить уровень горизонтального среза 3D-голограммы на 1 блок.")));
+            slice_inc_btn = Some(add_tip_btn(&mut w, &mut tooltips, [rx + slice_w + 26.0, body_y + 102.0, 22.0, 17.0], "+", st.preview_slice_y.is_some(), tr(lang, "Raise Slice Y", "Срез выше"), tr(lang, "Move 3D cutaway height up by 1 block.", "Поднять уровень горизонтального среза 3D-голограммы на 1 блок.")));
 
-            frame_btn = Some(w.add_button(Button::new(
+            frame_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 121.0, half_p, 16.0],
-                Text::literal(match (lang, st.show_frame_box) {
+                match (lang, st.show_frame_box) {
                     (UiLang::En, true) => "Frame: ON",
                     (UiLang::En, false) => "Frame: OFF",
                     (UiLang::Ru, true) => "Рамка: ВКЛ",
                     (UiLang::Ru, false) => "Рамка: ВЫКЛ",
-                }),
-            )));
-            collision_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Wireframe Box [H]", "Синяя рамка [H]"),
+                tr(lang, "Show or hide bounding wireframe outline independently of 3D preview.", "Показать или скрыть синюю рамку габаритов независимо от 3D-обзора."),
+            ));
+            collision_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx + half_p + 4.0, body_y + 121.0, half_p, 16.0],
-                Text::literal(match (lang, st.show_collisions) {
+                match (lang, st.show_collisions) {
                     (UiLang::En, true) => "Colls: ON",
                     (UiLang::En, false) => "Colls: OFF",
                     (UiLang::Ru, true) => "Коллиз: ВКЛ",
                     (UiLang::Ru, false) => "Коллиз: ВЫКЛ",
-                }),
-            )));
-            move_preview_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Collision Highlights", "Подсветка коллизий"),
+                tr(lang, "Highlight existing solid blocks that collide with the planned build.", "Подсвечивать коралловым цветом блоки мира, пересекающиеся с постройкой."),
+            ));
+            move_preview_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 139.0, half_p, 16.0],
-                Text::literal(tr(lang, "Move 3D [World]", "Двигать 3D")),
-            )));
-            auto_hide_btn = Some(w.add_button(Button::new(
+                tr(lang, "Move 3D [World]", "Двигать 3D"),
+                true,
+                tr(lang, "Move 3D Hologram", "Сдвиг 3D-превью"),
+                tr(lang, "Nudge hologram in-world with Arrows/IJKL, PgUp/Dn, R, [/], C & Enter to build.", "Сдвигать превью в мире стрелками/IJKL, PgUp/Dn, R, [/], C и Enter для стройки."),
+            ));
+            auto_hide_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx + half_p + 4.0, body_y + 139.0, half_p, 16.0],
-                Text::literal(match (lang, st.auto_hide_on_build) {
+                match (lang, st.auto_hide_on_build) {
                     (UiLang::En, true) => "Hide@Build: ON",
                     (UiLang::En, false) => "Hide@Build: OFF",
                     (UiLang::Ru, true) => "Автоскрыт: ВКЛ",
                     (UiLang::Ru, false) => "Автоскрыт: ВЫКЛ",
-                }),
-            )));
+                },
+                true,
+                tr(lang, "Auto-Hide After Build", "Скрывать при стройке"),
+                tr(lang, "Automatically hide frame & 3D preview when starting a build.", "Автоматически скрывать рамку и 3D-голограмму после нажатия «Сгенерировать»."),
+            ));
         }
         UiTab::DescNoise => {
             let b_gap = 3.0;
@@ -1752,34 +2275,54 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let w1 = (inner_w * 0.27).floor();
             let w2 = (inner_w * 0.26).floor();
             let w3 = inner_w - w0 - w1 - w2 - b_gap * 3.0;
-            cat_btn = Some(w.add_button(Button::new(
+            cat_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [px + pad, body_y, w0, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Type: {}", st.category.label(lang)),
                     UiLang::Ru => format!("Тип: {}", st.category.label(lang)),
-                }),
-            )));
-            style_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                format!("{}: {}", tr(lang, "Category", "Категория"), st.category.label(lang)),
+                category_tooltip_desc(st.category, lang),
+            ));
+            style_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [px + pad + w0 + b_gap, body_y, w1, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Style: {}", st.style.label(lang)),
                     UiLang::Ru => format!("Стиль: {}", st.style.label(lang)),
-                }),
-            )));
-            roof_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                format!("{}: {}", tr(lang, "Style", "Стиль"), st.style.label(lang)),
+                style_tooltip_desc(st.style, lang),
+            ));
+            roof_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [px + pad + w0 + w1 + b_gap * 2.0, body_y, w2, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Roof: {}", st.roof_choice.label(lang)),
                     UiLang::Ru => format!("Крыша: {}", st.roof_choice.label(lang)),
-                }),
-            )));
-            noise_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                format!("{}: {}", tr(lang, "Roof Shape", "Форма крыши"), st.roof_choice.label(lang)),
+                roof_tooltip_desc(st.roof_choice, lang),
+            ));
+            noise_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [px + pad + w0 + w1 + w2 + b_gap * 3.0, body_y, w3, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Noise: {}", st.noise_level.label(lang)),
                     UiLang::Ru => format!("Шум: {}", st.noise_level.label(lang)),
-                }),
-            )));
+                },
+                true,
+                format!("{}: {}", tr(lang, "Variation", "Вариативность"), st.noise_level.label(lang)),
+                noise_tooltip_desc(st.noise_level, lang),
+            ));
 
             let mut df = TextField::new([px + pad, body_y + 34.0, inner_w, 18.0], 200);
             df.set_value(&st.description);
@@ -1797,10 +2340,18 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             for (i, (label, phrase)) in quick_tags(lang).iter().enumerate() {
                 let col = (i % 4) as f32;
                 let row = (i / 4) as f32;
-                let id = w.add_button(Button::new(
+                let id = add_tip_btn(
+                    &mut w,
+                    &mut tooltips,
                     [px + pad + col * (chip_w + 4.0), body_y + 55.0 + row * 19.0, chip_w, 17.0],
-                    Text::literal(*label),
-                ));
+                    *label,
+                    true,
+                    *label,
+                    match lang {
+                        UiLang::En => format!("Append \"{phrase}\" to the text prompt for instant theme/detail."),
+                        UiLang::Ru => format!("Добавить «{phrase}» в текстовое описание постройки."),
+                    },
+                );
                 tag_buttons.push((id, *phrase));
             }
 
@@ -1816,56 +2367,87 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let nav_w = 16.0;
             let cat_btn_w = (arch_area_w - nav_w * 2.0 - 4.0).max(50.0);
 
-            prev_seed_btn = Some(w.add_button(Button::new(
+            prev_seed_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [prev_x, body_y + 95.0, 21.0, 17.0],
-                Text::literal("<"),
-            )));
+                "<",
+                true,
+                tr(lang, "Previous Seed", "Предыдущий сид"),
+                tr(lang, "Restore the previous seed from recent roll history.", "Вернуть предыдущий сид из истории генераций."),
+            ));
             let mut sf = TextField::new([sf_x, body_y + 95.0, sf_w, 17.0], 20);
             sf.set_value(&st.seed_text);
             seed_field = Some(w.add_text_field(sf));
-            new_seed_btn = Some(w.add_button(Button::new(
+            new_seed_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [ns_x, body_y + 95.0, ns_w, 17.0],
-                Text::literal(tr(lang, "New", "Новый")),
-            )));
-            auto_seed_btn = Some(w.add_button(Button::new(
+                tr(lang, "New", "Новый"),
+                true,
+                tr(lang, "Roll Random Seed", "Новый случайный сид"),
+                tr(lang, "Generate a fresh random seed to get a different layout & variation.", "Сгенерировать новый случайный сид для другой планировки."),
+            ));
+            auto_seed_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [as_x, body_y + 95.0, as_w, 17.0],
-                Text::literal(match (lang, st.auto_seed) {
+                match (lang, st.auto_seed) {
                     (UiLang::En, true) => "Seed: AUTO",
                     (UiLang::En, false) => "Seed: FIX",
                     (UiLang::Ru, true) => "Сид: АВТО",
                     (UiLang::Ru, false) => "Сид: ФИКС",
-                }),
-            )));
-            archetype_prev_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Seed Lock Mode", "Режим сида"),
+                tr(lang, "AUTO rolls a fresh seed on every build; FIX keeps this exact seed.", "АВТО меняет сид при каждой стройке; ФИКС закрепляет текущее число."),
+            ));
+            archetype_prev_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [arch_x, body_y + 95.0, nav_w, 17.0],
-                Text::literal("◀"),
-            )));
-            archetype_btn = Some(w.add_button(Button::new(
+                "◀",
+                true,
+                tr(lang, "Previous Preset", "Предыдущий пресет"),
+                tr(lang, "Step backward through all 88 built-in structure presets.", "Перейти к предыдущему пресету из встроенного каталога (88 шт.)."),
+            ));
+            let active_idx = st.archetype_idx % CLI_PRESETS.len();
+            archetype_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [arch_x + nav_w + 2.0, body_y + 95.0, cat_btn_w, 17.0],
-                Text::literal(match lang {
-                    UiLang::En => format!(
-                        "Catalog {}/{}",
-                        (st.archetype_idx % CLI_PRESETS.len()) + 1,
-                        CLI_PRESETS.len()
-                    ),
-                    UiLang::Ru => format!(
-                        "Каталог {}/{}",
-                        (st.archetype_idx % CLI_PRESETS.len()) + 1,
-                        CLI_PRESETS.len()
-                    ),
-                }),
-            )));
-            archetype_next_btn = Some(w.add_button(Button::new(
+                match lang {
+                    UiLang::En => format!("Catalog {}/{}", active_idx + 1, CLI_PRESETS.len()),
+                    UiLang::Ru => format!("Каталог {}/{}", active_idx + 1, CLI_PRESETS.len()),
+                },
+                true,
+                tr(lang, "Open Preset Catalog", "Открыть каталог (88)"),
+                match lang {
+                    UiLang::En => format!("Browse all {} curated presets. Active: #{}: {}", CLI_PRESETS.len(), active_idx + 1, CLI_PRESETS[active_idx].0),
+                    UiLang::Ru => format!("Открыть каталог из {} готовых построек. Текущий: #{}: {}", CLI_PRESETS.len(), active_idx + 1, CLI_PRESETS[active_idx].0),
+                },
+            ));
+            archetype_next_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [arch_x + nav_w + 2.0 + cat_btn_w + 2.0, body_y + 95.0, nav_w, 17.0],
-                Text::literal("▶"),
-            )));
+                "▶",
+                true,
+                tr(lang, "Next Preset", "Следующий пресет"),
+                tr(lang, "Step forward through all 88 built-in structure presets.", "Перейти к следующему пресету из встроенного каталога (88 шт.)."),
+            ));
 
             let tog_w = ((inner_w - 12.0) / 5.0).floor();
             for (idx, (lbl, _, _)) in toggle_meta(lang).iter().enumerate() {
-                let id = w.add_button(Button::new(
+                let id = add_tip_btn(
+                    &mut w,
+                    &mut tooltips,
                     [px + pad + idx as f32 * (tog_w + 3.0), body_y + 115.0, tog_w, 17.0],
-                    Text::literal(format!("{}:{}", lbl, st.toggles[idx].badge(lang))),
-                ));
+                    format!("{}:{}", lbl, st.toggles[idx].badge(lang)),
+                    true,
+                    *lbl,
+                    toggle_tooltip_desc(idx, st.toggles[idx], lang),
+                );
                 feature_toggles.push((id, idx));
             }
 
@@ -1885,32 +2467,50 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                     UiLang::Ru => format!("Биом: {bname} ✓"),
                 }
             };
-            biome_btn = Some(w.add_button(Button::new([px + pad, row_y, bw, 17.0], Text::literal(biome_txt))));
+            biome_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
+                [px + pad, row_y, bw, 17.0],
+                biome_txt,
+                true,
+                tr(lang, "Live World Biome Sync", "Адаптация к биому"),
+                tr(lang, "Inspect your current biome so Auto style & roads match local stone/wood/sand.", "Определяет текущий биом мира для стиля «Авто», дорог и палитры."),
+            ));
 
             let step_w = 15.0;
             let wx = px + pad + bw + gap3;
-            wear_dec_btn = Some(w.add_button(Button::new([wx, row_y, step_w, 17.0], Text::literal("-"))));
+            wear_dec_btn = Some(add_tip_btn(&mut w, &mut tooltips, [wx, row_y, step_w, 17.0], "-", true, tr(lang, "Less Wear", "Меньше износа"), tr(lang, "Decrease ruin aging & erosion by 15%.", "Уменьшить процент обветшания и руин на 15%.")));
             let wear_lbl = match lang {
                 UiLang::En => format!("Wear: {}%", st.wear_pct),
                 UiLang::Ru => format!("Износ: {}%", st.wear_pct),
             };
-            wear_btn = Some(w.add_button(Button::new(
+            wear_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [wx + step_w + 1.0, row_y, (ww - step_w * 2.0 - 2.0).max(40.0), 17.0],
-                Text::literal(wear_lbl),
-            )));
-            wear_inc_btn = Some(w.add_button(Button::new([wx + ww - step_w, row_y, step_w, 17.0], Text::literal("+"))));
+                wear_lbl,
+                true,
+                tr(lang, "Wear & Ruin Aging", "Износ и разрушение"),
+                tr(lang, "Cracked stone, oxidized copper, shattered glass, rubble & cobwebs (0-100%).", "Трещины, окисление меди, битые стёкла, обрушения и паутина (0-100%)."),
+            ));
+            wear_inc_btn = Some(add_tip_btn(&mut w, &mut tooltips, [wx + ww - step_w, row_y, step_w, 17.0], "+", true, tr(lang, "More Wear", "Больше износа"), tr(lang, "Increase ruin aging & erosion by 15%.", "Увеличить процент обветшания и руин на 15%.")));
 
             let ox = wx + ww + gap3;
-            over_dec_btn = Some(w.add_button(Button::new([ox, row_y, step_w, 17.0], Text::literal("-"))));
+            over_dec_btn = Some(add_tip_btn(&mut w, &mut tooltips, [ox, row_y, step_w, 17.0], "-", true, tr(lang, "Less Overgrowth", "Меньше зелени"), tr(lang, "Decrease vines, moss & wild flora by 15%.", "Уменьшить зарастание мхом и лианами на 15%.")));
             let over_lbl = match lang {
                 UiLang::En => format!("Moss: {}%", st.overgrowth_pct),
                 UiLang::Ru => format!("Зелень: {}%", st.overgrowth_pct),
             };
-            over_btn = Some(w.add_button(Button::new(
+            over_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [ox + step_w + 1.0, row_y, (ow - step_w * 2.0 - 2.0).max(40.0), 17.0],
-                Text::literal(over_lbl),
-            )));
-            over_inc_btn = Some(w.add_button(Button::new([ox + ow - step_w, row_y, step_w, 17.0], Text::literal("+"))));
+                over_lbl,
+                true,
+                tr(lang, "Overgrowth & Flora", "Зарастание зеленью"),
+                tr(lang, "Climbing vines, biome-aware moss, flowering leaves & foliage (0-100%).", "Плети лоз, биомный мох, цветущая листва и кустарники (0-100%)."),
+            ));
+            over_inc_btn = Some(add_tip_btn(&mut w, &mut tooltips, [ox + ow - step_w, row_y, step_w, 17.0], "+", true, tr(lang, "More Overgrowth", "Больше зелени"), tr(lang, "Increase vines, moss & wild flora by 15%.", "Увеличить зарастание мхом и лианами на 15%.")));
         }
         UiTab::Materials => {
             let lx = px + pad;
@@ -1918,39 +2518,75 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let top_w1 = (inner_w * 0.21).floor();
             let top_w2 = (inner_w * 0.22).floor();
             let top_w3 = inner_w - top_w0 - top_w1 - top_w2 - 9.0;
-            mat_preset_btn = Some(w.add_button(Button::new(
+            mat_preset_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx, body_y, top_w0, 17.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Palette: {}", st.palette.display_name(lang)),
                     UiLang::Ru => format!("Палитра: {}", st.palette.display_name(lang)),
-                }),
-            )));
+                },
+                true,
+                tr(lang, "Palette Preset", "Пресет палитры"),
+                tr(
+                    lang,
+                    "Cycle curated architectural material presets across all 30 slots.",
+                    "Перебирать готовые цветовые наборы архитектуры для всех 30 слотов.",
+                ),
+            ));
             let infer_lbl = match (lang, st.palette_manual) {
                 (UiLang::En, true) => "From Text",
                 (UiLang::En, false) => "From Text ✓",
                 (UiLang::Ru, true) => "По тексту",
                 (UiLang::Ru, false) => "По тексту ✓",
             };
-            mat_infer_btn = Some(w.add_button(Button::new(
+            mat_infer_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx + top_w0 + 3.0, body_y, top_w1, 17.0],
-                Text::literal(infer_lbl),
-            )));
-            mat_sync_wood_btn = Some(w.add_button(Button::new(
+                infer_lbl,
+                true,
+                tr(lang, "Infer from Prompt & Style", "Подбор по тексту и стилю"),
+                tr(
+                    lang,
+                    "Reset manual slot tweaks and auto-pick materials from your description, style & biome.",
+                    "Сбросить ручные правки и автоматически подобрать блоки по тексту, стилю и биому.",
+                ),
+            ));
+            mat_sync_wood_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx + top_w0 + top_w1 + 6.0, body_y, top_w2, 17.0],
-                Text::literal(match (lang, st.auto_sync_wood) {
+                match (lang, st.auto_sync_wood) {
                     (UiLang::En, true) => "Wood ✓",
                     (UiLang::En, false) => "Wood ✗",
                     (UiLang::Ru, true) => "Дерево ✓",
                     (UiLang::Ru, false) => "Дерево ✗",
-                }),
-            )));
-            mat_mix_mode_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Sync Matching Wood Set", "Синхронизация древесины"),
+                tr(
+                    lang,
+                    "When picking a plank or log, auto-match doors, fences, slabs, gates & trapdoors.",
+                    "При смене досок или брёвен автоматически подбирать двери, заборы, люки и плиты той же породы.",
+                ),
+            ));
+            mat_mix_mode_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx + top_w0 + top_w1 + top_w2 + 9.0, body_y, top_w3, 17.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Mix: {}", st.palette.mix_mode.label(lang)),
                     UiLang::Ru => format!("Микс: {}", st.palette.mix_mode.label(lang)),
-                }),
-            )));
+                },
+                true,
+                tr(lang, "Multi-Block Mix Mode", "Режим смешивания"),
+                tr(
+                    lang,
+                    "Cycle how multi-block lists blend: Patches, Scatter, Stripes, or Checker.",
+                    "Выбор узора смешивания блоков из списка слота: Пятна, Россыпь, Полосы, Шахматка.",
+                ),
+            ));
 
             let body_h = (foot_y - 25.0 - body_y).max(162.0);
             let cols_y = body_y + 20.0;
@@ -1961,7 +2597,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let right_w = inner_w - left_w - gap;
             let sb_w = 10.0;
 
-            // Left column: Smooth scrollable list of all 30 slots (NO pages!)
+            // Left column: Smooth scrollable list of all 30 slots (NO tooltips on materials!)
             let slot_row_h = 16.0;
             let slot_vis_rows = ((cols_h / slot_row_h).floor() as usize).clamp(7, 11);
             let slot_max_scroll = MaterialPalette::SLOT_COUNT.saturating_sub(slot_vis_rows);
@@ -1996,13 +2632,24 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             }
             let s_sb_x = lx + slot_area_w + 2.0;
             let s_sb_h = (slot_vis_rows as f32) * slot_row_h - 1.0;
-            let mut s_up = Button::new([s_sb_x, cols_y, sb_w, 12.0], Text::literal("▲"));
-            s_up.active = slot_scroll > 0;
-            mat_slot_up_btn = Some(w.add_button(s_up));
-            let mut s_dn =
-                Button::new([s_sb_x, cols_y + s_sb_h - 12.0, sb_w, 12.0], Text::literal("▼"));
-            s_dn.active = slot_scroll < slot_max_scroll;
-            mat_slot_down_btn = Some(w.add_button(s_dn));
+            mat_slot_up_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
+                [s_sb_x, cols_y, sb_w, 12.0],
+                "▲",
+                slot_scroll > 0,
+                tr(lang, "Scroll Slots Up", "Прокрутка вверх"),
+                tr(lang, "Scroll architectural slot list up.", "Прокрутить список слотов вверх."),
+            ));
+            mat_slot_down_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
+                [s_sb_x, cols_y + s_sb_h - 12.0, sb_w, 12.0],
+                "▼",
+                slot_scroll < slot_max_scroll,
+                tr(lang, "Scroll Slots Down", "Прокрутка вниз"),
+                tr(lang, "Scroll architectural slot list down.", "Прокрутить список слотов вниз."),
+            ));
             slot_scroll_zone = Some(ScrollZone {
                 viewport: [lx, cols_y, left_w, s_sb_h],
                 track: [s_sb_x, cols_y + 13.0, sb_w, (s_sb_h - 26.0).max(8.0)],
@@ -2015,26 +2662,49 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let slot_blocks = st.palette.slot_blocks(st.selected_mat_slot);
             tab3_header_pos = Some([rx, cols_y + 3.0]);
             let reset_w = 64.0;
-            let mut rst_b = Button::new(
+            list_clear_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx + right_w - reset_w, cols_y, reset_w, 15.0],
-                Text::literal(tr(lang, "Reset to 1", "Сброс до 1")),
-            );
-            rst_b.active = slot_blocks.len() > 1;
-            list_clear_btn = Some(w.add_button(rst_b));
+                tr(lang, "Reset to 1", "Сброс до 1"),
+                slot_blocks.len() > 1,
+                tr(lang, "Reset Slot to 1 Block", "Сбросить до 1 блока"),
+                tr(
+                    lang,
+                    "Remove all extra blocks from this slot list and keep only #1.",
+                    "Удалить дополнительные варианты блоков в этом слоте, оставив только первый.",
+                ),
+            ));
 
             let act_y = cols_y + cols_h - 16.0;
             let add_w = (right_w * 0.62).floor();
             let pop_w = right_w - add_w - 3.0;
-            picker_add_open_btn = Some(w.add_button(Button::new(
+            picker_add_open_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, act_y, add_w, 16.0],
-                Text::literal(tr(lang, "+ Expand (Menu)", "+ Расширить (Меню)")),
-            )));
-            let mut pop_b = Button::new(
+                tr(lang, "+ Expand (Menu)", "+ Расширить (Меню)"),
+                true,
+                tr(lang, "Open Block Picker", "Открыть каталог блоков"),
+                tr(
+                    lang,
+                    "Open dedicated searchable block menu to add variants into this slot.",
+                    "Открыть окно поиска и выбора блоков для добавления в текущий слот.",
+                ),
+            ));
+            list_pop_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx + add_w + 3.0, act_y, pop_w, 16.0],
-                Text::literal(tr(lang, "- Remove", "- Убрать")),
-            );
-            pop_b.active = slot_blocks.len() > 1;
-            list_pop_btn = Some(w.add_button(pop_b));
+                tr(lang, "- Remove", "- Убрать"),
+                slot_blocks.len() > 1,
+                tr(lang, "Remove Last Block", "Убрать последний блок"),
+                tr(
+                    lang,
+                    "Pop the last block out of this slot's mix list.",
+                    "Удалить последний добавленный блок из списка этого слота.",
+                ),
+            ));
 
             let list_y = cols_y + 18.0;
             let list_avail_h = (act_y - 3.0 - list_y).max(64.0);
@@ -2066,13 +2736,24 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             }
             let l_sb_x = rx + item_area_w + 2.0;
             let l_sb_h = (list_vis_rows as f32) * list_row_h - 1.0;
-            let mut l_up = Button::new([l_sb_x, list_y, sb_w, 12.0], Text::literal("▲"));
-            l_up.active = list_scroll > 0;
-            list_up_btn = Some(w.add_button(l_up));
-            let mut l_dn =
-                Button::new([l_sb_x, list_y + l_sb_h - 12.0, sb_w, 12.0], Text::literal("▼"));
-            l_dn.active = list_scroll < list_max_scroll;
-            list_down_btn = Some(w.add_button(l_dn));
+            list_up_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
+                [l_sb_x, list_y, sb_w, 12.0],
+                "▲",
+                list_scroll > 0,
+                tr(lang, "Scroll List Up", "Прокрутка вверх"),
+                tr(lang, "Scroll slot block list up.", "Прокрутить список блоков слота вверх."),
+            ));
+            list_down_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
+                [l_sb_x, list_y + l_sb_h - 12.0, sb_w, 12.0],
+                "▼",
+                list_scroll < list_max_scroll,
+                tr(lang, "Scroll List Down", "Прокрутка вниз"),
+                tr(lang, "Scroll slot block list down.", "Прокрутить список блоков слота вниз."),
+            ));
             list_scroll_zone = Some(ScrollZone {
                 viewport: [rx, list_y, right_w, l_sb_h],
                 track: [l_sb_x, list_y + 13.0, sb_w, (l_sb_h - 26.0).max(8.0)],
@@ -2088,24 +2769,42 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             let right_w = inner_w - half_w - 6.0;
 
             // Section 1: Living Interiors 2.0 + Outer Terrain Smoothing
-            living_decor_btn = Some(w.add_button(Button::new(
+            living_decor_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx, body_y + 17.0, half_w, 19.0],
-                Text::literal(match (lang, st.living_decor) {
+                match (lang, st.living_decor) {
                     (UiLang::En, true) => "Living Decor: ON",
                     (UiLang::En, false) => "Living Decor: OFF",
                     (UiLang::Ru, true) => "Живой декор: ВКЛ",
                     (UiLang::Ru, false) => "Живой декор: ВЫКЛ",
-                }),
-            )));
-            spawn_npcs_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Living Interiors 2.0", "Живые интерьеры 2.0"),
+                tr(
+                    lang,
+                    "Add heraldic banners, readable lectern books, streetlamps, signs, pressure plates & dungeon traps.",
+                    "Добавляет геральдические знамёна, читаемые книги на кафедрах, ночные фонари, таблички и механизмы.",
+                ),
+            ));
+            spawn_npcs_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 17.0, right_w, 19.0],
-                Text::literal(match (lang, st.spawn_npcs) {
+                match (lang, st.spawn_npcs) {
                     (UiLang::En, true) => "Spawn NPCs/Mobs: ON",
                     (UiLang::En, false) => "Spawn NPCs/Mobs: OFF",
                     (UiLang::Ru, true) => "Спавн NPC/Мобов: ВКЛ",
                     (UiLang::Ru, false) => "Спавн NPC/Мобов: ВЫКЛ",
-                }),
-            )));
+                },
+                true,
+                tr(lang, "NPC & Livestock Spawning", "Спавн жителей и мобов"),
+                tr(
+                    lang,
+                    "Populate villagers, golems, barn animals & dungeon guards (cleanly removed on Undo).",
+                    "Заселяет жителей, големов, скот на фермы и стражей в данжи (полностью удаляются при Undo).",
+                ),
+            ));
 
             let blend_lbl = match (lang, st.blend_radius) {
                 (UiLang::En, 0) => "Edge Blend: Off".to_owned(),
@@ -2113,50 +2812,99 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
                 (UiLang::Ru, 0) => "Сглаж. краёв: Выкл".to_owned(),
                 (UiLang::Ru, r) => format!("Сглаж. краёв: {r}"),
             };
-            blend_radius_btn = Some(w.add_button(Button::new(
+            blend_radius_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx, body_y + 40.0, half_w, 19.0],
-                Text::literal(blend_lbl),
-            )));
-            terrain_btn = Some(w.add_button(Button::new(
+                blend_lbl,
+                true,
+                tr(lang, "Smooth Radial Edge Blend", "Радиальное сглаживание краёв"),
+                tr(
+                    lang,
+                    "Smoothly merge ground & roads into surrounding terrain (0–10 blocks radius) using biome blocks.",
+                    "Плавно вписывает основание постройки и дорог в окружающий ландшафт в радиусе 0–10 блоков.",
+                ),
+            ));
+            terrain_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 40.0, right_w, 19.0],
-                Text::literal(match (lang, st.adapt_terrain) {
+                match (lang, st.adapt_terrain) {
                     (UiLang::En, true) => "Terrain: ON",
                     (UiLang::En, false) => "Terrain: OFF",
                     (UiLang::Ru, true) => "Рельеф: ВКЛ",
                     (UiLang::Ru, false) => "Рельеф: ВЫКЛ",
-                }),
-            )));
+                },
+                true,
+                tr(lang, "Terrain Adaptation", "Адаптация к рельефу"),
+                tr(
+                    lang,
+                    "Extend masonry skirts, road beds & water stilts seamlessly down onto uneven terrain.",
+                    "Вытягивает фундаменты, насыпи дорог и сваи к реальным перепадам высоты и воде.",
+                ),
+            ));
 
             // Section 2: 2-Point Road & Auto-Bridge Connector
-            road_width_btn = Some(w.add_button(Button::new(
+            road_width_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx, body_y + 94.0, half_w, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Road Width: {}", st.road_width),
                     UiLang::Ru => format!("Ширина дороги: {}", st.road_width),
-                }),
-            )));
-            road_auto_bridge_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Road Width (3 / 5 blocks)", "Ширина дороги (3 / 5)"),
+                tr(
+                    lang,
+                    "Switch between 3-block village lane and wide 5-block highway/avenue.",
+                    "Переключает ширину дороги между узкой (3 бл.) и широким проспектом (5 бл.).",
+                ),
+            ));
+            road_auto_bridge_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [rx, body_y + 94.0, right_w, 18.0],
-                Text::literal(match (lang, st.road_auto_bridge) {
+                match (lang, st.road_auto_bridge) {
                     (UiLang::En, true) => "Auto-Bridge: ON",
                     (UiLang::En, false) => "Auto-Bridge: OFF",
                     (UiLang::Ru, true) => "Авто-мост: ВКЛ",
                     (UiLang::Ru, false) => "Авто-мост: ВЫКЛ",
-                }),
-            )));
-            road_style_btn = Some(w.add_button(Button::new(
+                },
+                true,
+                tr(lang, "Automatic River Bridges", "Авто-мост через воду"),
+                tr(
+                    lang,
+                    "Automatically span rivers and channels with arched piers, railings & style lanterns.",
+                    "Автоматически строит арочный мост со сваями, перилами и фонарями над водой.",
+                ),
+            ));
+            road_style_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
                 [lx, body_y + 115.0, half_w, 18.0],
-                Text::literal(match lang {
+                match lang {
                     UiLang::En => format!("Style: {}", st.style.label(lang)),
                     UiLang::Ru => format!("Стиль: {}", st.style.label(lang)),
-                }),
-            )));
+                },
+                true,
+                format!("{}: {}", tr(lang, "Road Style", "Стиль дороги"), st.style.label(lang)),
+                style_tooltip_desc(st.style, lang),
+            ));
 
-            let r_rect = [lx, body_y + 136.0, inner_w, 21.0];
-            road_connect_btn = Some(w.add_button(Button::new(
-                r_rect,
-                Text::literal(tr(lang, "Connect Road (2 Points)", "Проложить дорогу (2 точки)")),
-            )));
+            road_connect_btn = Some(add_tip_btn(
+                &mut w,
+                &mut tooltips,
+                [lx, body_y + 136.0, inner_w, 21.0],
+                tr(lang, "Connect Road (2 Points)", "Проложить дорогу (2 точки)"),
+                true,
+                tr(lang, "Connect Two Points by Road", "Проложить дорогу по 2 точкам"),
+                tr(
+                    lang,
+                    "Pick Start and End points in world to pathfind a smooth styled road & auto-bridge.",
+                    "Укажите Старт и Финиш в мире — алгоритм проложит дорогу выбранного стиля с мостами.",
+                ),
+            ));
         }
     }
     }
@@ -2169,14 +2917,32 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     let redo_w = (inner_w * 0.19).floor();
     let close_w = inner_w - gen_w - reroll_w - undo_w - redo_w - gap * 4.0;
 
-    let generate_btn = w.add_button(Button::new(
+    let generate_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [px + pad, foot_y, gen_w, 20.0],
-        Text::literal(tr(lang, "GENERATE", "СГЕНЕРИРОВАТЬ")),
-    ));
-    let reroll_btn = w.add_button(Button::new(
+        tr(lang, "GENERATE", "СГЕНЕРИРОВАТЬ"),
+        true,
+        tr(lang, "Generate Structure", "Построить здание"),
+        tr(
+            lang,
+            "Build the configured structure in the selected world area (prompts area pick if unset).",
+            "Возвести постройку в выбранной зоне мира (если зона не задана, откроет выделение).",
+        ),
+    );
+    let reroll_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [px + pad + gen_w + gap, foot_y, reroll_w, 20.0],
-        Text::literal(tr(lang, "Reroll", "Заново")),
-    ));
+        tr(lang, "Reroll", "Заново"),
+        true,
+        tr(lang, "Reroll at Same Spot", "Перегенерировать здесь же"),
+        tr(
+            lang,
+            "Undo the last structure and rebuild it in the exact same spot with a new seed.",
+            "Откатить последнюю постройку и сразу возвести новую версию на том же месте.",
+        ),
+    );
     let undo_label = if st.undo_count > 0 {
         match lang {
             UiLang::En => format!("Undo ({})", st.undo_count),
@@ -2185,10 +2951,19 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     } else {
         tr(lang, "Undo", "Отмена").into()
     };
-    let undo_btn = w.add_button(Button::new(
+    let undo_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [px + pad + gen_w + reroll_w + gap * 2.0, foot_y, undo_w, 20.0],
-        Text::literal(undo_label),
-    ));
+        undo_label,
+        true,
+        tr(lang, "Undo Last Build", "Отменить постройку"),
+        tr(
+            lang,
+            "Restore previous terrain blocks and remove spawned NPCs/decor (persists across restarts, up to 5 steps).",
+            "Восстановить исходные блоки и убрать заспавненных NPC (история до 5 шагов сохраняется на диск).",
+        ),
+    );
     let redo_label = if st.redo_count > 0 {
         match lang {
             UiLang::En => format!("Redo ({})", st.redo_count),
@@ -2197,19 +2972,37 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
     } else {
         tr(lang, "Redo", "Возврат").into()
     };
-    let redo_btn = w.add_button(Button::new(
+    let redo_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [px + pad + gen_w + reroll_w + undo_w + gap * 3.0, foot_y, redo_w, 20.0],
-        Text::literal(redo_label),
-    ));
-    let close_btn = w.add_button(Button::new(
+        redo_label,
+        true,
+        tr(lang, "Redo Undone Build", "Вернуть постройку"),
+        tr(
+            lang,
+            "Re-apply the last undone structure or road build from history.",
+            "Повторно применить отменённую постройку или дорогу из истории.",
+        ),
+    );
+    let close_btn = add_tip_btn(
+        &mut w,
+        &mut tooltips,
         [
             px + pad + gen_w + reroll_w + undo_w + redo_w + gap * 4.0,
             foot_y,
             close_w,
             20.0,
         ],
-        Text::literal(tr(lang, "Close", "Закрыть")),
-    ));
+        tr(lang, "Close", "Закрыть"),
+        true,
+        tr(lang, "Close Menu [F8 / Esc]", "Закрыть меню [F8 / Esc]"),
+        tr(
+            lang,
+            "Close Building Generator menu while keeping your area, settings & 3D preview active.",
+            "Скрыть меню; выделенная область, настройки и 3D-превью останутся активны.",
+        ),
+    );
 
     BuiltScreen {
         size,
@@ -2321,6 +3114,7 @@ fn build_screen(st: &ClientUiState, size: [f32; 2]) -> BuiltScreen {
             redo_btn,
             close_btn,
         },
+        tooltips,
         slot_scroll_zone,
         list_scroll_zone,
         picker_scroll_zone,
@@ -4259,6 +5053,7 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
                 .is_none_or(|s| (s.size[0] - size[0]).abs() > 0.5 || (s.size[1] - size[1]).abs() > 0.5)
         {
             st.screen = Some(build_screen(st, size));
+            st.hover_widget = None;
             st.dirty = false;
         }
 
@@ -4593,6 +5388,19 @@ pub fn on_screen_render_post(host: &dyn ClientHost, event: &mut ScreenRenderPost
             event.draw.fill([bar_x, bar_y, fill_w, 6.0], 0xFF38_BDF8);
         }
         event.draw.text(&st.status, [px + pad, foot_y - 12.0], 0xFF34_D399, false);
+
+        let hovered_tip = resolve_hovered_tooltip(&screen.tooltips, event.screen.mouse)
+            .map(|t| (t.id, t.title.clone(), t.desc.clone()));
+        let hovered_id = hovered_tip.as_ref().map(|(id, _, _)| *id);
+        if hover_tooltip_ready(
+            &mut st.hover_widget,
+            &mut st.hover_since_ms,
+            hovered_id,
+            host.millis(),
+        ) && let Some((_, title, desc)) = hovered_tip
+        {
+            draw_tooltip_popup(&mut *event.draw, event.screen.mouse, size, &title, &desc);
+        }
     });
 }
 
@@ -5756,5 +6564,137 @@ pub fn on_submit_custom_geometry(
     }
     if !quads.is_empty() {
         let _ = event.draw.quads(&quads);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_audit_menu_tooltips() {
+    let screen_sz = [480.0, 290.0];
+    let has_tip = |scr: &BuiltScreen, id: Option<WidgetId>| -> bool {
+        let Some(wid) = id else { return true };
+        scr.tooltips.iter().any(|t| t.id == wid && !t.desc.is_empty())
+    };
+    let assert_has_tip = |scr: &BuiltScreen, id: WidgetId, name: &str| {
+        assert!(
+            scr.tooltips.iter().any(|t| t.id == id && !t.desc.is_empty()),
+            "Missing tooltip on menu button '{name}'"
+        );
+    };
+
+    for lang in [UiLang::En, UiLang::Ru] {
+        // 1. All 4 main tabs
+        for tab in [UiTab::SizeArea, UiTab::DescNoise, UiTab::Materials, UiTab::WorldDecor] {
+            let mut st = ClientUiState::default();
+            st.lang = lang;
+            st.tab = tab;
+            st.favorites.push(current_saved_preset(&st, "fav1".into()));
+            let scr = build_screen(&st, screen_sz);
+            let h = &scr.handles;
+
+            assert_has_tip(&scr, h.bom_btn, "bom_btn");
+            assert_has_tip(&scr, h.lang_btn, "lang_btn");
+            assert_has_tip(&scr, h.tab_size.unwrap(), "tab_size");
+            assert_has_tip(&scr, h.tab_desc.unwrap(), "tab_desc");
+            assert_has_tip(&scr, h.tab_mats.unwrap(), "tab_mats");
+            assert_has_tip(&scr, h.tab_world.unwrap(), "tab_world");
+            assert_has_tip(&scr, h.generate_btn, "generate_btn");
+            assert_has_tip(&scr, h.reroll_btn, "reroll_btn");
+            assert_has_tip(&scr, h.undo_btn, "undo_btn");
+            assert_has_tip(&scr, h.redo_btn, "redo_btn");
+            assert_has_tip(&scr, h.close_btn, "close_btn");
+
+            for opt in [
+                h.w_dec, h.w_inc, h.d_dec, h.d_inc, h.h_dec, h.h_inc,
+                h.preset_small, h.preset_med, h.preset_large, h.preset_tower,
+                h.place_front, h.pick_world, h.rotate_btn, h.y_dec_btn, h.y_inc_btn,
+                h.terrain_btn, h.preview_btn, h.air_only_btn,
+                h.slice_toggle_btn, h.slice_dec_btn, h.slice_inc_btn,
+                h.frame_btn, h.collision_btn, h.move_preview_btn, h.auto_hide_btn,
+                h.fav_save_btn, h.fav_load_btn, h.fav_del_btn,
+                h.share_copy_btn, h.share_paste_btn,
+                h.cat_btn, h.style_btn, h.roof_btn,
+                h.prev_seed_btn, h.new_seed_btn, h.auto_seed_btn,
+                h.archetype_prev_btn, h.archetype_btn, h.archetype_next_btn,
+                h.noise_btn, h.biome_btn,
+                h.wear_dec_btn, h.wear_btn, h.wear_inc_btn,
+                h.over_dec_btn, h.over_btn, h.over_inc_btn,
+                h.mat_preset_btn, h.mat_infer_btn, h.mat_sync_wood_btn, h.mat_mix_mode_btn,
+                h.mat_slot_up_btn, h.mat_slot_down_btn,
+                h.list_clear_btn, h.list_up_btn, h.list_down_btn,
+                h.picker_add_open_btn, h.list_pop_btn,
+                h.living_decor_btn, h.spawn_npcs_btn, h.blend_radius_btn,
+                h.road_width_btn, h.road_auto_bridge_btn, h.road_style_btn, h.road_connect_btn,
+            ] {
+                assert!(has_tip(&scr, opt), "Missing tooltip on active tab {:?} button", tab);
+            }
+            for &(tid, _) in &h.tag_buttons {
+                assert_has_tip(&scr, tid, "tag_button");
+            }
+            for &(fid, _) in &h.feature_toggles {
+                assert_has_tip(&scr, fid, "feature_toggle");
+            }
+            // Materials & blocks MUST NOT have hover tooltips!
+            for &(mid, _) in &h.mat_slot_btns {
+                assert!(scr.tooltips.iter().all(|t| t.id != mid), "Material slot button must NOT have tooltip");
+            }
+            for &(lid, _) in &h.list_item_btns {
+                assert!(scr.tooltips.iter().all(|t| t.id != lid), "Slot block list button must NOT have tooltip");
+            }
+            for &(rid, _) in &h.list_remove_btns {
+                assert!(scr.tooltips.iter().all(|t| t.id != rid), "Slot block remove button must NOT have tooltip");
+            }
+        }
+
+        // 2. Block picker modal: functional/category buttons have tooltips; block tiles & chips do NOT!
+        let mut st_pick = ClientUiState::default();
+        st_pick.lang = lang;
+        st_pick.picker_open = true;
+        st_pick.selected_mat_slot = 1;
+        let scr_pick = build_screen(&st_pick, screen_sz);
+        let hp = &scr_pick.handles;
+        assert_has_tip(&scr_pick, hp.picker_back_btn.unwrap(), "picker_back_btn");
+        assert_has_tip(&scr_pick, hp.picker_mode_btn.unwrap(), "picker_mode_btn");
+        assert_has_tip(&scr_pick, hp.picker_catalog_btn.unwrap(), "picker_catalog_btn");
+        assert_has_tip(&scr_pick, hp.mat_mix_mode_btn.unwrap(), "mat_mix_mode_btn");
+        assert_has_tip(&scr_pick, hp.mat_search_clear_btn.unwrap(), "mat_search_clear_btn");
+        assert_has_tip(&scr_pick, hp.list_clear_btn.unwrap(), "list_clear_btn");
+        assert_has_tip(&scr_pick, hp.picker_up_btn.unwrap(), "picker_up_btn");
+        assert_has_tip(&scr_pick, hp.picker_down_btn.unwrap(), "picker_down_btn");
+        for &(fbid, _) in &hp.mat_filter_btns {
+            assert_has_tip(&scr_pick, fbid, "mat_filter_btn");
+        }
+        for (gbid, _) in &hp.picker_grid_btns {
+            assert!(scr_pick.tooltips.iter().all(|t| t.id != *gbid), "Block tile button must NOT have tooltip");
+        }
+        for &(cbid, _) in &hp.picker_chip_btns {
+            assert!(scr_pick.tooltips.iter().all(|t| t.id != cbid), "Slot block chip button must NOT have tooltip");
+        }
+
+        // 3. Preset catalog & BOM modals
+        let mut st_cat = ClientUiState::default();
+        st_cat.lang = lang;
+        st_cat.preset_picker_open = true;
+        let scr_cat = build_screen(&st_cat, screen_sz);
+        let hc = &scr_cat.handles;
+        assert_has_tip(&scr_cat, hc.preset_back_btn.unwrap(), "preset_back_btn");
+        assert_has_tip(&scr_cat, hc.preset_cat_btn.unwrap(), "preset_cat_btn");
+        assert_has_tip(&scr_cat, hc.preset_search_clear_btn.unwrap(), "preset_search_clear_btn");
+        assert_has_tip(&scr_cat, hc.preset_up_btn.unwrap(), "preset_up_btn");
+        assert_has_tip(&scr_cat, hc.preset_down_btn.unwrap(), "preset_down_btn");
+        for &(pbid, pidx) in &hc.preset_grid_btns {
+            if pidx < CLI_PRESETS.len() {
+                assert_has_tip(&scr_cat, pbid, "preset_card");
+            }
+        }
+
+        let mut st_bom = ClientUiState::default();
+        st_bom.lang = lang;
+        st_bom.bom_open = true;
+        let scr_bom = build_screen(&st_bom, screen_sz);
+        let hb = &scr_bom.handles;
+        assert_has_tip(&scr_bom, hb.bom_back_btn.unwrap(), "bom_back_btn");
+        assert_has_tip(&scr_bom, hb.bom_copy_btn.unwrap(), "bom_copy_btn");
+        assert_has_tip(&scr_bom, hb.bom_up_btn.unwrap(), "bom_up_btn");
+        assert_has_tip(&scr_bom, hb.bom_down_btn.unwrap(), "bom_down_btn");
     }
 }
