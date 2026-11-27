@@ -3,7 +3,7 @@ use mod_api::PayloadCodec;
 /// Mod version string, falling back when Horizon's prebuilt-api rustc compiles without Cargo env vars.
 pub const MOD_VERSION: &str = match option_env!("CARGO_PKG_VERSION") {
     Some(ver) => ver,
-    None => "0.7.1",
+    None => "0.7.2",
 };
 
 /// UI and chat feedback language supported by the mod (`En` default, switchable to `Ru`).
@@ -292,6 +292,66 @@ impl BuildStyle {
             Self::Desert => Self::Steampunk,
             Self::Steampunk => Self::Classical,
             Self::Classical => Self::Auto,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Auto => Self::Classical,
+            Self::Medieval => Self::Auto,
+            Self::Cottage => Self::Medieval,
+            Self::Japanese => Self::Cottage,
+            Self::Gothic => Self::Japanese,
+            Self::Nordic => Self::Gothic,
+            Self::Modern => Self::Nordic,
+            Self::Desert => Self::Modern,
+            Self::Steampunk => Self::Desert,
+            Self::Classical => Self::Steampunk,
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Medieval => "medieval",
+            Self::Cottage => "cottage",
+            Self::Japanese => "japanese",
+            Self::Gothic => "gothic",
+            Self::Nordic => "nordic",
+            Self::Modern => "modern",
+            Self::Desert => "desert",
+            Self::Steampunk => "steampunk",
+            Self::Classical => "classical",
+        }
+    }
+
+    pub fn from_slug(raw: &str) -> Option<Self> {
+        let s = raw.trim().to_lowercase();
+        if s.is_empty() {
+            return None;
+        }
+        if matches!(s.as_str(), "auto" | "авто") {
+            Some(Self::Auto)
+        } else if s.starts_with("med") || s.contains("средн") {
+            Some(Self::Medieval)
+        } else if s.starts_with("cot") || s.contains("коттед") || s.contains("сад") {
+            Some(Self::Cottage)
+        } else if s.starts_with("jap") || s.contains("япон") {
+            Some(Self::Japanese)
+        } else if s.starts_with("got") || s.contains("гот") {
+            Some(Self::Gothic)
+        } else if s.starts_with("nor") || s.contains("сканд") || s.contains("норд") {
+            Some(Self::Nordic)
+        } else if s.starts_with("mod") || s.contains("модерн") || s.contains("совр") {
+            Some(Self::Modern)
+        } else if s.starts_with("des") || s.starts_with("ori") || s.contains("пуст") || s.contains("вост") {
+            Some(Self::Desert)
+        } else if s.starts_with("ste") || s.contains("стим") {
+            Some(Self::Steampunk)
+        } else if s.starts_with("cla") || s.starts_with("rom") || s.contains("антич") || s.contains("класс") || s.contains("рим") {
+            Some(Self::Classical)
+        } else {
+            None
         }
     }
 

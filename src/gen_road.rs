@@ -3,14 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::gen_common::{
     GeneratedBlueprint, LivingEntityKind, LivingPlan, PlannedBlock, PlannedEntity, PlannedSign,
-    SignPurpose, clamp_i32, make_slab, prune_map_unsupported, resolve_connections_and_shapes,
+    SignPurpose, clamp_i32, resolve_connections_and_shapes,
 };
+use crate::gen_interior::wood_prefix_for_palette;
 use crate::generator::apply_radial_terrain_column;
 use crate::model::{
     BuildCategory, BuildStyle, CardinalFacing, MaterialPalette, NoiseLevel, RoadConnectRequest,
 };
 use crate::noise::NoiseField;
-use crate::parser::parse_description_with_biome;
+use crate::parser::{biome_style_suggestion, parse_description_with_biome};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct NavNode {
@@ -30,65 +31,314 @@ impl PartialOrd for NavNode {
     }
 }
 
-fn road_palette_for_style(style: BuildStyle) -> MaterialPalette {
-    let mut pal = MaterialPalette::preset(0);
+struct RoadStyleTheme {
+    center_primary: String,
+    center_secondary: String,
+    center_tertiary: String,
+    center_stripe: Option<String>,
+    stripe_period: usize,
+    curb: String,
+    foundation: String,
+    bridge_deck: String,
+    bridge_edge: String,
+    fence: String,
+    wall_trim: String,
+    bridge_light: String,
+    sign_wood: String,
+    custom_mix_paving: bool,
+    custom_mix_foundation: bool,
+}
+
+fn infer_style_from_palette_hint(pal: &MaterialPalette) -> Option<BuildStyle> {
+    let joined = format!(
+        "{} {} {} {}",
+        pal.name.to_lowercase(),
+        pal.paving,
+        pal.wall,
+        pal.foundation
+    );
+    if joined.contains("sandstone") || joined.contains("terracotta") || joined.contains("acacia") {
+        Some(BuildStyle::Desert)
+    } else if joined.contains("concrete") || joined.contains("iron_bars") {
+        Some(BuildStyle::Modern)
+    } else if joined.contains("quartz") || joined.contains("calcite") && !joined.contains("япон") {
+        Some(BuildStyle::Classical)
+    } else if joined.contains("cherry") || joined.contains("bamboo") || joined.contains("япон") || joined.contains("сакур") {
+        Some(BuildStyle::Japanese)
+    } else if joined.contains("blackstone") || joined.contains("nether") || joined.contains("готик") || joined.contains("магич") {
+        Some(BuildStyle::Gothic)
+    } else if joined.contains("copper") || joined.contains("стимпанк") {
+        Some(BuildStyle::Steampunk)
+    } else if joined.contains("tuff") || joined.contains("spruce") || joined.contains("сканд") || joined.contains("снег") {
+        Some(BuildStyle::Nordic)
+    } else if joined.contains("bricks") || joined.contains("коттедж") || joined.contains("берёз") {
+        Some(BuildStyle::Cottage)
+    } else {
+        None
+    }
+}
+
+fn resolve_road_style(req: &RoadConnectRequest) -> BuildStyle {
+    if req.style != BuildStyle::Auto {
+        return req.style;
+    }
+    if let Some(biome_style) = biome_style_suggestion(&req.biome_hint) {
+        return biome_style;
+    }
+    if req.palette != MaterialPalette::preset(0)
+        && let Some(pal_style) = infer_style_from_palette_hint(&req.palette)
+    {
+        return pal_style;
+    }
+    BuildStyle::Medieval
+}
+
+fn base_road_theme(style: BuildStyle, biome_hint: &str) -> RoadStyleTheme {
+    let biome_lower = biome_hint.to_lowercase();
     match style {
         BuildStyle::Desert => {
-            pal.paving = "minecraft:smooth_sandstone".into();
-            pal.foundation = "minecraft:sandstone".into();
-            pal.trim_wall = "minecraft:cut_sandstone".into();
-            pal.roof_slab = "minecraft:sandstone_slab".into();
-            pal.fence = "minecraft:birch_fence".into();
-            pal.pillar = "minecraft:cut_sandstone".into();
-            pal.wall_trim = "minecraft:sandstone_wall".into();
+            if biome_lower.contains("badlands") {
+                RoadStyleTheme {
+                    center_primary: "minecraft:smooth_red_sandstone".into(),
+                    center_secondary: "minecraft:cut_red_sandstone".into(),
+                    center_tertiary: "minecraft:terracotta".into(),
+                    center_stripe: None,
+                    stripe_period: 4,
+                    curb: "minecraft:cut_red_sandstone".into(),
+                    foundation: "minecraft:red_sandstone".into(),
+                    bridge_deck: "minecraft:smooth_red_sandstone".into(),
+                    bridge_edge: "minecraft:terracotta".into(),
+                    fence: "minecraft:acacia_fence".into(),
+                    wall_trim: "minecraft:red_sandstone_wall".into(),
+                    bridge_light: "minecraft:lantern".into(),
+                    sign_wood: "acacia".into(),
+                    custom_mix_paving: false,
+                    custom_mix_foundation: false,
+                }
+            } else {
+                RoadStyleTheme {
+                    center_primary: "minecraft:smooth_sandstone".into(),
+                    center_secondary: "minecraft:cut_sandstone".into(),
+                    center_tertiary: "minecraft:sandstone".into(),
+                    center_stripe: None,
+                    stripe_period: 4,
+                    curb: "minecraft:cut_sandstone".into(),
+                    foundation: "minecraft:sandstone".into(),
+                    bridge_deck: "minecraft:smooth_sandstone".into(),
+                    bridge_edge: "minecraft:cut_sandstone".into(),
+                    fence: "minecraft:birch_fence".into(),
+                    wall_trim: "minecraft:sandstone_wall".into(),
+                    bridge_light: "minecraft:lantern".into(),
+                    sign_wood: "acacia".into(),
+                    custom_mix_paving: false,
+                    custom_mix_foundation: false,
+                }
+            }
         }
-        BuildStyle::Modern => {
-            pal.paving = "minecraft:gray_concrete".into();
-            pal.foundation = "minecraft:deepslate_tiles".into();
-            pal.trim_wall = "minecraft:smooth_stone".into();
-            pal.roof_slab = "minecraft:smooth_stone_slab".into();
-            pal.fence = "minecraft:iron_bars".into();
-            pal.pillar = "minecraft:polished_deepslate".into();
-            pal.wall_trim = "minecraft:polished_deepslate_wall".into();
-        }
-        BuildStyle::Japanese => {
-            pal.paving = "minecraft:andesite".into();
-            pal.foundation = "minecraft:stone_bricks".into();
-            pal.trim_wall = "minecraft:polished_andesite".into();
-            pal.roof_slab = "minecraft:crimson_slab".into();
-            pal.fence = "minecraft:crimson_fence".into();
-            pal.pillar = "minecraft:crimson_planks".into();
-            pal.wall_trim = "minecraft:stone_brick_wall".into();
-        }
-        BuildStyle::Gothic | BuildStyle::Nordic | BuildStyle::Steampunk => {
-            pal.paving = "minecraft:deepslate_bricks".into();
-            pal.foundation = "minecraft:cobbled_deepslate".into();
-            pal.trim_wall = "minecraft:polished_basalt".into();
-            pal.roof_slab = "minecraft:dark_oak_slab".into();
-            pal.fence = "minecraft:dark_oak_fence".into();
-            pal.pillar = "minecraft:dark_oak_planks".into();
-            pal.wall_trim = "minecraft:deepslate_brick_wall".into();
-        }
-        BuildStyle::Classical => {
-            pal.paving = "minecraft:quartz_bricks".into();
-            pal.foundation = "minecraft:smooth_stone".into();
-            pal.trim_wall = "minecraft:calcite".into();
-            pal.roof_slab = "minecraft:quartz_slab".into();
-            pal.fence = "minecraft:pale_oak_fence".into();
-            pal.pillar = "minecraft:quartz_pillar".into();
-            pal.wall_trim = "minecraft:stone_brick_wall".into();
-        }
-        _ => {
-            pal.paving = "minecraft:cobblestone".into();
-            pal.foundation = "minecraft:stone_bricks".into();
-            pal.trim_wall = "minecraft:mossy_stone_bricks".into();
-            pal.roof_slab = "minecraft:spruce_slab".into();
-            pal.fence = "minecraft:spruce_fence".into();
-            pal.pillar = "minecraft:spruce_planks".into();
-            pal.wall_trim = "minecraft:stone_brick_wall".into();
-        }
+        BuildStyle::Modern => RoadStyleTheme {
+            center_primary: "minecraft:gray_concrete".into(),
+            center_secondary: "minecraft:black_concrete".into(),
+            center_tertiary: "minecraft:gray_concrete".into(),
+            center_stripe: Some("minecraft:white_concrete".into()),
+            stripe_period: 4,
+            curb: "minecraft:smooth_stone".into(),
+            foundation: "minecraft:polished_deepslate".into(),
+            bridge_deck: "minecraft:smooth_stone".into(),
+            bridge_edge: "minecraft:gray_concrete".into(),
+            fence: "minecraft:iron_bars".into(),
+            wall_trim: "minecraft:polished_deepslate_wall".into(),
+            bridge_light: "minecraft:sea_lantern".into(),
+            sign_wood: "pale_oak".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        BuildStyle::Japanese => RoadStyleTheme {
+            center_primary: "minecraft:andesite".into(),
+            center_secondary: "minecraft:polished_andesite".into(),
+            center_tertiary: "minecraft:gravel".into(),
+            center_stripe: Some("minecraft:polished_andesite".into()),
+            stripe_period: 3,
+            curb: "minecraft:stone_bricks".into(),
+            foundation: "minecraft:stone_bricks".into(),
+            bridge_deck: "minecraft:dark_oak_planks".into(),
+            bridge_edge: "minecraft:crimson_planks".into(),
+            fence: "minecraft:bamboo_fence".into(),
+            wall_trim: "minecraft:polished_deepslate_wall".into(),
+            bridge_light: "minecraft:lantern".into(),
+            sign_wood: "bamboo".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        BuildStyle::Gothic => RoadStyleTheme {
+            center_primary: "minecraft:deepslate_bricks".into(),
+            center_secondary: "minecraft:cracked_deepslate_bricks".into(),
+            center_tertiary: "minecraft:cobbled_deepslate".into(),
+            center_stripe: None,
+            stripe_period: 4,
+            curb: "minecraft:polished_blackstone_bricks".into(),
+            foundation: "minecraft:cobbled_deepslate".into(),
+            bridge_deck: "minecraft:deepslate_tiles".into(),
+            bridge_edge: "minecraft:polished_blackstone_bricks".into(),
+            fence: "minecraft:nether_brick_fence".into(),
+            wall_trim: "minecraft:deepslate_brick_wall".into(),
+            bridge_light: "minecraft:soul_lantern".into(),
+            sign_wood: "dark_oak".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        BuildStyle::Nordic => RoadStyleTheme {
+            center_primary: "minecraft:cobbled_deepslate".into(),
+            center_secondary: "minecraft:tuff_bricks".into(),
+            center_tertiary: "minecraft:gravel".into(),
+            center_stripe: None,
+            stripe_period: 4,
+            curb: "minecraft:tuff_bricks".into(),
+            foundation: "minecraft:tuff_bricks".into(),
+            bridge_deck: "minecraft:spruce_planks".into(),
+            bridge_edge: "minecraft:spruce_log".into(),
+            fence: "minecraft:spruce_fence".into(),
+            wall_trim: "minecraft:tuff_brick_wall".into(),
+            bridge_light: "minecraft:lantern".into(),
+            sign_wood: "spruce".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        BuildStyle::Steampunk => RoadStyleTheme {
+            center_primary: "minecraft:mud_bricks".into(),
+            center_secondary: "minecraft:polished_tuff".into(),
+            center_tertiary: "minecraft:tuff_bricks".into(),
+            center_stripe: Some("minecraft:cut_copper".into()),
+            stripe_period: 5,
+            curb: "minecraft:oxidized_cut_copper".into(),
+            foundation: "minecraft:tuff_bricks".into(),
+            bridge_deck: "minecraft:dark_oak_planks".into(),
+            bridge_edge: "minecraft:exposed_cut_copper".into(),
+            fence: "minecraft:iron_bars".into(),
+            wall_trim: "minecraft:brick_wall".into(),
+            bridge_light: "minecraft:copper_lantern".into(),
+            sign_wood: "dark_oak".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        BuildStyle::Classical => RoadStyleTheme {
+            center_primary: "minecraft:quartz_bricks".into(),
+            center_secondary: "minecraft:calcite".into(),
+            center_tertiary: "minecraft:smooth_sandstone".into(),
+            center_stripe: Some("minecraft:chiseled_quartz_block".into()),
+            stripe_period: 4,
+            curb: "minecraft:chiseled_quartz_block".into(),
+            foundation: "minecraft:smooth_stone".into(),
+            bridge_deck: "minecraft:smooth_quartz".into(),
+            bridge_edge: "minecraft:quartz_pillar".into(),
+            fence: "minecraft:pale_oak_fence".into(),
+            wall_trim: "minecraft:sandstone_wall".into(),
+            bridge_light: "minecraft:lantern".into(),
+            sign_wood: "pale_oak".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        BuildStyle::Cottage => RoadStyleTheme {
+            center_primary: "minecraft:packed_mud".into(),
+            center_secondary: "minecraft:coarse_dirt".into(),
+            center_tertiary: "minecraft:mossy_cobblestone".into(),
+            center_stripe: None,
+            stripe_period: 4,
+            curb: "minecraft:bricks".into(),
+            foundation: "minecraft:cobblestone".into(),
+            bridge_deck: "minecraft:oak_planks".into(),
+            bridge_edge: "minecraft:cobblestone".into(),
+            fence: "minecraft:oak_fence".into(),
+            wall_trim: "minecraft:cobblestone_wall".into(),
+            bridge_light: "minecraft:lantern".into(),
+            sign_wood: "oak".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
+        _ => RoadStyleTheme {
+            center_primary: "minecraft:cobblestone".into(),
+            center_secondary: "minecraft:mossy_cobblestone".into(),
+            center_tertiary: "minecraft:gravel".into(),
+            center_stripe: None,
+            stripe_period: 4,
+            curb: "minecraft:mossy_stone_bricks".into(),
+            foundation: "minecraft:stone_bricks".into(),
+            bridge_deck: "minecraft:spruce_planks".into(),
+            bridge_edge: "minecraft:stone_bricks".into(),
+            fence: "minecraft:spruce_fence".into(),
+            wall_trim: "minecraft:stone_brick_wall".into(),
+            bridge_light: "minecraft:lantern".into(),
+            sign_wood: "spruce".into(),
+            custom_mix_paving: false,
+            custom_mix_foundation: false,
+        },
     }
-    pal
+}
+
+fn build_road_theme_and_palette(
+    req: &RoadConnectRequest,
+    effective_style: BuildStyle,
+) -> (RoadStyleTheme, MaterialPalette) {
+    let mut theme = base_road_theme(effective_style, &req.biome_hint);
+    let auto_default = MaterialPalette::preset(0);
+    let style_default = MaterialPalette::preset_for_style(effective_style);
+    let has_explicit_palette = req.palette != auto_default && req.palette != style_default;
+
+    let mut pal = style_default.clone();
+    pal.paving = theme.center_primary.clone();
+    pal.foundation = theme.foundation.clone();
+    pal.trim_wall = theme.curb.clone();
+    pal.wall_trim = theme.wall_trim.clone();
+    pal.fence = theme.fence.clone();
+    pal.pillar = theme.bridge_deck.clone();
+    pal.light = theme.bridge_light.clone();
+
+    if has_explicit_palette {
+        if req.palette.paving != style_default.paving {
+            theme.center_primary = req.palette.paving.clone();
+            theme.center_secondary = req.palette.paving.clone();
+            theme.center_stripe = None;
+            pal.paving = req.palette.paving.clone();
+        }
+        if req.palette.foundation != style_default.foundation {
+            theme.foundation = req.palette.foundation.clone();
+            theme.bridge_edge = req.palette.foundation.clone();
+            pal.foundation = req.palette.foundation.clone();
+        }
+        if req.palette.wall_accent != style_default.wall_accent {
+            theme.curb = req.palette.wall_accent.clone();
+            pal.trim_wall = req.palette.wall_accent.clone();
+        }
+        if req.palette.trim_wall != style_default.trim_wall {
+            theme.wall_trim = req.palette.trim_wall.clone();
+            pal.wall_trim = req.palette.trim_wall.clone();
+        }
+        if req.palette.fence != style_default.fence {
+            theme.fence = req.palette.fence.clone();
+            pal.fence = req.palette.fence.clone();
+        }
+        if req.palette.floor != style_default.floor {
+            theme.bridge_deck = req.palette.floor.clone();
+            pal.pillar = req.palette.floor.clone();
+        }
+        if req.palette.light != style_default.light {
+            theme.bridge_light = req.palette.light.clone();
+            pal.light = req.palette.light.clone();
+        }
+        if req.palette.door != style_default.door || req.palette.fence != style_default.fence {
+            theme.sign_wood = wood_prefix_for_palette(&req.palette).to_owned();
+        }
+        if req.palette.has_extra(MaterialPalette::SLOT_PAVING) {
+            theme.custom_mix_paving = true;
+            theme.center_stripe = None;
+        }
+        if req.palette.has_extra(MaterialPalette::SLOT_FOUNDATION) {
+            theme.custom_mix_foundation = true;
+        }
+        pal.mix_mode = req.palette.mix_mode;
+        pal.extra_lists = req.palette.extra_lists.clone();
+    }
+
+    (theme, pal)
 }
 
 fn find_road_path(
@@ -235,7 +485,8 @@ pub(crate) fn generate_road_connector(
     let w = i32::from(bw.max(7));
     let d = i32::from(bd.max(7));
     let seed = req.seed as u64;
-    let pal = road_palette_for_style(req.style);
+    let effective_style = resolve_road_style(req);
+    let (rtheme, pal) = build_road_theme_and_palette(req, effective_style);
     let noise = NoiseField::new(seed);
 
     let sx = clamp_i32(req.start_x - box_origin[0], 0, w - 1);
@@ -391,46 +642,26 @@ pub(crate) fn generate_road_connector(
     let mut max_rel_y = 6i32;
     let mut min_rel_y = 0i32;
 
-    let style_center_blk = |x: i32, y: i32, z: i32, h: f64| -> PlannedBlock {
-        match req.style {
-            BuildStyle::Desert => PlannedBlock::simple(if h > 0.72 {
-                "minecraft:cut_sandstone"
-            } else {
-                "minecraft:smooth_sandstone"
-            }),
-            BuildStyle::Modern => PlannedBlock::simple(if h > 0.78 {
-                "minecraft:polished_deepslate"
-            } else {
-                "minecraft:gray_concrete"
-            }),
-            BuildStyle::Japanese => PlannedBlock::simple(if h > 0.68 {
-                "minecraft:polished_andesite"
-            } else {
-                "minecraft:andesite"
-            }),
-            BuildStyle::Gothic | BuildStyle::Nordic | BuildStyle::Steampunk => {
-                PlannedBlock::simple(if h > 0.74 {
-                    "minecraft:cracked_deepslate_bricks"
-                } else {
-                    "minecraft:deepslate_bricks"
-                })
-            }
-            BuildStyle::Classical => PlannedBlock::simple(if h > 0.75 {
-                "minecraft:calcite"
-            } else {
-                "minecraft:quartz_bricks"
-            }),
-            _ => PlannedBlock::simple(if h > 0.74 {
-                "minecraft:mossy_cobblestone".to_owned()
-            } else if h < 0.22 {
-                "minecraft:gravel".to_owned()
-            } else {
-                pal.pick(MaterialPalette::SLOT_PAVING, seed, x, y, z)
-            }),
+    let style_center_blk = |x: i32, y: i32, z: i32, h: f64, is_centerline: bool, p_idx: usize| -> PlannedBlock {
+        if rtheme.custom_mix_paving {
+            return PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PAVING, seed, x, y, z));
+        }
+        if is_centerline
+            && let Some(ref stripe) = rtheme.center_stripe
+            && (p_idx % rtheme.stripe_period) < if rtheme.stripe_period == 4 && effective_style == BuildStyle::Modern { 2 } else { 1 }
+        {
+            return PlannedBlock::simple(stripe);
+        }
+        if h > 0.74 {
+            PlannedBlock::simple(&rtheme.center_secondary)
+        } else if h < 0.20 {
+            PlannedBlock::simple(&rtheme.center_tertiary)
+        } else {
+            PlannedBlock::simple(&rtheme.center_primary)
         }
     };
 
-    for (&(x, z), &(_, ry, is_bridge, is_edge, p_idx)) in &road_cols {
+    for (&(x, z), &(d2, ry, is_bridge, is_edge, p_idx)) in &road_cols {
         let terr = surf_at(x, z);
         let wd = wd_at(x, z);
         max_rel_y = max_rel_y.max(ry + 6).max(terr + 4);
@@ -438,11 +669,11 @@ pub(crate) fn generate_road_connector(
 
         let h = noise.cell_hash(x, 0, z);
         if is_bridge {
-            // Arched bridge deck + stone piers over water + parapet rails!
+            // Arched bridge deck + style masonry/timber piers over water + parapet rails!
             let deck_blk = if is_edge {
-                PlannedBlock::simple(&pal.foundation)
+                PlannedBlock::simple(&rtheme.bridge_edge)
             } else {
-                PlannedBlock::simple(&pal.pillar)
+                PlannedBlock::simple(&rtheme.bridge_deck)
             };
             blocks.insert([x, ry, z], deck_blk);
             for ay in (ry + 1)..=(ry + 4) {
@@ -452,35 +683,41 @@ pub(crate) fn generate_road_connector(
                 if p_idx % 4 == 0 {
                     let bot = (terr - wd - 1).clamp(-26, ry - 1);
                     for py in bot..ry {
-                        blocks.insert(
-                            [x, py, z],
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, x, py, z)),
-                        );
+                        let pier_blk = if rtheme.custom_mix_foundation {
+                            pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, x, py, z)
+                        } else {
+                            rtheme.foundation.clone()
+                        };
+                        blocks.insert([x, py, z], PlannedBlock::simple(pier_blk));
                     }
-                    blocks.insert([x, ry + 1, z], PlannedBlock::simple(&pal.wall_trim));
+                    blocks.insert([x, ry + 1, z], PlannedBlock::simple(&rtheme.wall_trim));
                     if req.living_decor {
-                        blocks.insert(
-                            [x, ry + 2, z],
-                            PlannedBlock::with_props("minecraft:lantern", vec![("hanging", "false")]),
-                        );
+                        let light_pb = if crate::gen_common::is_lantern(&rtheme.bridge_light) {
+                            PlannedBlock::with_props(&rtheme.bridge_light, vec![("hanging", "false")])
+                        } else {
+                            PlannedBlock::simple(&rtheme.bridge_light)
+                        };
+                        blocks.insert([x, ry + 2, z], light_pb);
                     }
                 } else {
-                    blocks.insert([x, ry + 1, z], PlannedBlock::simple(&pal.fence));
+                    blocks.insert([x, ry + 1, z], PlannedBlock::simple(&rtheme.fence));
                 }
             }
         } else {
             // Terrain-conforming road surface + solid skirt if elevated + clean headroom!
             let lo_fill = (terr - wd - 1).clamp(-26, ry - 1);
             for fy in lo_fill..ry {
-                blocks.insert(
-                    [x, fy, z],
-                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, x, fy, z)),
-                );
+                let fill_blk = if rtheme.custom_mix_foundation {
+                    pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, x, fy, z)
+                } else {
+                    rtheme.foundation.clone()
+                };
+                blocks.insert([x, fy, z], PlannedBlock::simple(fill_blk));
             }
             let surf_blk = if is_edge {
-                PlannedBlock::simple(&pal.trim_wall)
+                PlannedBlock::simple(&rtheme.curb)
             } else {
-                style_center_blk(x, ry, z, h)
+                style_center_blk(x, ry, z, h, d2 == 0, p_idx)
             };
             blocks.insert([x, ry, z], surf_blk);
             for ay in (ry + 1)..=(terr.max(ry) + 4) {
@@ -489,9 +726,10 @@ pub(crate) fn generate_road_connector(
         }
     }
 
-    // Add automated night streetlights along dry road shoulders every 10 blocks + waypost signs at endpoints.
+    // Add automated night streetlights along dry road shoulders every 10 blocks + style-matched waypost signs at endpoints.
     let mut shoulder_lamps: BTreeSet<(i32, i32)> = BTreeSet::new();
     let offset_shoulder = (half_w.round() as i32) + 1;
+    let sign_block_id = format!("minecraft:{}_sign", rtheme.sign_wood);
     for (idx, &(px, pz)) in path.iter().enumerate() {
         let is_endpoint = idx == 0 || idx + 1 == n;
         if !is_endpoint && (idx % 10 != 5 || is_bridge_pt[idx]) {
@@ -516,13 +754,13 @@ pub(crate) fn generate_road_connector(
         let ty = surf_at(sx_sh, sz_sh);
         let post_y = ty.max(smooth_y[idx]);
         for fy in (ty.min(post_y) - 1)..=post_y {
-            blocks.insert([sx_sh, fy, sz_sh], PlannedBlock::simple(&pal.foundation));
+            blocks.insert([sx_sh, fy, sz_sh], PlannedBlock::simple(&rtheme.foundation));
         }
         if is_endpoint && req.living_decor {
-            blocks.insert([sx_sh, post_y + 1, sz_sh], PlannedBlock::simple(&pal.fence));
+            blocks.insert([sx_sh, post_y + 1, sz_sh], PlannedBlock::simple(&rtheme.fence));
             blocks.insert(
                 [sx_sh, post_y + 2, sz_sh],
-                PlannedBlock::with_props("minecraft:oak_sign", vec![("rotation", "0"), ("waterlogged", "false")]),
+                PlannedBlock::with_props(sign_block_id.clone(), vec![("rotation", "0"), ("waterlogged", "false")]),
             );
             living.signs.push(PlannedSign {
                 pos: [sx_sh, post_y + 2, sz_sh],
@@ -532,9 +770,9 @@ pub(crate) fn generate_road_connector(
             });
             shoulder_lamps.insert((sx_sh, sz_sh));
         } else if req.living_decor {
-            blocks.insert([sx_sh, post_y + 1, sz_sh], PlannedBlock::simple(&pal.wall_trim));
-            blocks.insert([sx_sh, post_y + 2, sz_sh], PlannedBlock::simple(&pal.fence));
-            blocks.insert([sx_sh, post_y + 3, sz_sh], PlannedBlock::simple(&pal.fence));
+            blocks.insert([sx_sh, post_y + 1, sz_sh], PlannedBlock::simple(&rtheme.wall_trim));
+            blocks.insert([sx_sh, post_y + 2, sz_sh], PlannedBlock::simple(&rtheme.fence));
+            blocks.insert([sx_sh, post_y + 3, sz_sh], PlannedBlock::simple(&rtheme.fence));
             blocks.insert(
                 [sx_sh, post_y + 4, sz_sh],
                 PlannedBlock::with_props("minecraft:redstone_lamp", vec![("lit", "false")]),
@@ -592,7 +830,7 @@ pub(crate) fn generate_road_connector(
                     ry,
                     max_rel_y.max(terr + 3),
                     &req.biome_hint,
-                    req.style,
+                    effective_style,
                     &pal,
                     seed,
                     noise.cell_hash(lx, 0, lz),
@@ -625,20 +863,18 @@ pub(crate) fn generate_road_connector(
         Some(water_depths),
         false,
     );
-    let _ = prune_map_unsupported;
     resolve_connections_and_shapes(&mut blocks);
-    let _ = make_slab; // keep clean if unused in style branch
 
     let mut dummy_spec = parse_description_with_biome(
         BuildCategory::Engineering,
-        req.style,
+        effective_style,
         "road connector",
         bw.clamp(7, 96),
         bd.clamp(7, 96),
         16,
         NoiseLevel::Balanced,
         seed,
-        "",
+        &req.biome_hint,
     );
     dummy_spec.living_decor = req.living_decor;
     dummy_spec.spawn_npcs = req.spawn_npcs;

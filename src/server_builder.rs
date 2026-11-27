@@ -18,8 +18,8 @@ use crate::gen_common::{
 };
 use crate::generator::{GeneratedBlueprint, PlannedBlock};
 use crate::model::{
-    BuildCategory, BuildRequest, BuildResponse, CardinalFacing, MaterialPalette, NoiseLevel,
-    RedoRequest, RerollRequest, RoadConnectRequest, SetLangRequest, UiLang, UndoRequest,
+    BuildCategory, BuildRequest, BuildResponse, BuildStyle, CardinalFacing, MaterialPalette,
+    NoiseLevel, RedoRequest, RerollRequest, RoadConnectRequest, SetLangRequest, UiLang, UndoRequest,
 };
 use crate::network::channels;
 use crate::noise::SplitMix64;
@@ -73,8 +73,22 @@ static LOADED_HISTORY_OWNERS: Mutex<Option<HashSet<u128>>> = Mutex::new(None);
 static LAST_REQUESTS: Mutex<Option<HashMap<u128, BuildRequest>>> = Mutex::new(None);
 static PENDING_JOBS: Mutex<Option<VecDeque<PendingBatchJob>>> = Mutex::new(None);
 static PLAYER_LANG: Mutex<Option<HashMap<u128, UiLang>>> = Mutex::new(None);
+static PLAYER_STYLE: Mutex<Option<HashMap<u128, (BuildStyle, MaterialPalette)>>> = Mutex::new(None);
 static LAST_BUILD_AT: Mutex<Option<HashMap<u128, Instant>>> = Mutex::new(None);
 static ROAD_CONNECT_ANCHORS: Mutex<Option<HashMap<u128, (String, [i32; 3])>>> = Mutex::new(None);
+
+fn remember_player_style(player: Option<PlayerRef>, style: BuildStyle, palette: &MaterialPalette) {
+    let key = player.map_or(0, PlayerRef::uuid);
+    let mut guard = PLAYER_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(key, (style, palette.clone()));
+}
+
+fn player_last_style(player: Option<PlayerRef>) -> Option<(BuildStyle, MaterialPalette)> {
+    let key = player.map_or(0, PlayerRef::uuid);
+    let guard = PLAYER_STYLE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|map| map.get(&key).cloned())
+}
 
 #[cfg(test)]
 pub(crate) fn clear_history_memory_cache() {
@@ -84,6 +98,11 @@ pub(crate) fn clear_history_memory_cache() {
     *HISTORY_WORLD_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if let Ok(mut g) = LOADED_HISTORY_OWNERS.lock() {
         g.get_or_insert_with(HashSet::new).clear();
+    }
+    if let Ok(mut s) = PLAYER_STYLE.lock()
+        && let Some(m) = s.as_mut()
+    {
+        m.clear();
     }
     if let Ok(mut r) = ROAD_CONNECT_ANCHORS.lock()
         && let Some(m) = r.as_mut()
@@ -1951,6 +1970,7 @@ pub fn execute_build(
         water_depths.as_deref(),
     );
     apply_outer_halo_blend(host, &req, &mut bp);
+    remember_player_style(player, req.style, &req.palette);
     with_last_requests(|map| {
         map.insert(player.map_or(0, PlayerRef::uuid), req.clone());
     });
@@ -2679,6 +2699,24 @@ pub fn execute_road_connect(
     let base_y = req.start_y.min(req.end_y);
     let box_origin = [min_x, base_y, min_z];
 
+    if req.biome_hint.is_empty() && req.style == BuildStyle::Auto {
+        let mid_x = (req.start_x + req.end_x) / 2;
+        let mid_z = (req.start_z + req.end_z) / 2;
+        let sampled = sample_biome_at(host, &req.dimension, mid_x, base_y, mid_z);
+        if !sampled.is_empty() {
+            req.biome_hint = sampled;
+            if req.palette == MaterialPalette::preset(0) {
+                req.palette = crate::parser::infer_palette_with_biome(
+                    req.style,
+                    "",
+                    req.seed as u64,
+                    &req.biome_hint,
+                );
+            }
+        }
+    }
+    remember_player_style(player, req.style, &req.palette);
+
     let mut cols = Vec::with_capacity(usize::from(bw) * usize::from(bd));
     for lz in 0..i32::from(bd) {
         for lx in 0..i32::from(bw) {
@@ -2710,9 +2748,10 @@ pub fn execute_road_connect(
     };
 
     let mut bp = crate::gen_road::generate_road_connector(&req, &offsets, &depths, box_origin, bw, bd);
+    let style_name = req.style.label(lang);
     let label = match lang {
-        UiLang::En => format!("Road ({},{})->({},{}) [w={}]", req.start_x, req.start_z, req.end_x, req.end_z, req.road_width),
-        UiLang::Ru => format!("Дорога ({},{})->({},{}) [ш={}]", req.start_x, req.start_z, req.end_x, req.end_z, req.road_width),
+        UiLang::En => format!("Road [{style_name}] ({},{})->({},{}) [w={}]", req.start_x, req.start_z, req.end_x, req.end_z, req.road_width),
+        UiLang::Ru => format!("Дорога [{style_name}] ({},{})->({},{}) [ш={}]", req.start_x, req.start_z, req.end_x, req.end_z, req.road_width),
     };
     place_blueprint_with_history(
         host,
@@ -3115,6 +3154,10 @@ pub fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
         "buildgen road <x1:integer> <z1:integer> <x2:integer> <z2:integer> <width:integer>",
         2,
     ));
+    event.commands.push(Command::op(
+        "buildgen road <x1:integer> <z1:integer> <x2:integer> <z2:integer> <width:integer> <style:text>",
+        2,
+    ));
 }
 
 pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
@@ -3155,6 +3198,20 @@ pub fn tab_complete(event: &mut TabCompleteEvent<'_>) {
             String::new()
         };
         for &(slug, _, _, _, _, _, _) in CLI_PRESETS {
+            if slug.starts_with(&prefix) && !event.suggestions.iter().any(|s| s.text == slug) {
+                event.suggestions.push(mod_api::Suggestion::new(range, slug));
+            }
+        }
+    } else if parts.get(1).copied() == Some("road")
+        && (parts.len() > 7 || (parts.len() == 7 && (ends_with_space || !parts[6].is_empty())))
+    {
+        let prefix = if parts.len() >= 8 && !ends_with_space {
+            parts[7].to_lowercase()
+        } else {
+            String::new()
+        };
+        for st in BuildStyle::ALL {
+            let slug = st.slug();
             if slug.starts_with(&prefix) && !event.suggestions.iter().any(|s| s.text == slug) {
                 event.suggestions.push(mod_api::Suggestion::new(range, slug));
             }
@@ -3255,11 +3312,11 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
         Some("help") => {
             let _ = host.commands().feedback(Text::literal(match lang {
                 UiLang::En => format!(
-                    "Building Generator v{}: F8 or /buildgen | /buildgen lang <en|ru> | /buildgen preset <name> | /buildgen generate <desc> | /buildgen size <w> <d> <h> <desc> | /buildgen road <x1> <z1> <x2> <z2> [width] | /buildgen connect | /buildgen reroll | /buildgen undo | /buildgen redo",
+                    "Building Generator v{}: F8 or /buildgen | /buildgen lang <en|ru> | /buildgen preset <name> | /buildgen generate <desc> | /buildgen size <w> <d> <h> <desc> | /buildgen road <x1> <z1> <x2> <z2> [width] [style] | /buildgen connect | /buildgen reroll | /buildgen undo | /buildgen redo",
                     crate::model::MOD_VERSION
                 ),
                 UiLang::Ru => format!(
-                    "Building Generator v{}: F8 или /buildgen | /buildgen lang <en|ru> | /buildgen preset <имя> | /buildgen generate <описание> | /buildgen size <w> <d> <h> <описание> | /buildgen road <x1> <z1> <x2> <z2> [шир] | /buildgen connect | /buildgen reroll | /buildgen undo | /buildgen redo",
+                    "Building Generator v{}: F8 или /buildgen | /buildgen lang <en|ru> | /buildgen preset <имя> | /buildgen generate <описание> | /buildgen size <w> <d> <h> <описание> | /buildgen road <x1> <z1> <x2> <z2> [шир] [стиль] | /buildgen connect | /buildgen reroll | /buildgen undo | /buildgen redo",
                     crate::model::MOD_VERSION
                 ),
             }));
@@ -3420,6 +3477,7 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
             let mut x2 = 0i32;
             let mut z2 = 0i32;
             let mut width = 3u8;
+            let mut explicit_style_raw: Option<String> = None;
             for arg in &event.command.arguments {
                 match (arg.name.as_str(), &arg.value) {
                     ("x1", CommandArgumentValue::Integer(v)) => x1 = *v as i32,
@@ -3427,6 +3485,7 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
                     ("x2", CommandArgumentValue::Integer(v)) => x2 = *v as i32,
                     ("z2", CommandArgumentValue::Integer(v)) => z2 = *v as i32,
                     ("width", CommandArgumentValue::Integer(v)) => width = (*v).clamp(3, 5) as u8,
+                    ("style", CommandArgumentValue::String(s)) => explicit_style_raw = Some(s.clone()),
                     _ => {}
                 }
             }
@@ -3437,7 +3496,23 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
                 .and_then(|p| p.entity().position(host))
                 .map_or(event.command.position[1].floor() as i32, |pos| pos[1].floor() as i32 - 1);
             let seq = CMD_BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
-            let biome_hint = sample_biome_at(host, &dim, x1, base_y, z1);
+            let seed = crate::noise::fresh_entropy(seq, (x1 ^ z2) as u64) as i64;
+            let biome_hint = sample_biome_at(host, &dim, (x1 + x2) / 2, base_y, (z1 + z2) / 2);
+            let (style, palette) = if let Some(ref raw) = explicit_style_raw {
+                let st = BuildStyle::from_slug(raw).unwrap_or(BuildStyle::Auto);
+                let pal = if st == BuildStyle::Auto {
+                    crate::parser::infer_palette_with_biome(st, "", seed as u64, &biome_hint)
+                } else {
+                    MaterialPalette::preset_for_style(st)
+                };
+                (st, pal)
+            } else if let Some((st, pal)) = player_last_style(player_opt) {
+                (st, pal)
+            } else {
+                let st = BuildStyle::Auto;
+                let pal = crate::parser::infer_palette_with_biome(st, "", seed as u64, &biome_hint);
+                (st, pal)
+            };
             let req = RoadConnectRequest {
                 dimension: dim,
                 start_x: x1,
@@ -3448,14 +3523,14 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
                 end_z: z2,
                 road_width: width,
                 auto_bridge: true,
-                style: crate::model::BuildStyle::Medieval,
-                seed: crate::noise::fresh_entropy(seq, (x1 ^ z2) as u64) as i64,
+                style,
+                seed,
                 air_only: false,
                 blend_radius: 4,
                 living_decor: true,
                 spawn_npcs: false,
                 biome_hint,
-                palette: MaterialPalette::preset(0),
+                palette,
             };
             let resp = execute_road_connect(host, player_opt, req);
             let _ = host.commands().feedback(Text::literal(resp.message));
@@ -3494,7 +3569,21 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
             };
             if let Some(start) = prev {
                 let seq = CMD_BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
-                let biome_hint = sample_biome_at(host, &dim, start[0], start[1], start[2]);
+                let seed = crate::noise::fresh_entropy(seq, (start[0] ^ cur[2]) as u64) as i64;
+                let biome_hint = sample_biome_at(
+                    host,
+                    &dim,
+                    (start[0] + cur[0]) / 2,
+                    (start[1] + cur[1]) / 2,
+                    (start[2] + cur[2]) / 2,
+                );
+                let (style, palette) = if let Some((st, pal)) = player_last_style(player_opt) {
+                    (st, pal)
+                } else {
+                    let st = BuildStyle::Auto;
+                    let pal = crate::parser::infer_palette_with_biome(st, "", seed as u64, &biome_hint);
+                    (st, pal)
+                };
                 let req = RoadConnectRequest {
                     dimension: dim,
                     start_x: start[0],
@@ -3505,21 +3594,23 @@ pub fn handle_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
                     end_z: cur[2],
                     road_width: 3,
                     auto_bridge: true,
-                    style: crate::model::BuildStyle::Medieval,
-                    seed: crate::noise::fresh_entropy(seq, (start[0] ^ cur[2]) as u64) as i64,
+                    style,
+                    seed,
                     air_only: false,
                     blend_radius: 4,
                     living_decor: true,
                     spawn_npcs: false,
                     biome_hint,
-                    palette: MaterialPalette::preset(0),
+                    palette,
                 };
                 let resp = execute_road_connect(host, player_opt, req);
                 let _ = host.commands().feedback(Text::literal(resp.message));
             } else {
+                let cur_style = player_last_style(player_opt).map_or(BuildStyle::Auto, |(s, _)| s);
+                let style_lbl = cur_style.label(lang);
                 let _ = host.commands().feedback(Text::literal(match lang {
-                    UiLang::En => format!("Road start pinned at ({}, {}, {}). Walk to end and run /buildgen connect again.", cur[0], cur[1], cur[2]),
-                    UiLang::Ru => format!("Начало дороги зафиксировано ({}, {}, {}). Дойдите до второй точки и снова введите /buildgen connect.", cur[0], cur[1], cur[2]),
+                    UiLang::En => format!("Road start pinned at ({}, {}, {}) [style: {style_lbl}]. Walk to end and run /buildgen connect again.", cur[0], cur[1], cur[2]),
+                    UiLang::Ru => format!("Начало дороги зафиксировано ({}, {}, {}) [стиль: {style_lbl}]. Дойдите до второй точки и снова введите /buildgen connect.", cur[0], cur[1], cur[2]),
                 }));
             }
             Flow::Cancel

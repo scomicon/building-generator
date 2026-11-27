@@ -6410,4 +6410,213 @@ mod tests {
         assert!(ship_bp.blocks.values().any(|b| b.block_id == "minecraft:dark_oak_planks"));
         assert_grounded_blueprint(&ship_bp, &ship_flat, "Sailing Ship");
     }
+
+    #[test]
+    fn v072_road_generation_matches_selected_style_biome_palette_and_connect_memory() {
+        use crate::gen_road::generate_road_connector;
+        use crate::model::RoadConnectRequest;
+        use crate::server_builder::{
+            clear_history_memory_cache, clear_rate_limit_for_test, execute_build,
+        };
+        use mod_api::{CommandArgument, CommandArgumentValue, CommandInvocation};
+
+        let bw = 33u16;
+        let bd = 21u16;
+        let offsets = vec![0i32; usize::from(bw) * usize::from(bd)];
+        let mut depths = vec![0i32; usize::from(bw) * usize::from(bd)];
+        for z in 0..i32::from(bd) {
+            for x in 14..=18 {
+                depths[(z * i32::from(bw) + x) as usize] = 3;
+            }
+        }
+
+        let base_req = RoadConnectRequest {
+            dimension: "minecraft:overworld".into(),
+            start_x: 4,
+            start_y: 64,
+            start_z: 10,
+            end_x: 28,
+            end_y: 64,
+            end_z: 10,
+            road_width: 3,
+            auto_bridge: true,
+            style: BuildStyle::Medieval,
+            seed: 4201,
+            air_only: false,
+            blend_radius: 0,
+            living_decor: true,
+            spawn_npcs: false,
+            biome_hint: String::new(),
+            palette: MaterialPalette::preset(0),
+        };
+
+        // 1. All 9 explicit styles generate distinct style-matched paving, bridge lights & wayposts
+        let style_expectations: &[(BuildStyle, &str, &str)] = &[
+            (BuildStyle::Medieval, "minecraft:cobblestone", "minecraft:spruce_sign"),
+            (BuildStyle::Cottage, "minecraft:packed_mud", "minecraft:oak_sign"),
+            (BuildStyle::Japanese, "minecraft:polished_andesite", "minecraft:bamboo_sign"),
+            (BuildStyle::Gothic, "minecraft:deepslate_bricks", "minecraft:soul_lantern"),
+            (BuildStyle::Nordic, "minecraft:cobbled_deepslate", "minecraft:tuff_bricks"),
+            (BuildStyle::Modern, "minecraft:white_concrete", "minecraft:sea_lantern"),
+            (BuildStyle::Desert, "minecraft:smooth_sandstone", "minecraft:cut_sandstone"),
+            (BuildStyle::Steampunk, "minecraft:mud_bricks", "minecraft:copper_lantern"),
+            (BuildStyle::Classical, "minecraft:quartz_bricks", "minecraft:chiseled_quartz_block"),
+        ];
+
+        for &(style, expected_a, expected_b) in style_expectations {
+            let mut req = base_req.clone();
+            req.style = style;
+            req.palette = MaterialPalette::preset_for_style(style);
+            let bp = generate_road_connector(&req, &offsets, &depths, [0, 64, 0], bw, bd);
+            assert!(
+                bp.blocks.values().any(|b| b.block_id == expected_a),
+                "Style {:?} road should contain '{expected_a}'",
+                style
+            );
+            assert!(
+                bp.blocks.values().any(|b| b.block_id == expected_b),
+                "Style {:?} road should contain '{expected_b}'",
+                style
+            );
+        }
+
+        // 2. BuildStyle::Auto honors biome_hint cleanly
+        let mut auto_cherry = base_req.clone();
+        auto_cherry.style = BuildStyle::Auto;
+        auto_cherry.biome_hint = "minecraft:cherry_grove".into();
+        let bp_cherry = generate_road_connector(&auto_cherry, &offsets, &depths, [0, 64, 0], bw, bd);
+        assert!(
+            bp_cherry.blocks.values().any(|b| b.block_id == "minecraft:andesite" || b.block_id == "minecraft:polished_andesite"),
+            "Auto style in cherry_grove should resolve to Japanese road stone"
+        );
+
+        let mut auto_desert = base_req.clone();
+        auto_desert.style = BuildStyle::Auto;
+        auto_desert.biome_hint = "minecraft:badlands".into();
+        let bp_badlands = generate_road_connector(&auto_desert, &offsets, &depths, [0, 64, 0], bw, bd);
+        assert!(
+            bp_badlands.blocks.values().any(|b| b.block_id == "minecraft:smooth_red_sandstone"),
+            "Auto style in badlands should use red sandstone desert paving"
+        );
+
+        // 3. Explicit custom palette override flows into road paving & fencing
+        let mut custom_req = base_req.clone();
+        custom_req.style = BuildStyle::Medieval;
+        let mut custom_pal = MaterialPalette::preset(1);
+        custom_pal.paving = "minecraft:bricks".into();
+        custom_pal.fence = "minecraft:cherry_fence".into();
+        custom_req.palette = custom_pal;
+        let bp_custom = generate_road_connector(&custom_req, &offsets, &depths, [0, 64, 0], bw, bd);
+        assert!(bp_custom.blocks.values().any(|b| b.block_id == "minecraft:bricks"));
+        assert!(bp_custom.blocks.values().any(|b| b.block_id == "minecraft:cherry_fence"));
+
+        // 4. Server end-to-end: `/buildgen connect` inherits player's last selected style,
+        //    and `/buildgen road ... <width> <style>` parses explicit style cleanly.
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+            clear_history_memory_cache();
+            clear_rate_limit_for_test();
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(77, 100);
+            let player = host.player(77).unwrap();
+            let dim = host.level("minecraft:overworld").unwrap().dimension();
+
+            // Player builds a Modern house -> server remembers `Modern` style for that player
+            let mut mreq = sample_request("modern glass house", 9001);
+            mreq.style = BuildStyle::Modern;
+            mreq.origin_x = 0;
+            mreq.origin_y = 64;
+            mreq.origin_z = 0;
+            let b_resp = execute_build(&mut host, Some(player), mreq);
+            assert!(b_resp.ok, "Build failed: {}", b_resp.message);
+
+            // `/buildgen road 22 8 36 8 3` (without explicit style) inherits active `Modern` style!
+            let white_conc_key = host.id_to_key["minecraft:white_concrete"];
+            let road_inherit_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "road".into()],
+                vec![
+                    CommandArgument::new("x1".into(), CommandArgumentValue::Integer(22)),
+                    CommandArgument::new("z1".into(), CommandArgumentValue::Integer(8)),
+                    CommandArgument::new("x2".into(), CommandArgumentValue::Integer(36)),
+                    CommandArgument::new("z2".into(), CommandArgumentValue::Integer(8)),
+                    CommandArgument::new("width".into(), CommandArgumentValue::Integer(3)),
+                ],
+                dim.clone(),
+                [22.0, 64.0, 8.0],
+            );
+            let mut ev_inherit = RunModCommandEvent {
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                command: &road_inherit_cmd,
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut ev_inherit), Flow::Cancel);
+            assert!(
+                host.world_blocks
+                    .iter()
+                    .any(|(&[x, _, z], st)| x >= 22 && (5..=11).contains(&z) && st.block() == white_conc_key),
+                "/buildgen road without explicit style should inherit player's active Modern style"
+            );
+
+            // Explicit style argument on `/buildgen road ... <width> <style>`
+            let sand_key = host.id_to_key["minecraft:smooth_sandstone"];
+            let road_cmd = CommandInvocation::new(
+                vec!["buildgen".into(), "road".into()],
+                vec![
+                    CommandArgument::new("x1".into(), CommandArgumentValue::Integer(4)),
+                    CommandArgument::new("z1".into(), CommandArgumentValue::Integer(30)),
+                    CommandArgument::new("x2".into(), CommandArgumentValue::Integer(18)),
+                    CommandArgument::new("z2".into(), CommandArgumentValue::Integer(30)),
+                    CommandArgument::new("width".into(), CommandArgumentValue::Integer(5)),
+                    CommandArgument::new("style".into(), CommandArgumentValue::String("desert".into())),
+                ],
+                dim.clone(),
+                [4.0, 64.0, 30.0],
+            );
+            let mut road_ev = RunModCommandEvent {
+                source: &CommandSource::Player {
+                    player,
+                    permission: PermissionLevel::Owners,
+                },
+                command: &road_cmd,
+                cancelled: false,
+            };
+            assert_eq!(handle_command(&mut host, &mut road_ev), Flow::Cancel);
+            assert!(
+                host.world_blocks
+                    .iter()
+                    .any(|(&[_, _, z], st)| z >= 27 && st.block() == sand_key),
+                "/buildgen road with 'desert' style must place sandstone road"
+            );
+
+            // Check tab completion suggests road styles after width
+            let mut sugs = Vec::new();
+            let mut tab_ev = mod_api::TabCompleteEvent {
+                player: 1,
+                name: "buildgen",
+                command: "/buildgen road 0 0 10 10 3 ",
+                range: [26, 26],
+                suggestions: &mut sugs,
+            };
+            crate::server_builder::tab_complete(&mut tab_ev);
+            assert!(
+                sugs.iter().any(|s| s.text == "japanese") && sugs.iter().any(|s| s.text == "modern"),
+                "Tab completion should suggest road styles, got {:?}",
+                sugs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>()
+            );
+        });
+    }
 }
