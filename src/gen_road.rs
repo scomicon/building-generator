@@ -618,7 +618,14 @@ pub(crate) fn generate_road_connector(
     }
 
     living.apply_filters(req.living_decor, req.spawn_npcs);
-    prune_map_unsupported(&mut blocks);
+    crate::generator::prune_unsupported_floating_blocks_with_terrain(
+        &mut blocks,
+        Some((w, d)),
+        Some(terrain_offsets),
+        Some(water_depths),
+        false,
+    );
+    let _ = prune_map_unsupported;
     resolve_connections_and_shapes(&mut blocks);
     let _ = make_slab; // keep clean if unused in style branch
 

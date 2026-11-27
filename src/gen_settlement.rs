@@ -1027,6 +1027,7 @@ pub fn generate_settlement(
             sub_wd.as_deref(),
         );
 
+        let mut grounded_cols: BTreeMap<(i32, i32), i32> = BTreeMap::new();
         for ([sx, sy, sz], blk) in sub_bp.blocks {
             let wx = lot.x0 + sx;
             let wy = lot_base_y + sy;
@@ -1035,7 +1036,55 @@ pub fn generate_settlement(
                 continue;
             }
             if (0..w).contains(&wx) && (0..d).contains(&wz) {
+                if !is_floating && blk.block_id != "minecraft:air" {
+                    let bid = blk.block_id.as_str();
+                    let is_ground_piece = bid.ends_with("_wall")
+                        || bid.ends_with("_fence")
+                        || bid.ends_with("_log")
+                        || bid.ends_with("_wood")
+                        || bid.ends_with("_stairs")
+                        || bid.ends_with("cauldron")
+                        || matches!(
+                            bid,
+                            "minecraft:barrel"
+                                | "minecraft:composter"
+                                | "minecraft:hay_block"
+                                | "minecraft:chest"
+                                | "minecraft:anvil"
+                                | "minecraft:grindstone"
+                                | "minecraft:moss_block"
+                                | "minecraft:farmland"
+                                | "minecraft:lectern"
+                        );
+                    if is_ground_piece {
+                        grounded_cols
+                            .entry((wx, wz))
+                            .and_modify(|m| *m = (*m).min(wy))
+                            .or_insert(wy);
+                    }
+                }
                 blocks.insert([wx, wy, wz], blk);
+            }
+        }
+        if !is_floating {
+            for ((wx, wz), min_wy) in grounded_cols {
+                let surf_y = if req.adapt_terrain {
+                    terrain_at_wxz(terrain_offsets, w, wx, wz).clamp(-14, 14)
+                } else {
+                    0
+                };
+                if min_wy <= lot_base_y + 1
+                    && blocks.get(&[wx, min_wy - 1, wz]).is_none_or(|b| b.block_id == "minecraft:air")
+                    && min_wy - 1 >= surf_y
+                {
+                    let lo_y = (surf_y - 1).clamp(-16, min_wy - 1);
+                    for fy in lo_y..min_wy {
+                        blocks.insert(
+                            [wx, fy, wz],
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, wx, fy, wz)),
+                        );
+                    }
+                }
             }
         }
         let mut lot_living = sub_bp.living;
@@ -1123,7 +1172,18 @@ pub fn generate_settlement(
                             pave_block_for_style(spec.style, pal, seed, px, sy, pz, rng.next_f64(), false),
                         );
                         for cy in (sy + 1)..=(local_surf.max(sy) + 5) {
-                            blocks.insert([px, cy, pz], PlannedBlock::simple("minecraft:air"));
+                            let preserve = blocks.get(&[px, cy, pz]).is_some_and(|b| {
+                                let bid = b.block_id.as_str();
+                                bid.ends_with("_wall")
+                                    || bid.ends_with("_fence")
+                                    || bid == "minecraft:redstone_lamp"
+                                    || bid == "minecraft:daylight_detector"
+                                    || bid == "minecraft:lectern"
+                                    || crate::gen_common::is_lantern(bid)
+                            });
+                            if !preserve {
+                                blocks.insert([px, cy, pz], PlannedBlock::simple("minecraft:air"));
+                            }
                         }
                     }
                 }
@@ -1525,7 +1585,9 @@ pub fn generate_settlement(
                 let bx = cx + side;
                 if (1..(w - 1)).contains(&bx) {
                     let by = terrain_at_wxz(terrain_offsets, w, bx, d - 1).clamp(-12, 12);
-                    if blocks.get(&[bx, by + 3, d - 1]).is_none_or(|b| b.block_id == "minecraft:air") {
+                    let has_support = blocks.get(&[bx, by + 3, d - 2]).is_some_and(|b| b.block_id != "minecraft:air")
+                        || blocks.get(&[bx, by + 2, d - 1]).is_some_and(|b| b.block_id != "minecraft:air");
+                    if has_support && blocks.get(&[bx, by + 3, d - 1]).is_none_or(|b| b.block_id == "minecraft:air") {
                         living.banners.push(PlannedBanner { pos: [bx, by + 3, d - 1], style: b_style, primary_color: pri, accent_color: acc });
                     }
                 }

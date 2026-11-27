@@ -1375,11 +1375,25 @@ fn apply_outer_halo_blend(
     let d = i32::from(bp.depth);
     let h_lim = i32::from(bp.height) + 2;
 
-    // Map boundary columns of the generated structure to anchor height around base level.
+    // Map boundary columns of the generated structure to anchor height around base level (ignoring canopy/decor).
     let mut edge_anchors: HashMap<(i32, i32), i32> = HashMap::new();
     for (&[lx, ly, lz], blk) in &bp.blocks {
-        if blk.block_id != "minecraft:air"
-            && (-6..=8).contains(&ly)
+        let bid = blk.block_id.as_str();
+        if bid != "minecraft:air"
+            && !bid.ends_with("_leaves")
+            && !bid.ends_with("_fence")
+            && !bid.ends_with("_wall_banner")
+            && !bid.ends_with("_wall_sign")
+            && !bid.ends_with("_hanging_sign")
+            && !matches!(
+                bid,
+                "minecraft:daylight_detector"
+                    | "minecraft:redstone_lamp"
+                    | "minecraft:lantern"
+                    | "minecraft:soul_lantern"
+                    | "minecraft:copper_lantern"
+            )
+            && (-6..=3).contains(&ly)
             && (lx <= 1 || lx >= w - 2 || lz <= 1 || lz >= d - 2)
         {
             edge_anchors

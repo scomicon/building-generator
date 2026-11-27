@@ -1716,7 +1716,7 @@ pub(crate) fn apply_radial_terrain_column(
         let target_top = ((base_y as f64) + (delta as f64) * smooth_w + jitter)
             .round()
             .clamp(base_y as f64, (terr - 1) as f64) as i32;
-        for y in (target_top + 1)..=(terr + 2).min(height_lim) {
+        for y in (target_top + 1)..=(terr + 4).min(height_lim) {
             if blocks
                 .get(&[lx, y, lz])
                 .is_none_or(|b| b.block_id == "minecraft:air")
@@ -1890,8 +1890,21 @@ pub(crate) fn smooth_landmark_edges(
     }
 }
 
-/// Removes blocks whose structural support or attachment face is air/missing (prevents floating debris).
+/// Removes blocks whose structural support or attachment face is air/missing, plus disconnected floating fragments.
 pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], PlannedBlock>) {
+    prune_unsupported_floating_blocks_with_terrain(blocks, None, None, None, false);
+}
+
+/// Terrain-aware floating block pruning & connected-component grounding pass.
+pub(crate) fn prune_unsupported_floating_blocks_with_terrain(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    grid_dims: Option<(i32, i32)>,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
+    ruin_eroded: bool,
+) {
+    use std::collections::{HashSet, VecDeque};
+
     fn dir_offset(dir: &str) -> [i32; 3] {
         match dir {
             "north" => [0, 0, -1],
@@ -1905,16 +1918,33 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
         b.props.iter().find(|&&(pk, _)| pk == k).map(|&(_, pv)| pv)
     }
 
-    fn is_non_air(blocks: &BTreeMap<[i32; 3], PlannedBlock>, p: [i32; 3]) -> bool {
+    let surf_y = |x: i32, z: i32| -> i32 {
+        if let (Some((w, d)), Some(offs)) = (grid_dims, terrain_offsets)
+            && (0..w).contains(&x)
+            && (0..d).contains(&z)
+        {
+            let idx = (z * w + x) as usize;
+            let t = offs.get(idx).copied().unwrap_or(0).clamp(-24, 24);
+            let wd = water_depths
+                .and_then(|arr| arr.get(idx).copied())
+                .unwrap_or(0)
+                .clamp(0, 16);
+            t - wd
+        } else {
+            0
+        }
+    };
+
+    let is_non_air = |blocks: &BTreeMap<[i32; 3], PlannedBlock>, p: [i32; 3]| -> bool {
         match blocks.get(&p) {
             Some(b) => b.block_id != "minecraft:air",
-            None => p[1] <= 0,
+            None => p[1] <= surf_y(p[0], p[2]),
         }
-    }
+    };
 
-    fn is_solid_support(blocks: &BTreeMap<[i32; 3], PlannedBlock>, p: [i32; 3]) -> bool {
+    let is_solid_support = |blocks: &BTreeMap<[i32; 3], PlannedBlock>, p: [i32; 3]| -> bool {
         let Some(b) = blocks.get(&p) else {
-            return p[1] <= 0;
+            return p[1] <= surf_y(p[0], p[2]);
         };
         let id = b.block_id.as_str();
         !matches!(
@@ -1950,7 +1980,7 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
             && !id.ends_with("_wall_sign")
             && !id.ends_with("_pressure_plate")
             && !id.starts_with("minecraft:potted_")
-    }
+    };
 
     for _pass in 0..3 {
         let positions: Vec<[i32; 3]> = blocks.keys().copied().collect();
@@ -1976,6 +2006,16 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
             if needs_above && !is_non_air(blocks, above) {
                 to_remove.push(pos);
                 continue;
+            }
+
+            if id == "minecraft:cobweb" {
+                let anchored = [above, below, [x - 1, y, z], [x + 1, y, z], [x, y, z - 1], [x, y, z + 1]]
+                    .into_iter()
+                    .any(|np| is_solid_support(blocks, np));
+                if !anchored {
+                    to_remove.push(pos);
+                    continue;
+                }
             }
 
             if matches!(id, "minecraft:wall_torch" | "minecraft:soul_wall_torch" | "minecraft:tripwire_hook")
@@ -2016,7 +2056,7 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
                 }
             }
 
-            if y > 0 {
+            if y > surf_y(x, z) {
                 if id == "minecraft:lily_pad" {
                     let on_water = blocks
                         .get(&below)
@@ -2152,6 +2192,148 @@ pub(crate) fn prune_unsupported_floating_blocks(blocks: &mut BTreeMap<[i32; 3], 
             blocks.insert(p, PlannedBlock::simple("minecraft:air"));
         }
     }
+
+    // Stage 2: Prune any multi-block floating cluster disconnected from ground/terrain.
+    let active_positions: Vec<[i32; 3]> = blocks
+        .iter()
+        .filter_map(|(&p, b)| {
+            (!matches!(
+                b.block_id.as_str(),
+                "minecraft:air" | "minecraft:water" | "minecraft:lava"
+            ))
+            .then_some(p)
+        })
+        .collect();
+    if !active_positions.is_empty() {
+        let active_set: HashSet<[i32; 3]> = active_positions.iter().copied().collect();
+        let mut grounded: HashSet<[i32; 3]> = HashSet::new();
+        let mut queue: VecDeque<[i32; 3]> = VecDeque::new();
+        for &p in &active_positions {
+            let [x, y, z] = p;
+            let s = surf_y(x, z);
+            let below_blk = blocks.get(&[x, y - 1, z]);
+            let on_ground = y <= s
+                || (y == s + 1 && below_blk.is_none_or(|b| b.block_id != "minecraft:air"))
+                || (blocks.get(&p).is_some_and(|b| b.block_id == "minecraft:lily_pad")
+                    && below_blk.is_some_and(|b| b.block_id == "minecraft:water"));
+            if on_ground && grounded.insert(p) {
+                queue.push_back(p);
+            }
+        }
+
+        if !grounded.is_empty() {
+            let is_wood_or_flora = |id: &str| {
+                id.ends_with("_log")
+                    || id.ends_with("_wood")
+                    || id.ends_with("_leaves")
+                    || id.ends_with("_stem")
+                    || matches!(
+                        id,
+                        "minecraft:bamboo"
+                            | "minecraft:vine"
+                            | "minecraft:azalea"
+                            | "minecraft:flowering_azalea"
+                    )
+            };
+            let is_roof_step = |id: &str| id.ends_with("_stairs") || id.ends_with("_slab");
+
+            while let Some(cur) = queue.pop_front() {
+                let cur_id = blocks
+                    .get(&cur)
+                    .map(|b| b.block_id.as_str())
+                    .unwrap_or("");
+                let [cx, cy, cz] = cur;
+
+                for [nx, ny, nz] in [
+                    [cx + 1, cy, cz],
+                    [cx - 1, cy, cz],
+                    [cx, cy + 1, cz],
+                    [cx, cy - 1, cz],
+                    [cx, cy, cz + 1],
+                    [cx, cy, cz - 1],
+                ] {
+                    let np = [nx, ny, nz];
+                    if active_set.contains(&np) && grounded.insert(np) {
+                        queue.push_back(np);
+                    }
+                }
+
+                if is_roof_step(cur_id) {
+                    for [dx, dy, dz] in [
+                        [1, 1, 0],
+                        [-1, 1, 0],
+                        [1, -1, 0],
+                        [-1, -1, 0],
+                        [0, 1, 1],
+                        [0, 1, -1],
+                        [0, -1, 1],
+                        [0, -1, -1],
+                    ] {
+                        let np = [cx + dx, cy + dy, cz + dz];
+                        if active_set.contains(&np)
+                            && blocks.get(&np).is_some_and(|nb| is_roof_step(&nb.block_id))
+                            && grounded.insert(np)
+                        {
+                            queue.push_back(np);
+                        }
+                    }
+                }
+
+                if is_wood_or_flora(cur_id) {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            for dx in -1..=1 {
+                                if dx == 0 && dy == 0 && dz == 0 {
+                                    continue;
+                                }
+                                let np = [cx + dx, cy + dy, cz + dz];
+                                if active_set.contains(&np)
+                                    && blocks.get(&np).is_some_and(|nb| {
+                                        let nid = nb.block_id.as_str();
+                                        is_wood_or_flora(nid)
+                                            && (!ruin_eroded
+                                                || !(cur_id.ends_with("_leaves")
+                                                    && nid.ends_with("_leaves")))
+                                    })
+                                    && grounded.insert(np)
+                                {
+                                    queue.push_back(np);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut removed_any = false;
+            for &p in &active_positions {
+                if !grounded.contains(&p) {
+                    blocks.insert(p, PlannedBlock::simple("minecraft:air"));
+                    removed_any = true;
+                }
+            }
+            if removed_any {
+                for pos in active_positions {
+                    let Some(b) = blocks.get(&pos) else {
+                        continue;
+                    };
+                    if b.block_id.ends_with("_door") {
+                        let partner = if prop(b, "half") == Some("upper") {
+                            [pos[0], pos[1] - 1, pos[2]]
+                        } else {
+                            [pos[0], pos[1] + 1, pos[2]]
+                        };
+                        if blocks
+                            .get(&partner)
+                            .is_none_or(|pb| !pb.block_id.ends_with("_door"))
+                        {
+                            blocks.insert(pos, PlannedBlock::simple("minecraft:air"));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Dedicated monumental elliptical Roman Colosseum / amphitheater with multi-tier arcades, seating bowl & arena.
@@ -2225,7 +2407,7 @@ fn generate_colosseum(
             }
             let r = radius_at(u, v);
             let terr = if req.adapt_terrain {
-                terrain_rel_at(terrain_offsets, grid, u, v).clamp(-10, 0)
+                terrain_rel_at(terrain_offsets, grid, u, v).clamp(-16, 0)
             } else {
                 0
             };
@@ -2560,10 +2742,25 @@ pub fn generate_blueprint_with_water(
         smooth_landmark_edges(&mut bp, req, terrain_offsets, water_depths, noise);
     }
 
-    if crate::gen_weathering::apply_weathering_and_overgrowth(&mut bp, req, noise) {
-        prune_unsupported_floating_blocks(&mut bp.blocks);
-        crate::gen_common::resolve_connections_and_shapes(&mut bp.blocks);
-    }
+    let weathered = crate::gen_weathering::apply_weathering_and_overgrowth(&mut bp, req, noise);
+    let ruin_eroded = weathered && (req.wear_pct >= 14 || bp.spec.ruin_erosion >= 0.14);
+    prune_unsupported_floating_blocks_with_terrain(
+        &mut bp.blocks,
+        Some((grid.orig_w, grid.orig_d)),
+        req.adapt_terrain.then_some(terrain_offsets).flatten(),
+        req.adapt_terrain.then_some(water_depths).flatten(),
+        ruin_eroded,
+    );
+    crate::gen_common::resolve_connections_and_shapes(&mut bp.blocks);
+    bp.living
+        .lecterns
+        .retain(|l| bp.blocks.get(&l.pos).is_some_and(|b| b.block_id == "minecraft:lectern"));
+    bp.living
+        .banners
+        .retain(|b| bp.blocks.get(&b.pos).is_some_and(|blk| blk.block_id.ends_with("_banner")));
+    bp.living
+        .signs
+        .retain(|s| bp.blocks.get(&s.pos).is_some_and(|blk| blk.block_id.ends_with("_sign")));
     bp
 }
 
@@ -2720,7 +2917,18 @@ fn generate_standard_structure(
     );
 
     // 4b. Striped Cloth Market Awning & Open Street Counter Stall.
-    build_market_awning_stall(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed);
+    build_market_awning_stall(
+        &mut blocks,
+        grid,
+        &fp,
+        bounds,
+        best_door,
+        &spec,
+        pal,
+        seed,
+        req.adapt_terrain,
+        terrain_offsets,
+    );
 
     // 5. Spiral / Multi-floor Staircases, Guardrails & Basement Shaft.
     let (mut stairwell_uv, mut stair_headroom) = build_staircases(
@@ -2860,7 +3068,19 @@ fn generate_standard_structure(
         roof_base_y,
         height,
     );
-    build_downspouts_and_signs(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed);
+    build_downspouts_and_signs(
+        &mut blocks,
+        grid,
+        &fp,
+        bounds,
+        best_door,
+        &spec,
+        pal,
+        seed,
+        req.adapt_terrain,
+        terrain_offsets,
+        water_depths,
+    );
     build_arcade_gallery(
         &mut blocks,
         grid,
@@ -2875,7 +3095,20 @@ fn generate_standard_structure(
         water_depths,
     );
     if !spec.on_stilts {
-        build_custom_yard_trees(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed, height);
+        build_custom_yard_trees(
+            &mut blocks,
+            grid,
+            &fp,
+            bounds,
+            best_door,
+            &spec,
+            pal,
+            seed,
+            height,
+            req.adapt_terrain,
+            terrain_offsets,
+            water_depths,
+        );
     }
 
     // 11b. Smooth perimeter hillside terraces & radial biome blending outside footprint.
@@ -2999,7 +3232,13 @@ fn generate_standard_structure(
     }
 
     // 12. Structural Anti-Floating Sanitizer Pass.
-    prune_unsupported_floating_blocks(&mut blocks);
+    prune_unsupported_floating_blocks_with_terrain(
+        &mut blocks,
+        Some((grid.orig_w, grid.orig_d)),
+        req.adapt_terrain.then_some(terrain_offsets).flatten(),
+        req.adapt_terrain.then_some(water_depths).flatten(),
+        false,
+    );
 
     // 13. Connect glass panes, fences, stone walls, iron bars & miter stair corners cleanly.
     resolve_connections_and_shapes(&mut blocks);

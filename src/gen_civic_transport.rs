@@ -434,10 +434,17 @@ pub(crate) fn generate_sailing_ship(
         let rail_y = if t < 0.25 { deck_y + 3 } else { deck_y + 1 };
         for u in (cu - local_hw)..=(cu + local_hw) {
             let du = (u - cu).abs();
-            for y in 2..=deck_y {
-                let keel_inset = if y == 2 { (local_hw - 1).max(0) } else { local_hw };
-                if du <= keel_inset && (y == deck_y || du == keel_inset || v == v_stern) {
-                    set_uv(&mut blocks, grid, u, y, v, PlannedBlock::simple("minecraft:spruce_planks"));
+            for y in 1..=deck_y {
+                let keel_inset = if y == 1 {
+                    (local_hw - 2).max(0)
+                } else if y == 2 {
+                    (local_hw - 1).max(0)
+                } else {
+                    local_hw
+                };
+                if du <= keel_inset && (y == deck_y || y == 1 || du == keel_inset || v == v_stern) {
+                    let hull_blk = if y == 1 { "minecraft:dark_oak_planks" } else { "minecraft:spruce_planks" };
+                    set_uv(&mut blocks, grid, u, y, v, PlannedBlock::simple(hull_blk));
                 }
             }
             if du == local_hw || (v == v_stern && t < 0.25) {

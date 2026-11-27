@@ -513,7 +513,7 @@ fn build_bridge_tower(
     let has_arch_roof = portal_top >= max_walk + 4 && eff_top_y >= portal_top + 1;
     let pier_width_c0 = (c0 - 1).max(0);
     let pier_width_c1 = (c1 + 1).min(ax.cross_len - 1);
-    let base_anchor = (min_dy - 4).max(-6);
+    let base_anchor = (min_dy - 4).max(-14);
 
     for da in -1..=1 {
         let a = along_center + da;
@@ -832,7 +832,7 @@ fn build_suspension_rig(
             let a = (pylon + da).clamp(0, along_len - 1);
             let slice_dy = deck_profile[a as usize];
             for &c in &[c0, c1] {
-                for y in (slice_dy - 4).max(-6)..=pylon_top {
+                for y in (slice_dy - 4).max(-14)..=pylon_top {
                     let blk = if y <= slice_dy {
                         PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, c, y, a))
                     } else if y == pylon_top {
@@ -1236,8 +1236,8 @@ pub(crate) fn generate_bridge(
         let is_cutwater_center = pier_centers.contains(&along);
 
         for c in c0..=c1 {
-            let terr = ax.terr(terrain_offsets, c, along).clamp(-5, 3);
-            let floor_anchor = (terr - 4).min(dy - 2).max(-6);
+            let terr = ax.terr(terrain_offsets, c, along).clamp(-12, 3);
+            let floor_anchor = (terr - 4).min(dy - 2).max(-14);
 
             if variant == BridgeVariant::PontoonPier {
                 let is_bents = matching_span.is_none() || (along % 4 == 0);
@@ -1410,8 +1410,8 @@ pub(crate) fn generate_bridge(
                                 continue;
                             }
                             let local_top = pier_top - (dist - 1);
-                            let pterr = ax.terr(terrain_offsets, pc, along).clamp(-5, 2);
-                            let pbot = (pterr - 3).max(-6);
+                            let pterr = ax.terr(terrain_offsets, pc, along).clamp(-12, 2);
+                            let pbot = (pterr - 3).max(-14);
                             if dist == 2 && local_top <= pbot + 1 {
                                 continue;
                             }
@@ -1421,8 +1421,8 @@ pub(crate) fn generate_bridge(
                                 if pa < 0 || pa >= ax.along_len {
                                     continue;
                                 }
-                                let pterr_a = ax.terr(terrain_offsets, pc, pa).clamp(-5, 2);
-                                for y in (pterr_a - 3).max(-6)..=local_top {
+                                let pterr_a = ax.terr(terrain_offsets, pc, pa).clamp(-12, 2);
+                                for y in (pterr_a - 3).max(-14)..=local_top {
                                     let blk = if y == local_top {
                                         make_slab(&pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pc, y, pa), "bottom")
                                     } else {

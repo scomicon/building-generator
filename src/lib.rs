@@ -6158,4 +6158,256 @@ mod tests {
             assert!(road_undo.ok);
         });
     }
+
+    #[test]
+    fn v071_no_floating_blocks_in_settlements_engawa_yards_or_ruins() {
+        use std::collections::{HashSet, VecDeque};
+
+        fn assert_grounded_blueprint(bp: &crate::generator::GeneratedBlueprint, offsets: &[i32], label: &str) {
+            let w = i32::from(bp.width);
+            let d = i32::from(bp.depth);
+            let surf_y = |x: i32, z: i32| -> i32 {
+                if (0..w).contains(&x) && (0..d).contains(&z) {
+                    offsets.get((z * w + x) as usize).copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            };
+
+            let active: Vec<[i32; 3]> = bp
+                .blocks
+                .iter()
+                .filter_map(|(&p, b)| {
+                    (!matches!(
+                        b.block_id.as_str(),
+                        "minecraft:air" | "minecraft:water" | "minecraft:lava"
+                    ))
+                    .then_some(p)
+                })
+                .collect();
+            assert!(!active.is_empty(), "{label}: blueprint must not be empty");
+            let active_set: HashSet<[i32; 3]> = active.iter().copied().collect();
+            let mut grounded: HashSet<[i32; 3]> = HashSet::new();
+            let mut queue: VecDeque<[i32; 3]> = VecDeque::new();
+
+            for &p in &active {
+                let [x, y, z] = p;
+                let s = surf_y(x, z);
+                let below = bp.blocks.get(&[x, y - 1, z]);
+                let on_ground = y <= s
+                    || (y == s + 1 && below.is_none_or(|b| b.block_id != "minecraft:air"))
+                    || (bp.blocks.get(&p).is_some_and(|b| b.block_id == "minecraft:lily_pad")
+                        && below.is_some_and(|b| b.block_id == "minecraft:water"));
+                if on_ground && grounded.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+
+            let is_wood_or_flora = |id: &str| {
+                id.ends_with("_log")
+                    || id.ends_with("_wood")
+                    || id.ends_with("_leaves")
+                    || id.ends_with("_stem")
+                    || matches!(
+                        id,
+                        "minecraft:bamboo"
+                            | "minecraft:vine"
+                            | "minecraft:azalea"
+                            | "minecraft:flowering_azalea"
+                    )
+            };
+            let is_roof_step = |id: &str| id.ends_with("_stairs") || id.ends_with("_slab");
+
+            while let Some(cur) = queue.pop_front() {
+                let cur_id = bp.blocks.get(&cur).map(|b| b.block_id.as_str()).unwrap_or("");
+                let [cx, cy, cz] = cur;
+                for np in [
+                    [cx + 1, cy, cz],
+                    [cx - 1, cy, cz],
+                    [cx, cy + 1, cz],
+                    [cx, cy - 1, cz],
+                    [cx, cy, cz + 1],
+                    [cx, cy, cz - 1],
+                ] {
+                    if active_set.contains(&np) && grounded.insert(np) {
+                        queue.push_back(np);
+                    }
+                }
+                if is_roof_step(cur_id) {
+                    for [dx, dy, dz] in [
+                        [1, 1, 0],
+                        [-1, 1, 0],
+                        [1, -1, 0],
+                        [-1, -1, 0],
+                        [0, 1, 1],
+                        [0, 1, -1],
+                        [0, -1, 1],
+                        [0, -1, -1],
+                    ] {
+                        let np = [cx + dx, cy + dy, cz + dz];
+                        if active_set.contains(&np)
+                            && bp.blocks.get(&np).is_some_and(|nb| is_roof_step(&nb.block_id))
+                            && grounded.insert(np)
+                        {
+                            queue.push_back(np);
+                        }
+                    }
+                }
+                if is_wood_or_flora(cur_id) {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            for dx in -1..=1 {
+                                if dx == 0 && dy == 0 && dz == 0 {
+                                    continue;
+                                }
+                                let np = [cx + dx, cy + dy, cz + dz];
+                                if active_set.contains(&np)
+                                    && bp.blocks.get(&np).is_some_and(|nb| is_wood_or_flora(&nb.block_id))
+                                    && grounded.insert(np)
+                                {
+                                    queue.push_back(np);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let orphans: Vec<_> = active
+                .iter()
+                .filter(|p| !grounded.contains(*p))
+                .take(10)
+                .map(|p| (*p, bp.blocks[p].block_id.as_str()))
+                .collect();
+            assert!(
+                orphans.is_empty(),
+                "{label}: found disconnected floating blocks: {orphans:?}"
+            );
+
+            // Every wall, post-mounted daylight_detector/redstone_lamp, lower door, and floor cauldron
+            // must rest on non-air underneath (never hovering with air beneath its column).
+            for (&[x, y, z], b) in &bp.blocks {
+                let id = b.block_id.as_str();
+                let s = surf_y(x, z);
+                if y <= s {
+                    continue;
+                }
+                let below_is_air = |yy: i32| {
+                    bp.blocks
+                        .get(&[x, yy - 1, z])
+                        .is_some_and(|nb| nb.block_id == "minecraft:air")
+                        || (yy - 1 > s && !bp.blocks.contains_key(&[x, yy - 1, z]))
+                };
+                if id == "minecraft:daylight_detector" || id == "minecraft:redstone_lamp" {
+                    let mut yy = y;
+                    while yy > s {
+                        assert!(
+                            !below_is_air(yy),
+                            "{label}: streetlamp {id} at [{x}, {y}, {z}] has air gap at y={}",
+                            yy - 1
+                        );
+                        yy -= 1;
+                    }
+                }
+                if id.ends_with("_fence") && y == s + 1 {
+                    assert!(
+                        !below_is_air(y),
+                        "{label}: fence post {id} at [{x}, {y}, {z}] hovers over air"
+                    );
+                }
+            }
+        }
+
+        // 1. Sloped Badlands Settlement matching user report (`seed = 2218384`, `60x60x18`, `living_decor = true`)
+        let mut sreq = sample_request(
+            "огромный город с домами площадью каналами стенами и воротами",
+            2_218_384,
+        );
+        sreq.category = BuildCategory::Settlement;
+        sreq.style = crate::model::BuildStyle::Desert;
+        sreq.width = 60;
+        sreq.depth = 60;
+        sreq.height = 18;
+        sreq.biome_hint = "minecraft:badlands".to_owned();
+        sreq.living_decor = true;
+        sreq.adapt_terrain = true;
+        sreq.blend_radius = 4;
+        let sw = i32::from(sreq.width);
+        let sd = i32::from(sreq.depth);
+        let s_offsets: Vec<i32> = (0..(sw * sd))
+            .map(|idx| {
+                let x = idx % sw;
+                let z = idx / sw;
+                ((x - sw / 2) / 14 + (z - sd / 2) / 16).clamp(-3, 3)
+            })
+            .collect();
+        let s_bp = crate::generator::generate_blueprint_with_water(&sreq, Some(&s_offsets), None);
+        assert_grounded_blueprint(&s_bp, &s_offsets, "Badlands Sloped Settlement");
+
+        // 2. Sloped Japanese Mansion (Engawa + yard trees + market awning + downspouts + living streetlamps)
+        let mut jreq = sample_request(
+            "японская усадьба с верандой энгава садом фонарями деревом навесом и водостоком",
+            77_441,
+        );
+        jreq.style = crate::model::BuildStyle::Japanese;
+        jreq.width = 28;
+        jreq.depth = 28;
+        jreq.height = 16;
+        jreq.living_decor = true;
+        jreq.adapt_terrain = true;
+        jreq.blend_radius = 3;
+        let jw = i32::from(jreq.width);
+        let jd = i32::from(jreq.depth);
+        let j_offsets: Vec<i32> = (0..(jw * jd))
+            .map(|idx| {
+                let x = idx % jw;
+                let z = idx / jw;
+                ((x - jw / 2) / 6 - (z - jd / 2) / 9).clamp(-4, 2)
+            })
+            .collect();
+        let j_bp = crate::generator::generate_blueprint_with_water(&jreq, Some(&j_offsets), None);
+        assert_grounded_blueprint(&j_bp, &j_offsets, "Sloped Japanese Mansion");
+        // Verify Engawa / perimeter slabs over downhill slopes sit atop a foundation skirt rather than hovering!
+        let mut engawa_checked = 0usize;
+        for (&[x, y, z], b) in &j_bp.blocks {
+            if (x == 3 || x == jw - 4) && y == 1 && b.block_id.ends_with("_slab") {
+                let s = j_offsets[(z * jw + x) as usize];
+                if s < 0 {
+                    engawa_checked += 1;
+                    assert!(
+                        j_bp.blocks.get(&[x, 0, z]).is_some_and(|nb| nb.block_id != "minecraft:air"),
+                        "Engawa slab at [{x}, {y}, {z}] over slope s={s} lacks support at y=0"
+                    );
+                }
+            }
+        }
+        assert!(engawa_checked >= 2 || j_bp.non_air_count() > 500);
+
+        // 3. Heavily eroded Ruined Castle (wear=55%, overgrowth=45%)
+        let mut rreq = sample_request("древний разрушенный замок в руинах со мхом", 91_205);
+        rreq.category = BuildCategory::Castle;
+        rreq.style = crate::model::BuildStyle::Medieval;
+        rreq.width = 24;
+        rreq.depth = 24;
+        rreq.height = 18;
+        rreq.wear_pct = 55;
+        rreq.overgrowth_pct = 45;
+        let flat = vec![0i32; 24 * 24];
+        let r_bp = crate::generator::generate_blueprint_with_water(&rreq, Some(&flat), None);
+        assert_grounded_blueprint(&r_bp, &flat, "Ruined Castle Wear 55%");
+
+        // 4. Sailing Ship keeps sails + dark_oak keel with zero disconnected blocks
+        let ship_p = crate::server_builder::find_cli_preset("ship").unwrap();
+        let mut ship_req = sample_request(ship_p.6, 4242);
+        ship_req.category = ship_p.1;
+        ship_req.style = ship_p.2;
+        ship_req.width = ship_p.3;
+        ship_req.depth = ship_p.4;
+        ship_req.height = ship_p.5;
+        let ship_flat = vec![0i32; usize::from(ship_req.width) * usize::from(ship_req.depth)];
+        let ship_bp = crate::generator::generate_blueprint_with_water(&ship_req, Some(&ship_flat), None);
+        assert!(ship_bp.blocks.values().any(|b| b.block_id == "minecraft:white_wool"));
+        assert!(ship_bp.blocks.values().any(|b| b.block_id == "minecraft:dark_oak_planks"));
+        assert_grounded_blueprint(&ship_bp, &ship_flat, "Sailing Ship");
+    }
 }

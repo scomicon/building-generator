@@ -13,6 +13,36 @@ use crate::model::{BuildCategory, BuildStyle, MaterialPalette};
 use crate::noise::{NoiseField, SplitMix64};
 use crate::parser::{BlueprintSpec, StructureTheme};
 
+/// Anchors a yard pillar, fence post, cauldron, or tree root solidly into local ground/lot foundation.
+#[allow(clippy::too_many_arguments)]
+fn anchor_yard_foundation(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    grid: LocalGrid,
+    u: i32,
+    v: i32,
+    ground_y: i32,
+    top_y: i32,
+    pal: &MaterialPalette,
+    seed: u64,
+    adapt_terrain: bool,
+) {
+    let min_y = if adapt_terrain {
+        (ground_y - 2).clamp(-16, ground_y.min(top_y))
+    } else {
+        ground_y.min(top_y).min(0)
+    };
+    for fy in min_y..=top_y {
+        set_uv(
+            blocks,
+            grid,
+            u,
+            fy,
+            v,
+            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, fy, v)),
+        );
+    }
+}
+
 /// Places terrain-adaptive plinth, optional basement vault, lakeside/hillside stilts, & Japanese Engawa deck.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_foundation_and_basement(
@@ -179,7 +209,7 @@ pub(crate) fn build_foundation_and_basement(
         }
     }
 
-    // Japanese wrap-around Engawa veranda deck.
+    // Japanese wrap-around Engawa veranda deck (grounded on slopes with masonry skirt plinth).
     if spec.style == BuildStyle::Japanese && spec.category != BuildCategory::Tower {
         let engawa_y = i32::from(spec.foundation_height);
         for v in 0..grid.d {
@@ -192,6 +222,29 @@ pub(crate) fn build_foundation_and_basement(
                     || is_fp(grid, fp, u, v - 1)
                     || is_fp(grid, fp, u, v + 1);
                 if adj {
+                    if !spec.on_stilts {
+                        let terrain_rel = if adapt_terrain {
+                            terrain_rel_at(terrain_offsets, grid, u, v)
+                        } else {
+                            0
+                        };
+                        let wdepth = if adapt_terrain {
+                            water_depth_at(water_depths, grid, u, v)
+                        } else {
+                            0
+                        };
+                        let floor_bot = (terrain_rel - wdepth - 1).clamp(-16, engawa_y - 1);
+                        for fy in floor_bot..engawa_y {
+                            set_uv(
+                                blocks,
+                                grid,
+                                u,
+                                fy,
+                                v,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, fy, v)),
+                            );
+                        }
+                    }
                     set_uv(
                         blocks,
                         grid,
@@ -1269,11 +1322,13 @@ pub(crate) fn build_courtyard_and_landscaping(
                 let ly = terr_at_uv(lu, lv);
                 if grid.in_bounds(lu, lv)
                     && !is_fp(grid, fp, lu, lv)
+                    && water_depth_at(water_depths, grid, lu, lv) == 0
                     && !is_solid_or_occupied(blocks, grid, lu, ly + 1, lv)
                     && !is_solid_or_occupied(blocks, grid, lu, ly + 2, lv)
                     && !is_solid_or_occupied(blocks, grid, lu, ly + 3, lv)
                 {
                     let light_id = pal.pick(MaterialPalette::SLOT_LIGHT, seed, lu, ly + 3, lv);
+                    anchor_yard_foundation(blocks, grid, lu, lv, ly, ly, pal, seed, adapt_terrain);
                     set_uv(blocks, grid, lu, ly + 1, lv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lu, ly + 1, lv)));
                     set_uv(
                         blocks,
@@ -1294,30 +1349,37 @@ pub(crate) fn build_courtyard_and_landscaping(
 
         // Japanese Crimson Torii gate framing the front walkway when yard space allows.
         let tv = (dv + 3).min(grid.d - 2);
+        let ty_l = terr_at_uv(du - 1, tv);
+        let ty_r = terr_at_uv(du + 1, tv);
+        let ty_torii = ty_l.max(ty_r);
         if spec.style == BuildStyle::Japanese
             && tv >= dv + 2
             && du >= 2
             && du + 2 < grid.w
+            && (ty_l - ty_r).abs() <= 2
+            && water_depth_at(water_depths, grid, du - 1, tv) == 0
+            && water_depth_at(water_depths, grid, du + 1, tv) == 0
             && (-1..=1).all(|off| {
                 !is_fp(grid, fp, du + off, tv)
-                    && (1..=4).all(|y| !is_solid_or_occupied(blocks, grid, du + off, y, tv))
+                    && (1..=4).all(|dy| !is_solid_or_occupied(blocks, grid, du + off, ty_torii + dy, tv))
             })
         {
-            for side in [-1, 1] {
+            for (side, p_ty) in [(-1, ty_l), (1, ty_r)] {
+                anchor_yard_foundation(blocks, grid, du + side, tv, p_ty, ty_torii, pal, seed, adapt_terrain);
                 set_uv(
                     blocks,
                     grid,
                     du + side,
-                    1,
+                    ty_torii + 1,
                     tv,
-                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, du + side, 1, tv)),
+                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, du + side, ty_torii + 1, tv)),
                 );
-                for y in 2..=3 {
+                for dy in 2..=3 {
                     set_uv(
                         blocks,
                         grid,
                         du + side,
-                        y,
+                        ty_torii + dy,
                         tv,
                         PlannedBlock::simple("minecraft:crimson_planks"),
                     );
@@ -1327,20 +1389,20 @@ pub(crate) fn build_courtyard_and_landscaping(
                 blocks,
                 grid,
                 du,
-                3,
+                ty_torii + 3,
                 tv,
                 PlannedBlock::simple("minecraft:crimson_planks"),
             );
             for off in -2..=2 {
                 if grid.in_bounds(du + off, tv)
-                    && !is_solid_or_occupied(blocks, grid, du + off, 4, tv)
+                    && !is_solid_or_occupied(blocks, grid, du + off, ty_torii + 4, tv)
                 {
                     let lintel = if off.abs() == 2 {
-                        make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, du + off, 4, tv), "bottom")
+                        make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, du + off, ty_torii + 4, tv), "bottom")
                     } else {
-                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, du + off, 4, tv))
+                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, du + off, ty_torii + 4, tv))
                     };
-                    set_uv(blocks, grid, du + off, 4, tv, lintel);
+                    set_uv(blocks, grid, du + off, ty_torii + 4, tv, lintel);
                 }
             }
         }
@@ -1364,41 +1426,47 @@ pub(crate) fn build_courtyard_and_landscaping(
                 (1, 1),
                 (grid.w - 2, 1),
             ] {
+                let hy = terr_at_uv(hu, hv);
                 if !is_fp(grid, fp, hu, hv)
+                    && water_depth_at(water_depths, grid, hu, hv) == 0
                     && best_door.is_none_or(|(du, dv)| (hu - du).abs() > 2 || hv < dv)
-                    && !is_solid_or_occupied(blocks, grid, hu, 1, hv)
+                    && !is_solid_or_occupied(blocks, grid, hu, hy + 1, hv)
                 {
+                    anchor_yard_foundation(blocks, grid, hu, hv, hy, hy, pal, seed, adapt_terrain);
                     let hedge = if (hu == 1 || hu == grid.w - 2) && spec.style == BuildStyle::Classical {
-                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, hu, 1, hv))
+                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, hu, hy + 1, hv))
                     } else if (hu + hv) % 2 == 0 {
-                        make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, hu, 1, hv))
+                        make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, hu, hy + 1, hv))
                     } else {
-                        make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES_ALT, seed, hu, 1, hv))
+                        make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES_ALT, seed, hu, hy + 1, hv))
                     };
-                    set_uv(blocks, grid, hu, 1, hv, hedge);
+                    set_uv(blocks, grid, hu, hy + 1, hv, hedge);
                 }
             }
         } else {
             for v in 1..=(grid.d - 2) {
                 for u in 1..=(grid.w - 2) {
                     let on_ring = u == 1 || u == grid.w - 2 || v == 1 || v == grid.d - 2;
+                    let fy = terr_at_uv(u, v);
                     if !on_ring
                         || is_fp(grid, fp, u, v)
                         || is_fp(grid, fp, u - 1, v)
                         || is_fp(grid, fp, u + 1, v)
                         || is_fp(grid, fp, u, v - 1)
                         || is_fp(grid, fp, u, v + 1)
-                        || is_solid_or_occupied(blocks, grid, u, 1, v)
-                        || is_solid_or_occupied(blocks, grid, u, 2, v)
+                        || water_depth_at(water_depths, grid, u, v) > 0
+                        || is_solid_or_occupied(blocks, grid, u, fy + 1, v)
+                        || is_solid_or_occupied(blocks, grid, u, fy + 2, v)
                     {
                         continue;
                     }
+                    anchor_yard_foundation(blocks, grid, u, v, fy, fy, pal, seed, adapt_terrain);
                     if v == grid.d - 2
                         && let Some((du, _)) = best_door
                         && u == du
                     {
                         let gate_id = if pal.has_extra(MaterialPalette::SLOT_FENCE_GATE) {
-                            pal.pick(MaterialPalette::SLOT_FENCE_GATE, seed, u, 1, v)
+                            pal.pick(MaterialPalette::SLOT_FENCE_GATE, seed, u, fy + 1, v)
                         } else {
                             pal.fence_gate_for_fence().to_owned()
                         };
@@ -1406,7 +1474,7 @@ pub(crate) fn build_courtyard_and_landscaping(
                             blocks,
                             grid,
                             u,
-                            1,
+                            fy + 1,
                             v,
                             PlannedBlock::with_props(
                                 gate_id,
@@ -1422,10 +1490,10 @@ pub(crate) fn build_courtyard_and_landscaping(
                     }
                     let is_corner = (u == 1 || u == grid.w - 2) && (v == 1 || v == grid.d - 2);
                     if is_corner {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, 1, v)));
-                        set_uv(blocks, grid, u, 2, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, 2, v), "bottom"));
+                        set_uv(blocks, grid, u, fy + 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, fy + 1, v)));
+                        set_uv(blocks, grid, u, fy + 2, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, fy + 2, v), "bottom"));
                     } else {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, 1, v)));
+                        set_uv(blocks, grid, u, fy + 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, fy + 1, v)));
                     }
                 }
             }
@@ -1439,17 +1507,20 @@ pub(crate) fn build_courtyard_and_landscaping(
         for side in [-3, 3] {
             let bu = du + side;
             let bv = (dv + 3).min(grid.d - 2);
+            let by = terr_at_uv(bu, bv);
             if grid.in_bounds(bu, bv)
                 && !is_fp(grid, fp, bu, bv)
-                && !is_solid_or_occupied(blocks, grid, bu, 1, bv)
-                && !is_solid_or_occupied(blocks, grid, bu, 2, bv)
+                && water_depth_at(water_depths, grid, bu, bv) == 0
+                && !is_solid_or_occupied(blocks, grid, bu, by + 1, bv)
+                && !is_solid_or_occupied(blocks, grid, bu, by + 2, bv)
             {
-                set_uv(blocks, grid, bu, 1, bv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, bu, 1, bv)));
+                anchor_yard_foundation(blocks, grid, bu, bv, by, by, pal, seed, adapt_terrain);
+                set_uv(blocks, grid, bu, by + 1, bv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, bu, by + 1, bv)));
                 set_uv(
                     blocks,
                     grid,
                     bu,
-                    2,
+                    by + 2,
                     bv,
                     PlannedBlock::with_props(
                         "minecraft:campfire",
@@ -1464,65 +1535,77 @@ pub(crate) fn build_courtyard_and_landscaping(
     if spec.courtyard_well
         && let Some((wu, wv)) = find_clear_3x3(blocks, grid, fp, best_door, b_v1)
     {
-        if spec.style == BuildStyle::Modern {
-            for dv in -1..=1 {
-                for du in -1..=1 {
-                    let u = wu + du;
-                    let v = wv + dv;
-                    if (du == 0 && dv == 0) || (du == -1 && dv == 0) {
-                        set_uv(blocks, grid, u, 0, v, PlannedBlock::with_props("minecraft:water", vec![("level", "0")]));
-                        set_uv(blocks, grid, u, -1, v, PlannedBlock::simple("minecraft:sea_lantern"));
-                    } else {
-                        set_uv(blocks, grid, u, 0, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, 0, v)));
+        let wy = terr_at_uv(wu, wv);
+        let dry_flat = (-1..=1).all(|dv| (-1..=1).all(|du| {
+            water_depth_at(water_depths, grid, wu + du, wv + dv) == 0
+                && (terr_at_uv(wu + du, wv + dv) - wy).abs() <= 2
+                && (1..=3).all(|dy| !is_solid_or_occupied(blocks, grid, wu + du, wy + dy, wv + dv))
+        }));
+        if dry_flat {
+            if spec.style == BuildStyle::Modern {
+                for dv in -1..=1 {
+                    for du in -1..=1 {
+                        let u = wu + du;
+                        let v = wv + dv;
+                        let lt = terr_at_uv(u, v);
+                        if (du == 0 && dv == 0) || (du == -1 && dv == 0) {
+                            anchor_yard_foundation(blocks, grid, u, v, lt.min(wy - 1), wy - 1, pal, seed, adapt_terrain);
+                            set_uv(blocks, grid, u, wy, v, PlannedBlock::with_props("minecraft:water", vec![("level", "0")]));
+                            set_uv(blocks, grid, u, wy - 1, v, PlannedBlock::simple("minecraft:sea_lantern"));
+                        } else {
+                            anchor_yard_foundation(blocks, grid, u, v, lt.min(wy), wy, pal, seed, adapt_terrain);
+                        }
                     }
                 }
-            }
-            set_uv(
-                blocks,
-                grid,
-                wu + 1,
-                1,
-                wv,
-                make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, wu + 1, 1, wv), grid.dir_right(), "bottom"),
-            );
-            set_uv(
-                blocks,
-                grid,
-                wu + 1,
-                1,
-                wv - 1,
-                PlannedBlock::simple("minecraft:potted_azalea_bush"),
-            );
-        } else {
-            for dv in -1..=1 {
-                for du in -1..=1 {
-                    let u = wu + du;
-                    let v = wv + dv;
-                    if du == 0 && dv == 0 {
-                        set_uv(
-                            blocks,
-                            grid,
-                            u,
-                            1,
-                            v,
-                            PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]),
-                        );
-                        set_uv(
-                            blocks,
-                            grid,
-                            u,
-                            2,
-                            v,
-                            PlannedBlock::with_props("minecraft:iron_chain", vec![("axis", "y")]),
-                        );
-                        set_uv(blocks, grid, u, 3, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, u, 3, v)));
-                    } else if du.abs() == 1 && dv.abs() == 1 {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, 1, v)));
-                        set_uv(blocks, grid, u, 2, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, 2, v)));
-                        set_uv(blocks, grid, u, 3, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, 3, v), "bottom"));
-                    } else {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, 1, v)));
-                        set_uv(blocks, grid, u, 3, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, 3, v), "bottom"));
+                set_uv(
+                    blocks,
+                    grid,
+                    wu + 1,
+                    wy + 1,
+                    wv,
+                    make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, wu + 1, wy + 1, wv), grid.dir_right(), "bottom"),
+                );
+                set_uv(
+                    blocks,
+                    grid,
+                    wu + 1,
+                    wy + 1,
+                    wv - 1,
+                    PlannedBlock::simple("minecraft:potted_azalea_bush"),
+                );
+            } else {
+                for dv in -1..=1 {
+                    for du in -1..=1 {
+                        let u = wu + du;
+                        let v = wv + dv;
+                        let lt = terr_at_uv(u, v);
+                        anchor_yard_foundation(blocks, grid, u, v, lt.min(wy), wy, pal, seed, adapt_terrain);
+                        if du == 0 && dv == 0 {
+                            set_uv(
+                                blocks,
+                                grid,
+                                u,
+                                wy + 1,
+                                v,
+                                PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]),
+                            );
+                            set_uv(
+                                blocks,
+                                grid,
+                                u,
+                                wy + 2,
+                                v,
+                                PlannedBlock::with_props("minecraft:iron_chain", vec![("axis", "y")]),
+                            );
+                            set_uv(blocks, grid, u, wy + 3, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, u, wy + 3, v)));
+                        } else if du.abs() == 1 && dv.abs() == 1 {
+                            set_uv(blocks, grid, u, wy + 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, wy + 1, v)));
+                            set_uv(blocks, grid, u, wy + 2, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, wy + 2, v)));
+                            set_uv(blocks, grid, u, wy + 3, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, wy + 3, v), "bottom"));
+                        } else {
+                            set_uv(blocks, grid, u, wy + 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, u, wy + 1, v)));
+                            set_uv(blocks, grid, u, wy + 3, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, wy + 3, v), "bottom"));
+                        }
                     }
                 }
             }
@@ -1533,41 +1616,51 @@ pub(crate) fn build_courtyard_and_landscaping(
     if (spec.category == BuildCategory::Barn || spec.theme == StructureTheme::Windmill)
         && let Some((fu, fv)) = find_clear_3x3(blocks, grid, fp, best_door, b_v1)
     {
-        for dv in -1..=1 {
-            for du in -1..=1 {
-                let u = fu + du;
-                let v = fv + dv;
-                if du == 0 && dv == 0 {
-                    set_uv(
-                        blocks,
-                        grid,
-                        u,
-                        0,
-                        v,
-                        PlannedBlock::with_props("minecraft:water", vec![("level", "0")]),
-                    );
-                } else {
-                    set_uv(
-                        blocks,
-                        grid,
-                        u,
-                        0,
-                        v,
-                        PlannedBlock::with_props("minecraft:farmland", vec![("moisture", "7")]),
-                    );
-                    let age = match (u + v).abs() % 3 {
-                        0 => "7",
-                        1 => "6",
-                        _ => "5",
-                    };
-                    set_uv(
-                        blocks,
-                        grid,
-                        u,
-                        1,
-                        v,
-                        PlannedBlock::with_props("minecraft:wheat", vec![("age", age)]),
-                    );
+        let fy = terr_at_uv(fu, fv);
+        let dry_flat = (-1..=1).all(|dv| (-1..=1).all(|du| {
+            water_depth_at(water_depths, grid, fu + du, fv + dv) == 0
+                && (terr_at_uv(fu + du, fv + dv) - fy).abs() <= 2
+                && (1..=2).all(|dy| !is_solid_or_occupied(blocks, grid, fu + du, fy + dy, fv + dv))
+        }));
+        if dry_flat {
+            for dv in -1..=1 {
+                for du in -1..=1 {
+                    let u = fu + du;
+                    let v = fv + dv;
+                    let lt = terr_at_uv(u, v);
+                    anchor_yard_foundation(blocks, grid, u, v, lt.min(fy - 1), fy - 1, pal, seed, adapt_terrain);
+                    if du == 0 && dv == 0 {
+                        set_uv(
+                            blocks,
+                            grid,
+                            u,
+                            fy,
+                            v,
+                            PlannedBlock::with_props("minecraft:water", vec![("level", "0")]),
+                        );
+                    } else {
+                        set_uv(
+                            blocks,
+                            grid,
+                            u,
+                            fy,
+                            v,
+                            PlannedBlock::with_props("minecraft:farmland", vec![("moisture", "7")]),
+                        );
+                        let age = match (u + v).abs() % 3 {
+                            0 => "7",
+                            1 => "6",
+                            _ => "5",
+                        };
+                        set_uv(
+                            blocks,
+                            grid,
+                            u,
+                            fy + 1,
+                            v,
+                            PlannedBlock::with_props("minecraft:wheat", vec![("age", age)]),
+                        );
+                    }
                 }
             }
         }
@@ -1580,70 +1673,118 @@ pub(crate) fn build_courtyard_and_landscaping(
             || spec.category == BuildCategory::Pavilion)
         && let Some((pu, pv)) = find_clear_3x3(blocks, grid, fp, best_door, b_v1)
     {
-        for dv in -1..=1 {
-            for du in -1..=1 {
-                let u = pu + du;
-                let v = pv + dv;
-                if du.abs() == 1 && dv.abs() == 1 {
-                    set_uv(blocks, grid, u, 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, 1, v)));
-                    set_uv(blocks, grid, u, 2, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, 2, v)));
-                    set_uv(blocks, grid, u, 3, v, make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, u, 3, v)));
-                } else if du == 0 || dv == 0 {
-                    set_uv(blocks, grid, u, 3, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, 3, v), "top"));
+        let py = terr_at_uv(pu, pv);
+        let dry_flat = (-1..=1).all(|dv| (-1..=1).all(|du| {
+            water_depth_at(water_depths, grid, pu + du, pv + dv) == 0
+                && (terr_at_uv(pu + du, pv + dv) - py).abs() <= 2
+                && (1..=3).all(|dy| !is_solid_or_occupied(blocks, grid, pu + du, py + dy, pv + dv))
+        }));
+        if dry_flat {
+            for dv in -1..=1 {
+                for du in -1..=1 {
+                    let u = pu + du;
+                    let v = pv + dv;
+                    let lt = terr_at_uv(u, v);
+                    if du.abs() == 1 && dv.abs() == 1 {
+                        anchor_yard_foundation(blocks, grid, u, v, lt.min(py), py, pal, seed, adapt_terrain);
+                        set_uv(blocks, grid, u, py + 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, py + 1, v)));
+                        set_uv(blocks, grid, u, py + 2, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, py + 2, v)));
+                        set_uv(blocks, grid, u, py + 3, v, make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, u, py + 3, v)));
+                    } else if du == 0 || dv == 0 {
+                        set_uv(blocks, grid, u, py + 3, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, py + 3, v), "top"));
+                    }
                 }
             }
+            anchor_yard_foundation(blocks, grid, pu, pv, terr_at_uv(pu, pv).min(py), py, pal, seed, adapt_terrain);
+            set_uv(blocks, grid, pu, py + 1, pv, PlannedBlock::simple(style_pot(spec.style)));
+            anchor_yard_foundation(blocks, grid, pu - 1, pv, terr_at_uv(pu - 1, pv).min(py), py, pal, seed, adapt_terrain);
+            set_uv(
+                blocks,
+                grid,
+                pu - 1,
+                py + 1,
+                pv,
+                make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, pu - 1, py + 1, pv), grid.dir_right(), "bottom"),
+            );
         }
-        set_uv(blocks, grid, pu, 1, pv, PlannedBlock::simple(style_pot(spec.style)));
-        set_uv(
-            blocks,
-            grid,
-            pu - 1,
-            1,
-            pv,
-            make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, pu - 1, 1, pv), grid.dir_right(), "bottom"),
-        );
     }
 
     // Forge Outdoor Smithing Workyard vs Barn/Windmill Hay & Trough Farmstead vs Tavern Beer Garden.
     if spec.category == BuildCategory::Forge {
         if let Some((su, sv)) = find_clear_3x2(blocks, grid, fp, best_door, b_v1) {
-            for dv in 0..=1 {
-                for du in 0..=2 {
-                    set_uv(blocks, grid, su + du, 0, sv + dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, su + du, 0, sv + dv)));
+            let fy = terr_at_uv(su + 1, sv);
+            if (0..=1).all(|dv| (0..=2).all(|du| water_depth_at(water_depths, grid, su + du, sv + dv) == 0 && !is_solid_or_occupied(blocks, grid, su + du, fy + 1, sv + dv))) {
+                for dv in 0..=1 {
+                    for du in 0..=2 {
+                        let lt = terr_at_uv(su + du, sv + dv);
+                        anchor_yard_foundation(blocks, grid, su + du, sv + dv, lt.min(fy), fy, pal, seed, adapt_terrain);
+                    }
                 }
+                set_uv(blocks, grid, su, fy + 1, sv + 1, PlannedBlock::with_props("minecraft:anvil", vec![("facing", grid.dir_front())]));
+                set_uv(blocks, grid, su + 1, fy + 1, sv + 1, PlannedBlock::simple("minecraft:lava_cauldron"));
+                set_uv(blocks, grid, su + 2, fy + 1, sv + 1, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
+                set_uv(blocks, grid, su, fy + 1, sv, PlannedBlock::with_props("minecraft:grindstone", vec![("face", "floor"), ("facing", grid.dir_front())]));
+                set_uv(blocks, grid, su + 1, fy + 1, sv, PlannedBlock::with_props("minecraft:dark_oak_log", vec![("axis", "x")]));
+                set_uv(blocks, grid, su + 2, fy + 1, sv, PlannedBlock::with_props("minecraft:barrel", vec![("facing", "up")]));
             }
-            set_uv(blocks, grid, su, 1, sv + 1, PlannedBlock::with_props("minecraft:anvil", vec![("facing", grid.dir_front())]));
-            set_uv(blocks, grid, su + 1, 1, sv + 1, PlannedBlock::simple("minecraft:lava_cauldron"));
-            set_uv(blocks, grid, su + 2, 1, sv + 1, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
-            set_uv(blocks, grid, su, 1, sv, PlannedBlock::with_props("minecraft:grindstone", vec![("face", "floor"), ("facing", grid.dir_front())]));
-            set_uv(blocks, grid, su + 1, 1, sv, PlannedBlock::with_props("minecraft:dark_oak_log", vec![("axis", "x")]));
-            set_uv(blocks, grid, su + 2, 1, sv, PlannedBlock::with_props("minecraft:barrel", vec![("facing", "up")]));
         } else if let Some((su, sv)) = find_clear_rect(blocks, grid, fp, best_door, b_v1, 2, 2) {
-            set_uv(blocks, grid, su, 1, sv, PlannedBlock::with_props("minecraft:anvil", vec![("facing", grid.dir_front())]));
-            set_uv(blocks, grid, su + 1, 1, sv, PlannedBlock::simple("minecraft:lava_cauldron"));
-            set_uv(blocks, grid, su, 1, sv + 1, PlannedBlock::with_props("minecraft:grindstone", vec![("face", "floor"), ("facing", grid.dir_front())]));
-            set_uv(blocks, grid, su + 1, 1, sv + 1, PlannedBlock::with_props("minecraft:dark_oak_log", vec![("axis", "x")]));
+            let fy = terr_at_uv(su, sv);
+            if (0..=1).all(|dv| (0..=1).all(|du| water_depth_at(water_depths, grid, su + du, sv + dv) == 0 && !is_solid_or_occupied(blocks, grid, su + du, fy + 1, sv + dv))) {
+                for dv in 0..=1 {
+                    for du in 0..=1 {
+                        anchor_yard_foundation(blocks, grid, su + du, sv + dv, terr_at_uv(su + du, sv + dv).min(fy), fy, pal, seed, adapt_terrain);
+                    }
+                }
+                set_uv(blocks, grid, su, fy + 1, sv, PlannedBlock::with_props("minecraft:anvil", vec![("facing", grid.dir_front())]));
+                set_uv(blocks, grid, su + 1, fy + 1, sv, PlannedBlock::simple("minecraft:lava_cauldron"));
+                set_uv(blocks, grid, su, fy + 1, sv + 1, PlannedBlock::with_props("minecraft:grindstone", vec![("face", "floor"), ("facing", grid.dir_front())]));
+                set_uv(blocks, grid, su + 1, fy + 1, sv + 1, PlannedBlock::with_props("minecraft:dark_oak_log", vec![("axis", "x")]));
+            }
         }
     } else if spec.category == BuildCategory::Barn || spec.theme == StructureTheme::Windmill {
         if let Some((su, sv)) = find_clear_rect(blocks, grid, fp, best_door, b_v1, 2, 2) {
-            set_uv(blocks, grid, su, 1, sv, PlannedBlock::simple("minecraft:composter"));
-            set_uv(blocks, grid, su + 1, 1, sv, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
-            set_uv(blocks, grid, su, 1, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, su, 2, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, su + 1, 1, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
+            let by = terr_at_uv(su, sv);
+            if (0..=1).all(|dv| (0..=1).all(|du| water_depth_at(water_depths, grid, su + du, sv + dv) == 0 && (1..=2).all(|dy| !is_solid_or_occupied(blocks, grid, su + du, by + dy, sv + dv)))) {
+                for dv in 0..=1 {
+                    for du in 0..=1 {
+                        anchor_yard_foundation(blocks, grid, su + du, sv + dv, terr_at_uv(su + du, sv + dv).min(by), by, pal, seed, adapt_terrain);
+                    }
+                }
+                set_uv(blocks, grid, su, by + 1, sv, PlannedBlock::simple("minecraft:composter"));
+                set_uv(blocks, grid, su + 1, by + 1, sv, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
+                set_uv(blocks, grid, su, by + 1, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, su, by + 2, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, su + 1, by + 1, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
+            }
         } else if let Some((su, sv)) = find_clear_rect(blocks, grid, fp, best_door, b_v1, 3, 1) {
-            set_uv(blocks, grid, su, 1, sv, PlannedBlock::simple("minecraft:composter"));
-            set_uv(blocks, grid, su + 1, 1, sv, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, su + 1, 2, sv, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, su + 2, 1, sv, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
+            let by = terr_at_uv(su + 1, sv);
+            if (0..=2).all(|du| water_depth_at(water_depths, grid, su + du, sv) == 0 && (1..=2).all(|dy| !is_solid_or_occupied(blocks, grid, su + du, by + dy, sv))) {
+                for du in 0..=2 {
+                    anchor_yard_foundation(blocks, grid, su + du, sv, terr_at_uv(su + du, sv).min(by), by, pal, seed, adapt_terrain);
+                }
+                set_uv(blocks, grid, su, by + 1, sv, PlannedBlock::simple("minecraft:composter"));
+                set_uv(blocks, grid, su + 1, by + 1, sv, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, su + 1, by + 2, sv, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, su + 2, by + 1, sv, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
+            }
         } else if let Some((su, sv)) = find_clear_rect(blocks, grid, fp, best_door, b_v1, 1, 3) {
-            set_uv(blocks, grid, su, 1, sv + 2, PlannedBlock::simple("minecraft:composter"));
-            set_uv(blocks, grid, su, 1, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, su, 2, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, su, 1, sv, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
+            let by = terr_at_uv(su, sv + 1);
+            if (0..=2).all(|dv| water_depth_at(water_depths, grid, su, sv + dv) == 0 && (1..=2).all(|dy| !is_solid_or_occupied(blocks, grid, su, by + dy, sv + dv))) {
+                for dv in 0..=2 {
+                    anchor_yard_foundation(blocks, grid, su, sv + dv, terr_at_uv(su, sv + dv).min(by), by, pal, seed, adapt_terrain);
+                }
+                set_uv(blocks, grid, su, by + 1, sv + 2, PlannedBlock::simple("minecraft:composter"));
+                set_uv(blocks, grid, su, by + 1, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, su, by + 2, sv + 1, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, su, by + 1, sv, PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]));
+            }
         } else if let Some((hu, hv)) = find_clear_rect(blocks, grid, fp, best_door, b_v1, 1, 1) {
-            set_uv(blocks, grid, hu, 1, hv, PlannedBlock::simple("minecraft:hay_block"));
-            set_uv(blocks, grid, hu, 2, hv, PlannedBlock::simple("minecraft:hay_block"));
+            let by = terr_at_uv(hu, hv);
+            if water_depth_at(water_depths, grid, hu, hv) == 0 && (1..=2).all(|dy| !is_solid_or_occupied(blocks, grid, hu, by + dy, hv)) {
+                anchor_yard_foundation(blocks, grid, hu, hv, by, by, pal, seed, adapt_terrain);
+                set_uv(blocks, grid, hu, by + 1, hv, PlannedBlock::simple("minecraft:hay_block"));
+                set_uv(blocks, grid, hu, by + 2, hv, PlannedBlock::simple("minecraft:hay_block"));
+            }
         }
     } else if (spec.theme == StructureTheme::Tavern || matches!(spec.category, BuildCategory::House | BuildCategory::Pavilion))
         && grid.w >= 17
@@ -1654,24 +1795,33 @@ pub(crate) fn build_courtyard_and_landscaping(
         // Outdoor beer-garden table or shaded courtyard bistro bench!
         let tu = tu0 + 1;
         let tv = tv0 + 1;
-        set_uv(blocks, grid, tu, 1, tv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, tu, 1, tv)));
-        set_uv(
-            blocks,
-            grid,
-            tu,
-            2,
-            tv,
+        let by = terr_at_uv(tu, tv);
+        if (-1..=1).all(|du| water_depth_at(water_depths, grid, tu + du, tv) == 0 && !is_solid_or_occupied(blocks, grid, tu + du, by + 1, tv))
+            && water_depth_at(water_depths, grid, tu, tv - 1) == 0
+        {
+            for u in [tu - 1, tu, tu + 1] {
+                anchor_yard_foundation(blocks, grid, u, tv, terr_at_uv(u, tv).min(by), by, pal, seed, adapt_terrain);
+            }
+            set_uv(blocks, grid, tu, by + 1, tv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, tu, by + 1, tv)));
+            set_uv(
+                blocks,
+                grid,
+                tu,
+                by + 2,
+                tv,
+                if spec.theme == StructureTheme::Tavern {
+                    PlannedBlock::with_props("minecraft:sea_pickle", vec![("pickles", "2"), ("waterlogged", "false")])
+                } else {
+                    PlannedBlock::simple(style_pot(spec.style))
+                },
+            );
+            set_uv(blocks, grid, tu - 1, by + 1, tv, make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, tu - 1, by + 1, tv), grid.dir_left(), "bottom"));
+            set_uv(blocks, grid, tu + 1, by + 1, tv, make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, tu + 1, by + 1, tv), grid.dir_right(), "bottom"));
             if spec.theme == StructureTheme::Tavern {
-                PlannedBlock::with_props("minecraft:sea_pickle", vec![("pickles", "2"), ("waterlogged", "false")])
-            } else {
-                PlannedBlock::simple(style_pot(spec.style))
-            },
-        );
-        set_uv(blocks, grid, tu - 1, 1, tv, make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, tu - 1, 1, tv), grid.dir_left(), "bottom"));
-        set_uv(blocks, grid, tu + 1, 1, tv, make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, tu + 1, 1, tv), grid.dir_right(), "bottom"));
-        if spec.theme == StructureTheme::Tavern {
-            set_uv(blocks, grid, tu, 1, tv - 1, PlannedBlock::with_props("minecraft:barrel", vec![("facing", "up")]));
-            set_uv(blocks, grid, tu, 2, tv - 1, PlannedBlock::with_props("minecraft:cake", vec![("bites", "0")]));
+                anchor_yard_foundation(blocks, grid, tu, tv - 1, terr_at_uv(tu, tv - 1).min(by), by, pal, seed, adapt_terrain);
+                set_uv(blocks, grid, tu, by + 1, tv - 1, PlannedBlock::with_props("minecraft:barrel", vec![("facing", "up")]));
+                set_uv(blocks, grid, tu, by + 2, tv - 1, PlannedBlock::with_props("minecraft:cake", vec![("bites", "0")]));
+            }
         }
     }
 
@@ -1685,54 +1835,65 @@ pub(crate) fn build_courtyard_and_landscaping(
         && (spec.courtyard_garden || matches!(spec.style, BuildStyle::Japanese | BuildStyle::Cottage))
         && let Some((pu, pv)) = find_clear_3x3(blocks, grid, fp, best_door, b_v1)
     {
-        for dv in -1..=1 {
-            for du in -1..=1 {
-                let u = pu + du;
-                let v = pv + dv;
-                if du == 0 && dv == 0 {
-                    set_uv(blocks, grid, u, -1, v, PlannedBlock::simple("minecraft:sea_lantern"));
-                    set_uv(
-                        blocks,
-                        grid,
-                        u,
-                        0,
-                        v,
-                        PlannedBlock::with_props("minecraft:water", vec![("level", "0")]),
-                    );
-                    set_uv(blocks, grid, u, 1, v, PlannedBlock::simple("minecraft:lily_pad"));
-                } else {
-                    let bank = if spec.style == BuildStyle::Japanese && (du == 0 || dv == 0) {
-                        "minecraft:stone_bricks"
-                    } else if (du + dv) % 2 == 0 {
-                        "minecraft:moss_block"
-                    } else {
-                        "minecraft:gravel"
-                    };
-                    set_uv(blocks, grid, u, 0, v, PlannedBlock::simple(bank));
-                    if spec.style == BuildStyle::Japanese && du == -1 && dv == -1 && !is_solid_or_occupied(blocks, grid, u, 1, v) {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, 1, v)));
-                        let pond_light = pal.pick(MaterialPalette::SLOT_LIGHT, seed, u, 2, v);
-                        if is_lantern(&pond_light) {
-                            set_uv(blocks, grid, u, 2, v, PlannedBlock::simple(pond_light));
-                        }
-                    } else if du == 1 && dv == 1 && !is_solid_or_occupied(blocks, grid, u, 1, v) {
+        let py = terr_at_uv(pu, pv);
+        let dry_flat = (-1..=1).all(|dv| (-1..=1).all(|du| {
+            water_depth_at(water_depths, grid, pu + du, pv + dv) == 0
+                && (terr_at_uv(pu + du, pv + dv) - py).abs() <= 2
+                && (1..=2).all(|dy| !is_solid_or_occupied(blocks, grid, pu + du, py + dy, pv + dv))
+        }));
+        if dry_flat {
+            for dv in -1..=1 {
+                for du in -1..=1 {
+                    let u = pu + du;
+                    let v = pv + dv;
+                    let lt = terr_at_uv(u, v);
+                    if du == 0 && dv == 0 {
+                        anchor_yard_foundation(blocks, grid, u, v, lt.min(py - 1), py - 1, pal, seed, adapt_terrain);
+                        set_uv(blocks, grid, u, py - 1, v, PlannedBlock::simple("minecraft:sea_lantern"));
                         set_uv(
                             blocks,
                             grid,
                             u,
-                            1,
+                            py,
                             v,
-                            PlannedBlock::with_props("minecraft:sugar_cane", vec![("age", "0")]),
+                            PlannedBlock::with_props("minecraft:water", vec![("level", "0")]),
                         );
-                        if !is_solid_or_occupied(blocks, grid, u, 2, v) {
+                        set_uv(blocks, grid, u, py + 1, v, PlannedBlock::simple("minecraft:lily_pad"));
+                    } else {
+                        anchor_yard_foundation(blocks, grid, u, v, lt.min(py), py, pal, seed, adapt_terrain);
+                        let bank = if spec.style == BuildStyle::Japanese && (du == 0 || dv == 0) {
+                            "minecraft:stone_bricks"
+                        } else if (du + dv) % 2 == 0 {
+                            "minecraft:moss_block"
+                        } else {
+                            "minecraft:gravel"
+                        };
+                        set_uv(blocks, grid, u, py, v, PlannedBlock::simple(bank));
+                        if spec.style == BuildStyle::Japanese && du == -1 && dv == -1 && !is_solid_or_occupied(blocks, grid, u, py + 1, v) {
+                            set_uv(blocks, grid, u, py + 1, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, u, py + 1, v)));
+                            let pond_light = pal.pick(MaterialPalette::SLOT_LIGHT, seed, u, py + 2, v);
+                            if is_lantern(&pond_light) {
+                                set_uv(blocks, grid, u, py + 2, v, PlannedBlock::simple(pond_light));
+                            }
+                        } else if du == 1 && dv == 1 && !is_solid_or_occupied(blocks, grid, u, py + 1, v) {
                             set_uv(
                                 blocks,
                                 grid,
                                 u,
-                                2,
+                                py + 1,
                                 v,
                                 PlannedBlock::with_props("minecraft:sugar_cane", vec![("age", "0")]),
                             );
+                            if !is_solid_or_occupied(blocks, grid, u, py + 2, v) {
+                                set_uv(
+                                    blocks,
+                                    grid,
+                                    u,
+                                    py + 2,
+                                    v,
+                                    PlannedBlock::with_props("minecraft:sugar_cane", vec![("age", "0")]),
+                                );
+                            }
                         }
                     }
                 }
@@ -1749,11 +1910,15 @@ pub(crate) fn build_courtyard_and_landscaping(
         let mut vine_count = 0;
         for v in 1..(grid.d - 1) {
             for u in 1..(grid.w - 1) {
+                if water_depth_at(water_depths, grid, u, v) > 0 {
+                    continue;
+                }
+                let ty = terr_at_uv(u, v);
                 let only_engawa_slab = spec.style == BuildStyle::Japanese
                     && get_uv(blocks, grid, u, base_y, v).is_some_and(|b| b.block_id.ends_with("_slab"))
                     && !is_solid_or_occupied(blocks, grid, u, base_y + 1, v)
                     && !is_solid_or_occupied(blocks, grid, u, base_y + 2, v);
-                let ground_free = !is_solid_or_occupied(blocks, grid, u, 1, v)
+                let ground_free = !is_solid_or_occupied(blocks, grid, u, ty + 1, v)
                     && !is_solid_or_occupied(blocks, grid, u, base_y + 1, v);
                 if is_fp(grid, fp, u, v) || (!ground_free && !only_engawa_slab) {
                     continue;
@@ -1822,11 +1987,14 @@ pub(crate) fn build_courtyard_and_landscaping(
                     }
                     if planter_count < 6
                         && (only_engawa_slab || noise.cell_hash(u, 5, v) > 0.72)
-                        && !is_solid_or_occupied(blocks, grid, u, 2, v)
+                        && !is_solid_or_occupied(blocks, grid, u, ty + 2, v)
                         && !is_solid_or_occupied(blocks, grid, u, base_y + 2, v)
                     {
-                        let py = if only_engawa_slab { base_y } else { 1 };
+                        let py = if only_engawa_slab { base_y } else { ty };
                         if !is_solid_or_occupied(blocks, grid, u, py + 1, v) {
+                            if !only_engawa_slab {
+                                anchor_yard_foundation(blocks, grid, u, v, py, py - 1, pal, seed, adapt_terrain);
+                            }
                             set_uv(blocks, grid, u, py, v, PlannedBlock::simple("minecraft:moss_block"));
                             if spec.style == BuildStyle::Japanese && planter_count % 2 == 0 {
                                 set_uv(
@@ -1867,13 +2035,14 @@ pub(crate) fn build_courtyard_and_landscaping(
                         && ground_free
                         && noise.fbm_2d(u as f64 * 0.55, v as f64 * 0.55, 2) > 0.58
                     {
-                        set_uv(blocks, grid, u, 1, v, make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, u, 1, v)));
-                        if noise.cell_hash(u, 2, v) > 0.65 && !is_solid_or_occupied(blocks, grid, u, 2, v) {
-                            set_uv(blocks, grid, u, 2, v, make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, u, 2, v)));
+                        anchor_yard_foundation(blocks, grid, u, v, ty, ty, pal, seed, adapt_terrain);
+                        set_uv(blocks, grid, u, ty + 1, v, make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, u, ty + 1, v)));
+                        if noise.cell_hash(u, 2, v) > 0.65 && !is_solid_or_occupied(blocks, grid, u, ty + 2, v) {
+                            set_uv(blocks, grid, u, ty + 2, v, make_leaves(&pal.pick(MaterialPalette::SLOT_LEAVES, seed, u, ty + 2, v)));
                         }
                     }
                 } else if ground_free
-                    && !is_solid_or_occupied(blocks, grid, u, 0, v)
+                    && !is_solid_or_occupied(blocks, grid, u, ty, v)
                     && best_door.is_none_or(|(du, dv)| (u - du).abs() > 2 || v < dv)
                 {
                     let fh = noise.cell_hash(u, 7, v);
@@ -1894,11 +2063,11 @@ pub(crate) fn build_courtyard_and_landscaping(
                                 vec![("facing", grid.dir_front()), ("segment_amount", "3")],
                             )
                         };
-                        set_uv(blocks, grid, u, 1, v, dec);
+                        set_uv(blocks, grid, u, ty + 1, v, dec);
                     } else if fh > 0.85 {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple("minecraft:fern"));
+                        set_uv(blocks, grid, u, ty + 1, v, PlannedBlock::simple("minecraft:fern"));
                     } else if fh > 0.77 {
-                        set_uv(blocks, grid, u, 1, v, PlannedBlock::simple("minecraft:short_grass"));
+                        set_uv(blocks, grid, u, ty + 1, v, PlannedBlock::simple("minecraft:short_grass"));
                     }
                 }
             }
@@ -1919,6 +2088,8 @@ pub(crate) fn build_market_awning_stall(
     spec: &BlueprintSpec,
     pal: &MaterialPalette,
     seed: u64,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
 ) {
     if !spec.market_awning || spec.ruin_erosion >= 0.1 || spec.category == BuildCategory::Bridge {
         return;
@@ -1987,6 +2158,12 @@ pub(crate) fn build_market_awning_stall(
             set_uv(blocks, grid, u, ground_y + 3, sv + 1, PlannedBlock::simple(wool1));
             set_uv(blocks, grid, u, ground_y + 3, sv + 2, PlannedBlock::simple(wool2));
             if k == 0 || k == aw_w - 1 {
+                let post_terr = if adapt_terrain {
+                    terrain_rel_at(terrain_offsets, grid, u, sv + 2).clamp(-16, ground_y)
+                } else {
+                    0
+                };
+                anchor_yard_foundation(blocks, grid, u, sv + 2, post_terr, ground_y, pal, seed, adapt_terrain);
                 set_uv(
                     blocks,
                     grid,
@@ -2027,6 +2204,12 @@ pub(crate) fn build_market_awning_stall(
                         PlannedBlock::simple("minecraft:spore_blossom")
                     },
                 );
+                let ctr_terr = if adapt_terrain {
+                    terrain_rel_at(terrain_offsets, grid, u, sv + 1).clamp(-16, ground_y)
+                } else {
+                    0
+                };
+                anchor_yard_foundation(blocks, grid, u, sv + 1, ctr_terr, ground_y, pal, seed, adapt_terrain);
                 set_uv(
                     blocks,
                     grid,
@@ -2269,6 +2452,9 @@ pub(crate) fn build_downspouts_and_signs(
     spec: &BlueprintSpec,
     pal: &MaterialPalette,
     seed: u64,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
 ) {
     if spec.ruin_erosion >= 0.1 || spec.category == BuildCategory::Bridge {
         return;
@@ -2283,20 +2469,29 @@ pub(crate) fn build_downspouts_and_signs(
         if spout_done
             || !grid.in_bounds(su, sv)
             || is_fp(grid, fp, su, sv)
+            || water_depth_at(water_depths, grid, su, sv) > 0
             || best_door.is_some_and(|(du, dv)| (su - du).abs() <= 2 && sv >= dv)
         {
             continue;
         }
-        if (1..=top_spout_y).all(|y| !is_solid_or_occupied(blocks, grid, su, y, sv)) {
+        let ty = if adapt_terrain {
+            terrain_rel_at(terrain_offsets, grid, su, sv).clamp(-10, ground_y)
+        } else {
+            0
+        };
+        if ty + 2 < top_spout_y
+            && (ty + 1..=top_spout_y).all(|y| !is_solid_or_occupied(blocks, grid, su, y, sv))
+        {
+            anchor_yard_foundation(blocks, grid, su, sv, ty, ty, pal, seed, adapt_terrain);
             set_uv(
                 blocks,
                 grid,
                 su,
-                1,
+                ty + 1,
                 sv,
                 PlannedBlock::with_props("minecraft:water_cauldron", vec![("level", "3")]),
             );
-            for y in 2..top_spout_y {
+            for y in (ty + 2)..top_spout_y {
                 set_uv(
                     blocks,
                     grid,
@@ -2386,6 +2581,9 @@ pub(crate) fn build_custom_yard_trees(
     pal: &MaterialPalette,
     seed: u64,
     height: u16,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
 ) {
     if grid.w < 19
         || grid.d < 17
@@ -2397,16 +2595,23 @@ pub(crate) fn build_custom_yard_trees(
         return;
     }
     let [_b_u0, _b_v0, _b_u1, b_v1] = bounds;
-    let max_clear_y = (i32::from(height) - 2).min(7);
-    if max_clear_y < 5 {
+    let max_h_lim = i32::from(height) - 2;
+    if max_h_lim < 5 {
         return;
     }
+    let terr_at_uv = |u: i32, v: i32| -> i32 {
+        if adapt_terrain {
+            terrain_rel_at(terrain_offsets, grid, u, v).clamp(-10, 6)
+        } else {
+            0
+        }
+    };
 
-    let mut chosen: Option<(i32, i32)> = None;
+    let mut chosen: Option<(i32, i32, i32)> = None;
     let mut best_score = i32::MAX;
     for tv in 1..(grid.d - 1) {
         for tu in 1..(grid.w - 1) {
-            if is_fp(grid, fp, tu, tv) {
+            if is_fp(grid, fp, tu, tv) || water_depth_at(water_depths, grid, tu, tv) > 0 {
                 continue;
             }
             if let Some((du, dv)) = best_door
@@ -2415,26 +2620,30 @@ pub(crate) fn build_custom_yard_trees(
             {
                 continue;
             }
-            let base_ok = get_uv(blocks, grid, tu, 0, tv)
-                .is_none_or(|b| b.block_id != "minecraft:water")
-                && get_uv(blocks, grid, tu, 1, tv).is_none_or(|b| {
-                    matches!(
-                        b.block_id.as_str(),
-                        "minecraft:short_grass"
-                            | "minecraft:fern"
-                            | "minecraft:wildflowers"
-                            | "minecraft:pink_petals"
-                            | "minecraft:leaf_litter"
-                            | "minecraft:moss_carpet"
-                    )
-                });
-            let trunk_air_ok = (2..=max_clear_y)
+            let ty = terr_at_uv(tu, tv);
+            let top_y = (ty + 7).min(max_h_lim);
+            if top_y < ty + 5 {
+                continue;
+            }
+            let base_ok = get_uv(blocks, grid, tu, ty + 1, tv).is_none_or(|b| {
+                matches!(
+                    b.block_id.as_str(),
+                    "minecraft:air"
+                        | "minecraft:short_grass"
+                        | "minecraft:fern"
+                        | "minecraft:wildflowers"
+                        | "minecraft:pink_petals"
+                        | "minecraft:leaf_litter"
+                        | "minecraft:moss_carpet"
+                )
+            });
+            let trunk_air_ok = ((ty + 2)..=top_y)
                 .all(|y| !is_solid_or_occupied(blocks, grid, tu, y, tv));
             let ring_cardinal_clear = [(-1, 0), (1, 0), (0, -1), (0, 1)]
                 .into_iter()
                 .filter(|&(du, dv)| {
                     !is_fp(grid, fp, tu + du, tv + dv)
-                        && !is_solid_or_occupied(blocks, grid, tu + du, 5, tv + dv)
+                        && !is_solid_or_occupied(blocks, grid, tu + du, ty + 5, tv + dv)
                 })
                 .count();
             if base_ok && trunk_air_ok && ring_cardinal_clear >= 2 {
@@ -2442,14 +2651,15 @@ pub(crate) fn build_custom_yard_trees(
                 let score = clear_4 + if tv > b_v1 { 0 } else { 8 } + (tu - grid.w / 2).abs();
                 if score < best_score {
                     best_score = score;
-                    chosen = Some((tu, tv));
+                    chosen = Some((tu, tv, ty));
                 }
             }
         }
     }
-    let Some((tu, tv)) = chosen else {
+    let Some((tu, tv, ty)) = chosen else {
         return;
     };
+    let max_clear_y = (ty + 7).min(max_h_lim);
 
     enum TreeStyle {
         SpruceCone,
@@ -2473,9 +2683,12 @@ pub(crate) fn build_custom_yard_trees(
         }
     };
 
+    // Anchor tree base firmly into ground/lot terrain so trunks never float on slopes.
+    anchor_yard_foundation(blocks, grid, tu, tv, ty, ty, pal, seed, adapt_terrain);
+
     match tree_kind {
         TreeStyle::SpruceCone => {
-            for y in 1..=6.min(max_clear_y) {
+            for y in (ty + 1)..=(ty + 6).min(max_clear_y) {
                 set_uv(
                     blocks,
                     grid,
@@ -2485,7 +2698,8 @@ pub(crate) fn build_custom_yard_trees(
                     PlannedBlock::with_props(trunk_id, vec![("axis", "y")]),
                 );
             }
-            for (ly, rad) in [(3i32, 2i32), (4, 1), (5, 1), (6, 1)] {
+            for (dy, rad) in [(3i32, 2i32), (4, 1), (5, 1), (6, 1)] {
+                let ly = ty + dy;
                 if ly > max_clear_y {
                     continue;
                 }
@@ -2494,7 +2708,7 @@ pub(crate) fn build_custom_yard_trees(
                         if (du == 0 && dv == 0) || (rad == 2 && du.abs() == 2 && dv.abs() == 2) {
                             continue;
                         }
-                        if ly == 6 && (du.abs() + dv.abs() > 1) {
+                        if dy == 6 && (du.abs() + dv.abs() > 1) {
                             continue;
                         }
                         let (cu, cv) = (tu + du, tv + dv);
@@ -2507,14 +2721,14 @@ pub(crate) fn build_custom_yard_trees(
                     }
                 }
             }
-            if 7 <= max_clear_y && !is_solid_or_occupied(blocks, grid, tu, 7, tv) {
-                set_uv(blocks, grid, tu, 7, tv, make_leaves(&pick_leaf(tu, 7, tv)));
+            if ty + 7 <= max_clear_y && !is_solid_or_occupied(blocks, grid, tu, ty + 7, tv) {
+                set_uv(blocks, grid, tu, ty + 7, tv, make_leaves(&pick_leaf(tu, ty + 7, tv)));
             }
         }
         TreeStyle::CypressPillar => {
             // Tall slender Mediterranean cypress spire beside Classical & Desert builds.
-            let top_y = 6.min(max_clear_y);
-            for y in 1..=top_y.min(5) {
+            let top_y = (ty + 6).min(max_clear_y);
+            for y in (ty + 1)..=top_y.min(ty + 5) {
                 set_uv(
                     blocks,
                     grid,
@@ -2524,7 +2738,7 @@ pub(crate) fn build_custom_yard_trees(
                     PlannedBlock::with_props(trunk_id, vec![("axis", "y")]),
                 );
             }
-            for ly in 2..=top_y {
+            for ly in (ty + 2)..=top_y {
                 for (du, dv) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                     let (cu, cv) = (tu + du, tv + dv);
                     if grid.in_bounds(cu, cv)
@@ -2540,7 +2754,7 @@ pub(crate) fn build_custom_yard_trees(
             }
         }
         TreeStyle::OrnamentalFlat => {
-            for y in 1..=4.min(max_clear_y) {
+            for y in (ty + 1)..=(ty + 4).min(max_clear_y) {
                 set_uv(
                     blocks,
                     grid,
@@ -2550,7 +2764,7 @@ pub(crate) fn build_custom_yard_trees(
                     PlannedBlock::with_props(trunk_id, vec![("axis", "y")]),
                 );
             }
-            let crown_y = 5.min(max_clear_y);
+            let crown_y = (ty + 5).min(max_clear_y);
             for dv in -1..=1 {
                 for du in -1..=1 {
                     let (cu, cv) = (tu + du, tv + dv);
@@ -2570,18 +2784,18 @@ pub(crate) fn build_custom_yard_trees(
         }
         TreeStyle::CrookedCanopy => {
             let lean_u = if !is_fp(grid, fp, tu - 1, tv)
-                && !is_solid_or_occupied(blocks, grid, tu - 1, 4, tv)
+                && !is_solid_or_occupied(blocks, grid, tu - 1, ty + 4, tv)
                 && (tu >= grid.w / 2 || is_fp(grid, fp, tu + 1, tv))
             {
                 -1
             } else if !is_fp(grid, fp, tu + 1, tv)
-                && !is_solid_or_occupied(blocks, grid, tu + 1, 4, tv)
+                && !is_solid_or_occupied(blocks, grid, tu + 1, ty + 4, tv)
             {
                 1
             } else {
                 0
             };
-            for y in 1..=3 {
+            for y in (ty + 1)..=(ty + 3) {
                 set_uv(
                     blocks,
                     grid,
@@ -2591,11 +2805,22 @@ pub(crate) fn build_custom_yard_trees(
                     PlannedBlock::with_props(trunk_id, vec![("axis", "y")]),
                 );
             }
+            // Keep crooked branch face-connected to trunk at `ty + 3` -> `ty + 4`.
+            if lean_u != 0 && !is_solid_or_occupied(blocks, grid, tu, ty + 4, tv) {
+                set_uv(
+                    blocks,
+                    grid,
+                    tu,
+                    ty + 4,
+                    tv,
+                    PlannedBlock::with_props(trunk_id, vec![("axis", "y")]),
+                );
+            }
             set_uv(
                 blocks,
                 grid,
                 tu + lean_u,
-                4,
+                ty + 4,
                 tv,
                 PlannedBlock::with_props(trunk_id, vec![("axis", if lean_u == 0 { "y" } else { "x" })]),
             );
@@ -2604,30 +2829,30 @@ pub(crate) fn build_custom_yard_trees(
                     let cu = tu + lean_u + du;
                     let cv = tv + dv;
                     if grid.in_bounds(cu, cv) && !is_fp(grid, fp, cu, cv) {
-                        if !is_solid_or_occupied(blocks, grid, cu, 5, cv) {
-                            set_uv(blocks, grid, cu, 5, cv, make_leaves(&pick_leaf(cu, 5, cv)));
+                        if !is_solid_or_occupied(blocks, grid, cu, ty + 5, cv) {
+                            set_uv(blocks, grid, cu, ty + 5, cv, make_leaves(&pick_leaf(cu, ty + 5, cv)));
                         }
                         if du.abs() + dv.abs() <= 1
-                            && 6 <= max_clear_y
-                            && !is_solid_or_occupied(blocks, grid, cu, 6, cv)
+                            && ty + 6 <= max_clear_y
+                            && !is_solid_or_occupied(blocks, grid, cu, ty + 6, cv)
                         {
-                            set_uv(blocks, grid, cu, 6, cv, make_leaves(&pick_leaf(cu, 6, cv)));
+                            set_uv(blocks, grid, cu, ty + 6, cv, make_leaves(&pick_leaf(cu, ty + 6, cv)));
                         }
                     }
                 }
             }
-            let tree_light = pal.pick(MaterialPalette::SLOT_LIGHT, seed, tu + lean_u, 4, tv + 1);
+            let tree_light = pal.pick(MaterialPalette::SLOT_LIGHT, seed, tu + lean_u, ty + 4, tv + 1);
             if grid.in_bounds(tu + lean_u, tv + 1)
                 && !is_fp(grid, fp, tu + lean_u, tv + 1)
-                && !is_solid_or_occupied(blocks, grid, tu + lean_u, 4, tv + 1)
-                && is_solid_or_occupied(blocks, grid, tu + lean_u, 5, tv + 1)
+                && !is_solid_or_occupied(blocks, grid, tu + lean_u, ty + 4, tv + 1)
+                && is_solid_or_occupied(blocks, grid, tu + lean_u, ty + 5, tv + 1)
                 && is_lantern(&tree_light)
             {
                 set_uv(
                     blocks,
                     grid,
                     tu + lean_u,
-                    4,
+                    ty + 4,
                     tv + 1,
                     PlannedBlock::with_props(tree_light, vec![("hanging", "true")]),
                 );
@@ -2639,10 +2864,12 @@ pub(crate) fn build_custom_yard_trees(
     for (du, dv) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
         let cu = tu + du;
         let cv = tv + dv;
+        let cy = terr_at_uv(cu, cv);
         if grid.in_bounds(cu, cv)
+            && (cy - ty).abs() <= 1
             && !is_fp(grid, fp, cu, cv)
-            && !is_solid_or_occupied(blocks, grid, cu, 1, cv)
-            && get_uv(blocks, grid, cu, 0, cv).is_none_or(|b| b.block_id != "minecraft:water")
+            && !is_solid_or_occupied(blocks, grid, cu, cy + 1, cv)
+            && water_depth_at(water_depths, grid, cu, cv) == 0
         {
             let dec = match spec.style {
                 BuildStyle::Japanese => PlannedBlock::with_props(
@@ -2658,7 +2885,7 @@ pub(crate) fn build_custom_yard_trees(
                     vec![("facing", grid.dir_front()), ("segment_amount", "3")],
                 ),
             };
-            set_uv(blocks, grid, cu, 1, cv, dec);
+            set_uv(blocks, grid, cu, cy + 1, cv, dec);
         }
     }
 }
@@ -2811,59 +3038,83 @@ pub(crate) fn decorate_living_exteriors(
                         }
                     }
                 }
-                for (lu, lv) in candidates {
-                    if !grid.in_bounds(lu, lv)
-                        || is_fp(grid, fp, lu, lv)
-                        || water_depth_at(water_depths, grid, lu, lv) > 0
-                    {
-                        continue;
+                for require_spaced in [true, false] {
+                    let mut placed = false;
+                    for &(lu, lv) in &candidates {
+                        if !grid.in_bounds(lu, lv)
+                            || is_fp(grid, fp, lu, lv)
+                            || water_depth_at(water_depths, grid, lu, lv) > 0
+                        {
+                            continue;
+                        }
+                        let ty = terr_at_uv(lu, lv);
+                        let near_other_post = require_spaced && (-1..=1).any(|dv_p| {
+                            (-1..=1).any(|du_p| {
+                                (1..=4).any(|dy| {
+                                    get_uv(blocks, grid, lu + du_p, ty + dy, lv + dv_p).is_some_and(|b| {
+                                        let id = b.block_id.as_str();
+                                        id.ends_with("_wall")
+                                            || id.ends_with("_fence")
+                                            || is_lantern(id)
+                                            || id == "minecraft:redstone_lamp"
+                                            || id == "minecraft:daylight_detector"
+                                    })
+                                })
+                            })
+                        });
+                        if near_other_post {
+                            continue;
+                        }
+                        if (1..=5).all(|dy| !is_solid_or_occupied(blocks, grid, lu, ty + dy, lv)) {
+                            anchor_yard_foundation(blocks, grid, lu, lv, ty, ty, pal, seed, adapt_terrain);
+                            set_uv(
+                                blocks,
+                                grid,
+                                lu,
+                                ty + 1,
+                                lv,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lu, ty + 1, lv)),
+                            );
+                            set_uv(
+                                blocks,
+                                grid,
+                                lu,
+                                ty + 2,
+                                lv,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ty + 2, lv)),
+                            );
+                            set_uv(
+                                blocks,
+                                grid,
+                                lu,
+                                ty + 3,
+                                lv,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ty + 3, lv)),
+                            );
+                            set_uv(
+                                blocks,
+                                grid,
+                                lu,
+                                ty + 4,
+                                lv,
+                                PlannedBlock::with_props("minecraft:redstone_lamp", vec![("lit", "false")]),
+                            );
+                            set_uv(
+                                blocks,
+                                grid,
+                                lu,
+                                ty + 5,
+                                lv,
+                                PlannedBlock::with_props(
+                                    "minecraft:daylight_detector",
+                                    vec![("inverted", "true"), ("power", "0")],
+                                ),
+                            );
+                            placed = true;
+                            break;
+                        }
                     }
-                    let ty = terr_at_uv(lu, lv);
-                    let supported = ty <= 0 || is_solid_or_occupied(blocks, grid, lu, ty, lv);
-                    if supported && (1..=5).all(|dy| !is_solid_or_occupied(blocks, grid, lu, ty + dy, lv)) {
-                        set_uv(
-                            blocks,
-                            grid,
-                            lu,
-                            ty + 1,
-                            lv,
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lu, ty + 1, lv)),
-                        );
-                        set_uv(
-                            blocks,
-                            grid,
-                            lu,
-                            ty + 2,
-                            lv,
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ty + 2, lv)),
-                        );
-                        set_uv(
-                            blocks,
-                            grid,
-                            lu,
-                            ty + 3,
-                            lv,
-                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lu, ty + 3, lv)),
-                        );
-                        set_uv(
-                            blocks,
-                            grid,
-                            lu,
-                            ty + 4,
-                            lv,
-                            PlannedBlock::with_props("minecraft:redstone_lamp", vec![("lit", "false")]),
-                        );
-                        set_uv(
-                            blocks,
-                            grid,
-                            lu,
-                            ty + 5,
-                            lv,
-                            PlannedBlock::with_props(
-                                "minecraft:daylight_detector",
-                                vec![("inverted", "true"), ("power", "0")],
-                            ),
-                        );
+                    if placed {
                         break;
                     }
                 }
