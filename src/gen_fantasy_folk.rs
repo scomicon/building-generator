@@ -409,8 +409,7 @@ pub(crate) fn generate_dwarven_hall(
     set_uv(&mut blocks, grid, cu, 2, v0 + 3, PlannedBlock::simple("minecraft:gold_block"));
     set_uv(&mut blocks, grid, cu, 3, v0 + 3, pick_stair(pal, MaterialPalette::SLOT_FLOOR, seed, cu, 3, v0 + 3, grid.dir_front(), "bottom"));
     set_uv(&mut blocks, grid, cu - 1, 2, v0 + 3, PlannedBlock::simple("minecraft:anvil"));
-    let [lx, lz] = grid.to_local_xz(cu, v1);
-    finish_landmark(req, spec, grid, height, blocks, noise, Some([lx, 2, lz]))
+    finish_landmark(req, spec, grid, height, blocks, noise, None)
 }
 
 /// 39. Dragon Sanctuary / Leviathan Ribcage Shrine: ruined stone dais arched over by huge bone ribcage & skull!
@@ -477,8 +476,7 @@ pub(crate) fn generate_dragon_sanctuary(
     set_uv(&mut blocks, grid, cu - 2, 6, v1 - 2, PlannedBlock::simple("minecraft:bone_block"));
     set_uv(&mut blocks, grid, cu + 2, 6, v1 - 2, PlannedBlock::simple("minecraft:bone_block"));
 
-    let [lx, lz] = grid.to_local_xz(cu, v1);
-    finish_landmark(req, spec, grid, height, blocks, noise, Some([lx, 2, lz]))
+    finish_landmark(req, spec, grid, height, blocks, noise, None)
 }
 
 /// 40. Megalithic Stonehenge Circle & Rune Portal Altar: moss mound, trilithon arches & glowing amethyst core!

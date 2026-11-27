@@ -2210,14 +2210,29 @@ fn compute_origin_in_front(host: &dyn ClientHost, st: &mut ClientUiState) {
     let dist = f64::from(st.width.max(st.depth)) * 0.5 + 4.5;
     let cx = (cam.position[0] + fx * dist).round() as i32;
     let cz = (cam.position[2] + fz * dist).round() as i32;
-    let ox = cx - i32::from(st.width / 2);
-    let oz = cz - i32::from(st.depth / 2);
+    let iw = i32::from(st.width.clamp(7, 96));
+    let id = i32::from(st.depth.clamp(7, 96));
+    let ox = cx - iw / 2;
+    let oz = cz - id / 2;
 
-    let mut oy = (cam.position[1] - f64::from(cam.eye_height)).floor() as i32;
-    if let Ok(heights) = host.client_surface_heights(&[(cx, cz)], Heightmap::MotionBlockingNoLeaves)
-        && let Some(Some(sy)) = heights.first()
-    {
-        oy = sy - 1;
+    // Sample a 5x5 grid across the entire footprint instead of a single center point so local
+    // pillars, fountains, trees, or preexisting roofs do not launch the building into mid-air.
+    let mut sample_cols = Vec::with_capacity(25);
+    for gz in 0..5 {
+        let lz = (gz * (id - 1)) / 4;
+        for gx in 0..5 {
+            let lx = (gx * (iw - 1)) / 4;
+            sample_cols.push((ox + lx, oz + lz));
+        }
+    }
+
+    let mut oy = (cam.position[1] - f64::from(cam.eye_height)).floor() as i32 - 1;
+    if let Ok(heights) = host.client_surface_heights(&sample_cols, Heightmap::MotionBlockingNoLeaves) {
+        let mut ys: Vec<i32> = heights.into_iter().flatten().map(|sy| sy - 1).collect();
+        if !ys.is_empty() {
+            ys.sort_unstable();
+            oy = ys[(ys.len() * 35) / 100];
+        }
     }
     st.origin = Some([ox, oy, oz]);
 }
@@ -2226,10 +2241,12 @@ fn current_aim_block(host: &dyn ClientHost) -> Option<[i32; 3]> {
     if let Some(target) = host.crosshair_target() {
         match target {
             CrosshairTarget::Block { pos, hit, .. } => {
-                // Place bottom right on top of clicked block when hitting top face, else adjacent.
+                // Anchor directly on the clicked surface block when aiming at its top face so foundations
+                // sit flush on terrain instead of hovering 1 block up in the air.
+                let fy = if hit.face[1] > 0 { 0 } else { hit.face[1] };
                 return Some([
                     pos.x + hit.face[0],
-                    pos.y + hit.face[1],
+                    pos.y + fy,
                     pos.z + hit.face[2],
                 ]);
             }
@@ -2244,7 +2261,7 @@ fn current_aim_block(host: &dyn ClientHost) -> Option<[i32; 3]> {
         }
     }
     if let Some((_, hit)) = host.view_hit() {
-        return Some([hit.block_x, hit.block_y + 1, hit.block_z]);
+        return Some([hit.block_x, hit.block_y, hit.block_z]);
     }
     None
 }

@@ -480,8 +480,7 @@ pub(crate) fn generate_sailing_ship(
     }
 
     set_uv(&mut blocks, grid, cu, deck_y + 4, v_stern + 1, PlannedBlock::simple("minecraft:lantern"));
-    let [lx, lz] = grid.to_local_xz(cu, v_mid);
-    finish_landmark(req, spec, grid, height, blocks, noise, Some([lx, deck_y + 1, lz]))
+    finish_landmark(req, spec, grid, height, blocks, noise, None)
 }
 
 /// 23. Harbor Shipyard Dock: cobblestone quay, storage warehouse, towering cargo crane & moored boat.

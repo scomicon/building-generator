@@ -963,7 +963,7 @@ fn build_gable_roof(
                 c0.min(c1)
             };
             let is_ridge_step_wall = !is_gable_outer_end && min_adj_ridge_ry < ry;
-            let is_cross_step_wall = !is_gable_outer_end && min_cross_ry < ry - 1;
+            let is_cross_step_wall = !is_gable_outer_end && min_cross_ry < ry;
             let is_step_wall = is_ridge_step_wall || is_cross_step_wall;
 
             if in_fp && step > 0 && (is_gable_outer_end || is_step_wall) {
@@ -985,7 +985,7 @@ fn build_gable_roof(
                 } else if is_ridge_step_wall {
                     min_adj_ridge_ry
                 } else {
-                    min_cross_ry + 1
+                    min_cross_ry
                 };
                 let wy_start = if is_gable_outer_end {
                     roof_base_y + 1
@@ -1541,9 +1541,18 @@ pub(crate) fn build_wing_cross_gable_roof(
             }
             if in_v && dl == dr && step >= 1 {
                 let r_sl = pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, u, ry, v);
-                set_uv(blocks, grid, u, ry, v, make_slab(&r_sl, "bottom"));
                 if is_end && ry + 1 < i32::from(height) {
+                    set_uv(
+                        blocks,
+                        grid,
+                        u,
+                        ry,
+                        v,
+                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_ROOF, seed, u, ry, v)),
+                    );
                     set_uv(blocks, grid, u, ry + 1, v, make_slab(&r_sl, "bottom"));
+                } else {
+                    set_uv(blocks, grid, u, ry, v, make_slab(&r_sl, "bottom"));
                 }
             } else if v <= (wv0 + wv1) / 2 {
                 set_uv(

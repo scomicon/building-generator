@@ -82,11 +82,13 @@ fn build_footprint(
     });
     let pad_front = if (spec.courtyard_well && grid.d >= 18) || (front_slopes_down && grid.d >= 14) {
         5
-    } else if spec.courtyard_well && grid.d >= 16 {
+    } else if (spec.courtyard_well && grid.d >= 16)
+        || (spec.porch && spec.style == BuildStyle::Classical && grid.d >= 11)
+    {
         4
-    } else if spec.porch && grid.d >= 12 {
+    } else if spec.porch && grid.d >= 11 {
         3
-    } else if spec.porch && grid.d >= 10 {
+    } else if spec.porch && grid.d >= 9 {
         2
     } else if grid.d >= 9 {
         1
@@ -1186,6 +1188,7 @@ fn build_walls_and_buttresses(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn build_corner_turret(
     blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
     grid: LocalGrid,
@@ -1200,6 +1203,9 @@ fn build_corner_turret(
     seed: u64,
     max_placed_roof_y: i32,
     height: u16,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
     rng: &mut SplitMix64,
 ) {
     if !spec.corner_turret {
@@ -1230,7 +1236,7 @@ fn build_corner_turret(
             .into_iter()
             .filter(|&(tu, tv)| {
                 is_fp(grid, fp, tu, tv)
-                    && best_door.is_none_or(|(du, dv)| (tu - du).abs() + (tv - dv).abs() > 3)
+                    && best_door.is_none_or(|(du, dv)| (tu - du).abs() + (tv - dv).abs() > rad + 3)
                     && !stairwell_uv
                         .iter()
                         .any(|&(su, sv)| (su - tu).abs() <= rad + 1 && (sv - tv).abs() <= rad + 1)
@@ -1242,7 +1248,7 @@ fn build_corner_turret(
             .map(|k| turret_candidates[(start_idx + k) % 4])
             .find(|&(tu, tv)| {
                 is_fp(grid, fp, tu, tv)
-                    && best_door.is_none_or(|(du, dv)| (tu - du).abs() + (tv - dv).abs() > 3)
+                    && best_door.is_none_or(|(du, dv)| (tu - du).abs() + (tv - dv).abs() > rad + 3)
                     && !stairwell_uv
                         .iter()
                         .any(|&(su, sv)| (su - tu).abs() <= rad + 1 && (sv - tv).abs() <= rad + 1)
@@ -1286,6 +1292,41 @@ fn build_corner_turret(
                 } else {
                     du.abs() == 1 && dv.abs() == 1
                 };
+                // Ground corner turret solidly into terrain/water even where its 3x3 base projects outside `fp`.
+                let terr = terrain_rel_at(terrain_offsets, grid, u, v);
+                let wd = crate::gen_common::water_depth_at(water_depths, grid, u, v);
+                let seabed = terr - wd;
+                if spec.on_stilts {
+                    if !is_fp(grid, fp, u, v) && is_corner_post {
+                        let post_bot = (seabed - 1).clamp(-14, floor_base - 1);
+                        for y in post_bot..floor_base {
+                            if !is_solid_or_occupied(blocks, grid, u, y, v) {
+                                let blk = if y <= seabed + 1 {
+                                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, y, v))
+                                } else {
+                                    make_frame_block_at(pal, "y", seed, u, y, v)
+                                };
+                                set_uv(blocks, grid, u, y, v, blk);
+                            }
+                        }
+                    }
+                } else {
+                    let skirt_bot = if adapt_terrain { seabed.clamp(-16, 0) } else { 0 };
+                    for y in skirt_bot..floor_base {
+                        if (is_rim || !is_fp(grid, fp, u, v) || !spec.basement || y >= 0)
+                            && !is_solid_or_occupied(blocks, grid, u, y, v)
+                        {
+                            set_uv(
+                                blocks,
+                                grid,
+                                u,
+                                y,
+                                v,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, y, v)),
+                            );
+                        }
+                    }
+                }
                 for y in floor_base..=turret_top {
                     if y == floor_base {
                         set_uv(blocks, grid, u, y, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, y, v)));
@@ -1375,7 +1416,13 @@ fn build_corner_turret(
             } else {
                 grid.in_bounds(eu + ed_u, ev + ed_v) && is_fp(grid, roof_fp, eu + ed_u, ev + ed_v)
             };
-            if floor_exists && grid.in_bounds(eu, ev) {
+            let near_entrance = f == 0
+                && best_door.is_some_and(|(du, dv)| (eu - du).abs() <= 2 && (ev - dv).abs() <= 1);
+            let has_door = (fy..=(fy + 2)).any(|dy| {
+                crate::gen_common::get_uv(blocks, grid, eu, dy, ev)
+                    .is_some_and(|b| b.block_id.ends_with("_door"))
+            });
+            if floor_exists && grid.in_bounds(eu, ev) && !near_entrance && !has_door {
                 set_uv(blocks, grid, eu, fy, ev, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, eu, fy, ev)));
                 set_uv(blocks, grid, eu, fy + 1, ev, PlannedBlock::simple("minecraft:air"));
                 set_uv(blocks, grid, eu, fy + 2, ev, PlannedBlock::simple("minecraft:air"));
@@ -1460,6 +1507,9 @@ fn build_arcade_gallery(
     spec: &BlueprintSpec,
     pal: &MaterialPalette,
     seed: u64,
+    adapt_terrain: bool,
+    terrain_offsets: Option<&[i32]>,
+    water_depths: Option<&[i32]>,
 ) {
     if !spec.arcade_gallery || spec.ruin_erosion >= 0.1 {
         return;
@@ -1503,6 +1553,29 @@ fn build_arcade_gallery(
         let ridge_out = grid.uv_to_mc_dir(dir_u, 0);
         let _ = arch_face;
         for v in v_start..=v_end {
+            if !spec.on_stilts {
+                for col_u in [u1, u2] {
+                    let terr = terrain_rel_at(terrain_offsets, grid, col_u, v);
+                    let wd = crate::gen_common::water_depth_at(water_depths, grid, col_u, v);
+                    let skirt_bot = if adapt_terrain {
+                        (terr - wd).clamp(-16, 0)
+                    } else {
+                        0
+                    };
+                    for fy in skirt_bot..ground_y {
+                        if !is_solid_or_occupied(blocks, grid, col_u, fy, v) {
+                            set_uv(
+                                blocks,
+                                grid,
+                                col_u,
+                                fy,
+                                v,
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, col_u, fy, v)),
+                            );
+                        }
+                    }
+                }
+            }
             set_uv(blocks, grid, u1, ground_y, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, u1, ground_y, v)));
             set_uv(blocks, grid, u2, ground_y, v, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u2, ground_y, v)));
             set_uv(blocks, grid, u1, top_y + 1, v, make_slab(&pal.pick_slab(MaterialPalette::SLOT_CEILING, seed, u1, top_y + 1, v), "top"));
@@ -1532,7 +1605,10 @@ fn build_arcade_gallery(
                     );
                 }
             }
-            if v == mid_v {
+            let near_door = best_door.is_some_and(|(du, dv)| (wall_u - du).abs() <= 2 && (v - dv).abs() <= 2)
+                || crate::gen_common::get_uv(blocks, grid, wall_u, ground_y + 1, v)
+                    .is_some_and(|b| b.block_id.ends_with("_door"));
+            if v == mid_v && !near_door {
                 set_uv(blocks, grid, wall_u, ground_y + 1, v, PlannedBlock::simple("minecraft:air"));
                 set_uv(blocks, grid, wall_u, ground_y + 2, v, PlannedBlock::simple("minecraft:air"));
             }
@@ -1589,7 +1665,19 @@ pub(crate) fn blend_surrounding_terrain(
             let terr = terrain_rel_at(Some(terrain_offsets), grid, u, v);
             let h = noise.cell_hash(u, 0, v);
             let jitter = if h > 0.65 { 1 } else { 0 };
-            let organic_top = if h > 0.78 {
+            let is_badlands = spec.biome_tag.contains("badlands");
+            let is_arid = spec.style == BuildStyle::Desert
+                || spec.biome_tag.contains("desert")
+                || is_badlands;
+            let organic_top = if is_arid {
+                if is_badlands && h > 0.55 {
+                    "minecraft:red_sandstone"
+                } else if h > 0.72 {
+                    "minecraft:cut_sandstone"
+                } else {
+                    "minecraft:sandstone"
+                }
+            } else if h > 0.78 {
                 "minecraft:moss_block"
             } else if h < 0.18 && ring_d >= 2 {
                 "minecraft:coarse_dirt"
@@ -1597,11 +1685,13 @@ pub(crate) fn blend_surrounding_terrain(
                 "minecraft:grass_block"
             };
             if terr < -1 {
-                let target_top = (terr + (4 - ring_d) - jitter).min(-1).max(-6);
-                for y in (terr + 1).max(-6)..target_top {
+                let target_top = (terr + (4 - ring_d) - jitter).min(-1).max(-14);
+                for y in (terr + 1).max(-14)..target_top {
                     if !is_solid_or_occupied(blocks, grid, u, y, v) {
                         let fill_blk = if ring_d == 1 && y == target_top - 1 {
                             pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, u, y, v)
+                        } else if is_arid {
+                            "minecraft:sandstone".to_owned()
                         } else {
                             "minecraft:dirt".to_owned()
                         };
@@ -2327,14 +2417,14 @@ fn generate_standard_structure(
 
     let (fp, bounds) = build_footprint(grid, &spec, noise, terrain_offsets, &mut rng);
 
-    // Auto-detect lakeside / steep-slope conditions so the structure rises cleanly on stilts instead of burying in stone.
+    // Auto-detect deep water / floodplains so aquatic builds rise cleanly on pilings;
+    // dry slopes extend solid stone foundation skirts down cleanly instead of hovering on stilts.
     if req.adapt_terrain
         && !matches!(spec.category, BuildCategory::Castle)
         && !spec.on_stilts
     {
         let mut fp_cells = 0usize;
         let mut water_cells = 0usize;
-        let mut steep_drop_cells = 0usize;
         for v in 0..grid.d {
             for u in 0..grid.w {
                 if !fp[grid.idx(u, v)] {
@@ -2344,17 +2434,12 @@ fn generate_standard_structure(
                 if crate::gen_common::water_depth_at(water_depths, grid, u, v) > 0 {
                     water_cells += 1;
                 }
-                if crate::gen_common::terrain_rel_at(terrain_offsets, grid, u, v) <= -3 {
-                    steep_drop_cells += 1;
-                }
             }
         }
-        if fp_cells > 0 && (water_cells * 3 >= fp_cells || steep_drop_cells * 2 >= fp_cells) {
+        if fp_cells > 0 && water_cells * 3 >= fp_cells {
             spec.on_stilts = true;
             spec.foundation_height = spec.foundation_height.max(2);
-            if water_cells > 0 {
-                spec.basement = false;
-            }
+            spec.basement = false;
         }
     } else if spec.on_stilts {
         spec.foundation_height = spec.foundation_height.max(2);
@@ -2542,6 +2627,9 @@ fn generate_standard_structure(
         seed,
         max_placed_roof_y,
         height,
+        req.adapt_terrain,
+        terrain_offsets,
+        water_depths,
         &mut rng,
     );
 
@@ -2604,7 +2692,19 @@ fn generate_standard_structure(
         height,
     );
     build_downspouts_and_signs(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed);
-    build_arcade_gallery(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed);
+    build_arcade_gallery(
+        &mut blocks,
+        grid,
+        &fp,
+        bounds,
+        best_door,
+        &spec,
+        pal,
+        seed,
+        req.adapt_terrain,
+        terrain_offsets,
+        water_depths,
+    );
     if !spec.on_stilts {
         build_custom_yard_trees(&mut blocks, grid, &fp, bounds, best_door, &spec, pal, seed, height);
     }
@@ -2676,18 +2776,27 @@ fn generate_standard_structure(
                     continue;
                 }
             }
-            let blocked_by_non_stair = crate::gen_common::get_uv(&blocks, grid, su, cy, sv)
-                .is_some_and(|b| {
+            let protected_door_frame = best_door.is_some_and(|(du, dv)| {
+                cy <= i32::from(spec.foundation_height) + 3
+                    && (su - du).abs() <= 2
+                    && sv == dv
+            });
+            let blocked_by_non_stair = !protected_door_frame
+                && crate::gen_common::get_uv(&blocks, grid, su, cy, sv).is_some_and(|b| {
                     b.block_id != "minecraft:air"
                         && b.block_id != "minecraft:ladder"
                         && !b.block_id.ends_with("_trapdoor")
                         && !b.block_id.ends_with("_stairs")
+                        && !b.block_id.ends_with("_door")
                 });
             if blocked_by_non_stair {
                 set_uv(&mut blocks, grid, su, cy, sv, PlannedBlock::simple("minecraft:air"));
             }
         }
     }
+
+    // Enforce complete 2-high doors, solid supports, solid lintels, and non-window jambs.
+    enforce_door_invariants(&mut blocks, &pal, seed, &spec);
 
     // 12. Structural Anti-Floating Sanitizer Pass.
     prune_unsupported_floating_blocks(&mut blocks);
@@ -2703,5 +2812,162 @@ fn generate_standard_structure(
         height,
         blocks,
         door_pos,
+    }
+}
+
+fn block_needs_solid_floor(bid: &str) -> bool {
+    bid == "minecraft:air"
+        || bid == "minecraft:water"
+        || bid == "minecraft:lava"
+        || bid.contains("glass")
+        || bid.ends_with("_grate")
+        || bid == "minecraft:iron_bars"
+        || bid.ends_with("_door")
+        || bid.ends_with("_fence")
+        || bid.ends_with("_slab")
+        || bid.ends_with("_stairs")
+        || bid.ends_with("_trapdoor")
+}
+
+fn is_window_or_open(bid: &str) -> bool {
+    bid == "minecraft:air"
+        || bid.contains("glass")
+        || bid.ends_with("_grate")
+        || bid == "minecraft:iron_bars"
+}
+
+fn is_transparent_window_block(bid: &str) -> bool {
+    bid.contains("glass") || bid.ends_with("_grate") || bid == "minecraft:iron_bars"
+}
+
+/// Repairs half-doors, missing door supports, transparent lintels, and glass/grate door jambs.
+pub(crate) fn enforce_door_invariants(
+    blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
+    pal: &MaterialPalette,
+    seed: u64,
+    spec: &BlueprintSpec,
+) {
+    let door_entries: Vec<([i32; 3], PlannedBlock)> = blocks
+        .iter()
+        .filter(|(_, b)| b.block_id.ends_with("_door"))
+        .map(|(&pos, b)| (pos, b.clone()))
+        .collect();
+
+    for (pos, pb) in &door_entries {
+        let half = pb
+            .props
+            .iter()
+            .find(|&&(k, _)| k == "half")
+            .map(|&(_, v)| v);
+        if half != Some("upper") {
+            continue;
+        }
+        let below = [pos[0], pos[1] - 1, pos[2]];
+        let below_is_door = blocks
+            .get(&below)
+            .is_some_and(|b| b.block_id.ends_with("_door"));
+        if !below_is_door {
+            let below_open = blocks
+                .get(&below)
+                .is_none_or(|b| is_window_or_open(&b.block_id));
+            if below_open {
+                let mut lower_props: Vec<(&'static str, &'static str)> = pb
+                    .props
+                    .iter()
+                    .copied()
+                    .filter(|&(k, _)| k != "half")
+                    .collect();
+                lower_props.push(("half", "lower"));
+                blocks.insert(
+                    below,
+                    PlannedBlock::with_props(pb.block_id.clone(), lower_props),
+                );
+            } else {
+                blocks.remove(pos);
+            }
+        }
+    }
+
+    let lower_doors: Vec<([i32; 3], PlannedBlock)> = blocks
+        .iter()
+        .filter(|(_, b)| {
+            b.block_id.ends_with("_door")
+                && !b.props.iter().any(|&(k, v)| k == "half" && v == "upper")
+        })
+        .map(|(&pos, b)| (pos, b.clone()))
+        .collect();
+
+    for (pos, pb) in lower_doors {
+        let [x, y, z] = pos;
+        let floor_pos = [x, y - 1, z];
+        if blocks
+            .get(&floor_pos)
+            .is_none_or(|b| block_needs_solid_floor(&b.block_id))
+        {
+            blocks.insert(
+                floor_pos,
+                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, x, y - 1, z)),
+            );
+        }
+
+        let upper_pos = [x, y + 1, z];
+        let mut upper_props: Vec<(&'static str, &'static str)> = pb
+            .props
+            .iter()
+            .copied()
+            .filter(|&(k, _)| k != "half")
+            .collect();
+        upper_props.push(("half", "upper"));
+        blocks.insert(
+            upper_pos,
+            PlannedBlock::with_props(pb.block_id.clone(), upper_props),
+        );
+
+        let lintel_pos = [x, y + 2, z];
+        let lintel_bad = blocks.get(&lintel_pos).is_none_or(|b| {
+            let bid = b.block_id.as_str();
+            if spec.category == BuildCategory::Castle && bid == "minecraft:iron_bars" {
+                false
+            } else {
+                is_window_or_open(bid)
+            }
+        });
+        if lintel_bad {
+            blocks.insert(
+                lintel_pos,
+                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, x, y + 2, z)),
+            );
+        }
+
+        let facing = pb
+            .props
+            .iter()
+            .find(|&&(k, _)| k == "facing")
+            .map(|&(_, v)| v)
+            .unwrap_or("south");
+        let (jx, jz) = match facing {
+            "east" | "west" => (0, 1),
+            _ => (1, 0),
+        };
+        for sign in [-1, 1] {
+            for dy in 0..=2 {
+                let jp = [x + sign * jx, y + dy, z + sign * jz];
+                let bad_jamb = blocks.get(&jp).is_some_and(|b| {
+                    let bid = b.block_id.as_str();
+                    !bid.ends_with("_door")
+                        && is_transparent_window_block(bid)
+                        && !(matches!(spec.category, BuildCategory::Castle | BuildCategory::Dungeon)
+                            && bid == "minecraft:iron_bars")
+                });
+                if bad_jamb {
+                    let repl = if dy <= 1 {
+                        pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, jp[0], jp[1], jp[2])
+                    } else {
+                        pal.pick(MaterialPalette::SLOT_WALL, seed, jp[0], jp[1], jp[2])
+                    };
+                    blocks.insert(jp, PlannedBlock::simple(repl));
+                }
+            }
+        }
     }
 }

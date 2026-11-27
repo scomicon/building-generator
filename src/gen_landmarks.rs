@@ -121,8 +121,8 @@ pub(crate) fn anchor_plinth(
 ) {
     for v in v0..=v1 {
         for u in u0..=u1 {
-            let terr = terrain_rel_at(terrain_offsets, grid, u, v).clamp(-8, 1);
-            let bot = (terr - 2).max(-6);
+            let terr = terrain_rel_at(terrain_offsets, grid, u, v).clamp(-16, 1);
+            let bot = (terr - 2).clamp(-16, -2);
             for y in bot..=top_y {
                 let blk = if y == top_y {
                     pal.pick(MaterialPalette::SLOT_PAVING, seed, u, y, v)
@@ -143,6 +143,22 @@ pub(crate) fn place_door_stack(
     base_y: i32,
     v: i32,
 ) -> [i32; 3] {
+    let is_window_like = |id: &str| {
+        id == "minecraft:air"
+            || id.contains("glass")
+            || id == "minecraft:copper_grate"
+            || id == "minecraft:iron_bars"
+            || pal.slot_contains(MaterialPalette::SLOT_WINDOW, id)
+            || pal.slot_contains(MaterialPalette::SLOT_WINDOW_ACCENT, id)
+    };
+    set_uv(
+        blocks,
+        grid,
+        u,
+        base_y - 1,
+        v,
+        PlannedBlock::simple(pal.foundation.clone()),
+    );
     set_uv(
         blocks,
         grid,
@@ -175,6 +191,54 @@ pub(crate) fn place_door_stack(
             ],
         ),
     );
+    // Ensure solid door lintel & non-glass side jambs so windows never clip into doorways.
+    if crate::gen_common::get_uv(blocks, grid, u, base_y + 2, v)
+        .is_none_or(|b| is_window_like(&b.block_id))
+    {
+        set_uv(
+            blocks,
+            grid,
+            u,
+            base_y + 2,
+            v,
+            make_beam_block_at(pal, grid.axis_u(), 0xD00A_1147, u, base_y + 2, v),
+        );
+    }
+    for side in [-1, 1] {
+        let su = u + side;
+        if grid.in_bounds(su, v) {
+            for dy in 0..=2 {
+                if crate::gen_common::get_uv(blocks, grid, su, base_y + dy, v)
+                    .is_some_and(|b| is_window_like(&b.block_id))
+                {
+                    let blk = if dy < 2 {
+                        make_frame_block_at(pal, "y", 0xD00A_1147, su, base_y + dy, v)
+                    } else {
+                        PlannedBlock::simple(pal.wall.clone())
+                    };
+                    set_uv(blocks, grid, su, base_y + dy, v, blk);
+                }
+            }
+        }
+    }
+    for clear_v in [v - 1, v + 1] {
+        if grid.in_bounds(u, clear_v) {
+            for dy in 0..=1 {
+                if crate::gen_common::get_uv(blocks, grid, u, base_y + dy, clear_v)
+                    .is_some_and(|b| !b.block_id.ends_with("_stairs"))
+                {
+                    set_uv(
+                        blocks,
+                        grid,
+                        u,
+                        base_y + dy,
+                        clear_v,
+                        PlannedBlock::simple("minecraft:air"),
+                    );
+                }
+            }
+        }
+    }
     let [lx, lz] = grid.to_local_xz(u, v);
     [lx, base_y, lz]
 }
@@ -218,6 +282,19 @@ pub(crate) fn build_dome_shell(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn is_wall_support_at(
+    blocks: &BTreeMap<[i32; 3], PlannedBlock>,
+    grid: LocalGrid,
+    u: i32,
+    eave_y: i32,
+    v: i32,
+) -> bool {
+    crate::gen_common::get_uv(blocks, grid, u, eave_y, v).is_some_and(|b| {
+        let id = b.block_id.as_str();
+        id != "minecraft:air" && !id.ends_with("_stairs") && !id.ends_with("_slab")
+    })
+}
+
 pub(crate) fn build_gable_roof(
     blocks: &mut BTreeMap<[i32; 3], PlannedBlock>,
     grid: LocalGrid,
@@ -234,11 +311,60 @@ pub(crate) fn build_gable_roof(
     let mid_u = (u0 + u1) / 2;
     let mid_v = (v0 + v1) / 2;
     let half = if ridge_along_v { (u1 - u0) / 2 } else { (v1 - v0) / 2 };
+
+    // Identify the true perimeter wall bounds beneath optional eave overhangs so gable end triangles
+    // and side wall-to-eave seams seal cleanly without gaps above walls.
+    let mut wall_u0 = u1;
+    let mut wall_u1 = u0;
+    let mut wall_v0 = v1;
+    let mut wall_v1 = v0;
+    let mut found_wall = false;
+    for v in v0..=v1 {
+        for u in u0..=u1 {
+            if is_wall_support_at(blocks, grid, u, eave_y, v) {
+                wall_u0 = wall_u0.min(u);
+                wall_u1 = wall_u1.max(u);
+                wall_v0 = wall_v0.min(v);
+                wall_v1 = wall_v1.max(v);
+                found_wall = true;
+            }
+        }
+    }
+    if !found_wall {
+        wall_u0 = u0;
+        wall_u1 = u1;
+        wall_v0 = v0;
+        wall_v1 = v1;
+    }
+
     for v in v0..=v1 {
         for u in u0..=u1 {
             let dist = if ridge_along_v { (u - mid_u).abs() } else { (v - mid_v).abs() };
             let rise = (half - dist).max(0);
             let ry = (eave_y + 1 + rise / 2).min(max_h - 1);
+
+            if u >= wall_u0 && u <= wall_u1 && v >= wall_v0 && v <= wall_v1 && ry > eave_y + 1 {
+                let on_gable_end = if ridge_along_v {
+                    v == wall_v0 || v == wall_v1
+                } else {
+                    u == wall_u0 || u == wall_u1
+                };
+                let on_side_wall = is_wall_support_at(blocks, grid, u, eave_y, v);
+                if on_gable_end || on_side_wall {
+                    for wy in (eave_y + 1)..ry {
+                        let center_truss = (ridge_along_v && u == mid_u) || (!ridge_along_v && v == mid_v);
+                        let wblk = if on_gable_end && center_truss {
+                            make_frame_block_at(pal, "y", seed, u, wy, v)
+                        } else if (u + wy + v) % 3 == 0 {
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL_ACCENT, seed, u, wy, v))
+                        } else {
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, u, wy, v))
+                        };
+                        set_uv(blocks, grid, u, wy, v, wblk);
+                    }
+                }
+            }
+
             if dist == 0 {
                 set_uv(blocks, grid, u, ry, v, make_slab(&pal.pick(MaterialPalette::SLOT_ROOF, seed, u, ry, v), "bottom"));
             } else {

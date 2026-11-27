@@ -115,9 +115,9 @@ pub(crate) fn build_foundation_and_basement(
                     || !is_fp(grid, fp, u, v - 1)
                     || !is_fp(grid, fp, u, v + 1);
                 let skirt_bottom = if spec.basement {
-                    seabed_rel.clamp(-10, -4).min(-4)
+                    seabed_rel.clamp(-16, -4).min(-4)
                 } else if adapt_terrain {
-                    seabed_rel.clamp(-10, 0)
+                    seabed_rel.clamp(-16, 0)
                 } else {
                     0
                 };
@@ -307,15 +307,31 @@ pub(crate) fn build_entrance_and_porch(
                 set_uv(blocks, grid, du - 1, door_base_y + dy, actual_dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, du - 1, door_base_y + dy, actual_dv)));
                 set_uv(blocks, grid, du + 1, door_base_y + dy, actual_dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, du + 1, door_base_y + dy, actual_dv)));
             }
+            set_uv(blocks, grid, du - 1, door_base_y + 2, dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, du - 1, door_base_y + 2, dv)));
+            set_uv(blocks, grid, du + 1, door_base_y + 2, dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, du + 1, door_base_y + 2, dv)));
             set_uv(blocks, grid, du - 1, door_base_y + 2, actual_dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, du - 1, door_base_y + 2, actual_dv)));
             set_uv(blocks, grid, du + 1, door_base_y + 2, actual_dv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, du + 1, door_base_y + 2, actual_dv)));
         } else {
-            for dy in 0..=1 {
-                if !is_solid_or_occupied(blocks, grid, du - 1, door_base_y + dy, actual_dv) {
-                    set_uv(blocks, grid, du - 1, door_base_y + dy, actual_dv, make_frame_block_at(pal, "y", seed, du - 1, door_base_y + dy, actual_dv));
-                }
-                if !is_solid_or_occupied(blocks, grid, right_jamb_u, door_base_y + dy, actual_dv) {
-                    set_uv(blocks, grid, right_jamb_u, door_base_y + dy, actual_dv, make_frame_block_at(pal, "y", seed, right_jamb_u, door_base_y + dy, actual_dv));
+            for dy in 0..=2 {
+                for jamb_u in [du - 1, right_jamb_u] {
+                    let is_window_or_empty = get_uv(blocks, grid, jamb_u, door_base_y + dy, actual_dv)
+                        .is_none_or(|b| {
+                            let id = b.block_id.as_str();
+                            id == "minecraft:air"
+                                || id.contains("glass")
+                                || id.ends_with("_grate")
+                                || id == "minecraft:iron_bars"
+                        });
+                    if dy <= 1 || is_window_or_empty {
+                        let blk = if dy <= 1 && is_window_or_empty {
+                            make_frame_block_at(pal, "y", seed, jamb_u, door_base_y + dy, actual_dv)
+                        } else if dy == 2 && is_window_or_empty {
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_WALL, seed, jamb_u, door_base_y + dy, actual_dv))
+                        } else {
+                            continue;
+                        };
+                        set_uv(blocks, grid, jamb_u, door_base_y + dy, actual_dv, blk);
+                    }
                 }
             }
         }
@@ -368,6 +384,14 @@ pub(crate) fn build_entrance_and_porch(
                 blocks,
                 grid,
                 du + 1,
+                door_base_y - 1,
+                dv,
+                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, du + 1, door_base_y - 1, dv)),
+            );
+            set_uv(
+                blocks,
+                grid,
+                du + 1,
                 door_base_y,
                 dv,
                 PlannedBlock::with_props(
@@ -403,6 +427,15 @@ pub(crate) fn build_entrance_and_porch(
             if spec.category == BuildCategory::Castle {
                 set_uv(blocks, grid, du, door_base_y + 2, dv, PlannedBlock::simple("minecraft:iron_bars"));
                 set_uv(blocks, grid, du + 1, door_base_y + 2, dv, PlannedBlock::simple("minecraft:iron_bars"));
+            } else {
+                set_uv(
+                    blocks,
+                    grid,
+                    du + 1,
+                    door_base_y + 2,
+                    dv,
+                    make_stair(&pal.pick_stair(MaterialPalette::SLOT_ROOF, seed, du + 1, door_base_y + 2, dv), grid.dir_front(), "top"),
+                );
             }
         }
 
@@ -440,6 +473,33 @@ pub(crate) fn build_entrance_and_porch(
                         continue;
                     }
                     set_uv(blocks, grid, pu, step_y, pv, PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, pu, step_y, pv)));
+                    let local_terr = if adapt_terrain {
+                        (terrain_rel_at(terrain_offsets, grid, pu, pv)
+                            - water_depth_at(water_depths, grid, pu, pv))
+                        .clamp(-16, step_y - 1)
+                    } else {
+                        0
+                    };
+                    if local_terr < step_y {
+                        if spec.on_stilts {
+                            if (pu < du || pu > door_u1) && pv_off == porch_depth {
+                                for fill_y in local_terr..step_y {
+                                    set_uv(blocks, grid, pu, fill_y, pv, make_frame_block_at(pal, "y", seed, pu, fill_y, pv));
+                                }
+                            }
+                        } else {
+                            for fill_y in local_terr..step_y {
+                                set_uv(
+                                    blocks,
+                                    grid,
+                                    pu,
+                                    fill_y,
+                                    pv,
+                                    PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, pu, fill_y, pv)),
+                                );
+                            }
+                        }
+                    }
                     set_uv(blocks, grid, pu, step_y + 1, pv, PlannedBlock::simple("minecraft:air"));
                     set_uv(blocks, grid, pu, step_y + 2, pv, PlannedBlock::simple("minecraft:air"));
                     let is_outer_post = (pu < du || pu > door_u1) && pv_off == porch_depth;
@@ -510,7 +570,7 @@ pub(crate) fn build_entrance_and_porch(
             }
         } else {
             let initial_ground = if adapt_terrain && stair_start_v < grid.d {
-                terrain_rel_at(terrain_offsets, grid, du, stair_start_v).clamp(-8, 4)
+                terrain_rel_at(terrain_offsets, grid, du, stair_start_v).clamp(-16, 12)
             } else {
                 0
             };
@@ -520,7 +580,7 @@ pub(crate) fn build_entrance_and_porch(
                 let mut sv = stair_start_v;
                 while sv < grid.d && !is_fp(grid, fp, du, sv) {
                     let ground_rel = if adapt_terrain {
-                        terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-8, 4)
+                        terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-16, 12)
                     } else {
                         0
                     };
@@ -555,11 +615,15 @@ pub(crate) fn build_entrance_and_porch(
                     sv += 1;
                 }
             } else {
-                let mut sy = if spec.porch && step_y >= 2 { step_y - 1 } else { step_y };
+                let mut sy = if spec.porch && step_y - initial_ground >= 2 {
+                    step_y - 1
+                } else {
+                    step_y
+                };
                 let mut sv = stair_start_v;
                 while sv < grid.d && !is_fp(grid, fp, du, sv) {
                     let ground_rel = if adapt_terrain {
-                        terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-8, 4)
+                        terrain_rel_at(terrain_offsets, grid, du, sv).clamp(-16, 12)
                     } else {
                         0
                     };
@@ -598,15 +662,15 @@ pub(crate) fn build_entrance_and_porch(
                         set_uv(blocks, grid, step_u, sy + 1, sv, PlannedBlock::simple("minecraft:air"));
                         set_uv(blocks, grid, step_u, sy + 2, sv, PlannedBlock::simple("minecraft:air"));
                         set_uv(blocks, grid, step_u, sy + 3, sv, PlannedBlock::simple("minecraft:air"));
-                        if sy - 1 > ground_rel {
+                        if sy > ground_rel {
                             if spec.on_stilts {
-                                if (sv - stair_start_v) % 2 == 0 {
-                                    for fill_y in (ground_rel.max(-8))..sy {
+                                if sy - 1 > ground_rel && (sv - stair_start_v) % 2 == 0 {
+                                    for fill_y in (ground_rel.max(-16))..sy {
                                         set_uv(blocks, grid, step_u, fill_y, sv, make_frame_block_at(pal, "y", seed, step_u, fill_y, sv));
                                     }
                                 }
                             } else {
-                                for fill_y in (ground_rel.max(-8))..sy {
+                                for fill_y in (ground_rel.max(-16))..sy {
                                     set_uv(
                                         blocks,
                                         grid,
@@ -678,11 +742,18 @@ pub(crate) fn build_windows_and_balcony(
                     if out_count != 1 {
                         continue;
                     }
-                    if let Some((du, dv)) = best_door
-                        && (u - du).abs() <= 1
-                        && (v - dv).abs() <= 1
-                    {
-                        continue;
+                    if let Some((du, dv)) = best_door {
+                        let door_u_max = if matches!(
+                            spec.category,
+                            BuildCategory::Barn | BuildCategory::Castle | BuildCategory::Temple
+                        ) {
+                            du + 1
+                        } else {
+                            du
+                        };
+                        if u >= du - 1 && u <= door_u_max + 1 && (v - dv).abs() <= 2 {
+                            continue;
+                        }
                     }
                     // Keep perimeter walls directly supporting interior ladders or stairwell shafts solid.
                     if stairwell_uv
@@ -718,15 +789,31 @@ pub(crate) fn build_windows_and_balcony(
                     let window_blocked_outside = grid.in_bounds(ou, ov)
                         && (win_y0..=clamped_y1)
                             .any(|wy| is_solid_or_occupied(blocks, grid, ou, wy, ov));
-                    let pier_or_special_wall = (win_y0..=clamped_y1).any(|wy| {
-                        get_uv(blocks, grid, u, wy, v).is_none_or(|b| {
+                    let pier_or_special_wall = ((floor_y + 1)..=(clamped_y1 + 1)).any(|wy| {
+                        let self_special = get_uv(blocks, grid, u, wy, v).is_none_or(|b| {
                             let bid = b.block_id.as_str();
-                            bid == "minecraft:air"
-                                || pal.slot_contains(MaterialPalette::SLOT_FRAME, bid)
+                            bid.ends_with("_door")
                                 || pal.slot_contains(MaterialPalette::SLOT_DOOR, bid)
-                                || pal.slot_contains(MaterialPalette::SLOT_CHIMNEY, bid)
-                                || bid.ends_with("_door")
-                        })
+                                || (wy >= win_y0
+                                    && wy <= clamped_y1
+                                    && (bid == "minecraft:air"
+                                        || pal.slot_contains(MaterialPalette::SLOT_FRAME, bid)
+                                        || pal.slot_contains(MaterialPalette::SLOT_CHIMNEY, bid)))
+                        });
+                        let adj_door = [
+                            (u - tan_u, v - tan_v),
+                            (u + tan_u, v + tan_v),
+                            (u + odu, v + odv),
+                            (u - odu, v - odv),
+                        ]
+                        .into_iter()
+                        .any(|(au, av)| {
+                            get_uv(blocks, grid, au, wy, av).is_some_and(|b| {
+                                b.block_id.ends_with("_door")
+                                    || pal.slot_contains(MaterialPalette::SLOT_DOOR, &b.block_id)
+                            })
+                        });
+                        self_special || adj_door
                     });
                     if window_blocked_outside || pier_or_special_wall {
                         continue;
@@ -1781,7 +1868,7 @@ pub(crate) fn build_market_awning_stall(
                     is_fp(grid, fp, u, v)
                         && !is_fp(grid, fp, u, v + 1)
                         && !is_fp(grid, fp, u, v + 2)
-                        && best_door.is_none_or(|(du, dv)| (u - du).abs() >= 2 || (v - dv).abs() >= 2)
+                        && best_door.is_none_or(|(du, dv)| (u - du).abs() >= 3 || (v - dv).abs() >= 2)
                 });
                 if !valid_wall {
                     continue;
@@ -2167,9 +2254,10 @@ pub(crate) fn build_downspouts_and_signs(
             "minecraft:cherry_door" => "minecraft:cherry_hanging_sign",
             _ => "minecraft:oak_hanging_sign",
         };
-        for side in [-2, 2, -3, 3] {
+        for side in [-3, 3, -4, 4, -2, 2] {
             let su = du + side;
             let sv = dv + 1;
+            let inward_u = su + if side < 0 { 1 } else { -1 };
             let anchor_wall_ok = get_uv(blocks, grid, su, ground_y + 3, dv).is_some_and(|b| {
                 let bid = b.block_id.as_str();
                 bid != "minecraft:air" && !bid.contains("glass") && !bid.ends_with("_door")
@@ -2179,6 +2267,8 @@ pub(crate) fn build_downspouts_and_signs(
                 && is_fp(grid, fp, su, dv)
                 && anchor_wall_ok
                 && !is_solid_or_occupied(blocks, grid, su, ground_y + 2, sv)
+                && get_uv(blocks, grid, inward_u, ground_y + 3, sv)
+                    .is_none_or(|b| !b.block_id.ends_with("_fence") && !b.block_id.ends_with("_wall"))
             {
                 if !is_solid_or_occupied(blocks, grid, su, ground_y + 3, sv) {
                     set_uv(

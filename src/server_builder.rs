@@ -302,8 +302,23 @@ fn resolve_planned_state(
             .collect();
         match BlockState::of(&states, block_key, &constraints) {
             Ok(state) => Ok(state),
-            Err(_) => BlockState::of(&states, block_key, &[])
-                .map_err(|e| format!("Fallback error for {}: {e:?}", planned.block_id)),
+            Err(_) => {
+                // Preserve critical structural properties like `half` ("upper"/"lower") & `facing`
+                // if an optional property constraint fails, before falling back to bare default state.
+                let essential: Vec<StateConstraint> = planned
+                    .props
+                    .iter()
+                    .filter(|&&(k, _)| matches!(k, "half" | "facing" | "type"))
+                    .map(|(k, v)| StateConstraint::new(*k, *v))
+                    .collect();
+                if !essential.is_empty()
+                    && let Ok(state) = BlockState::of(&states, block_key, &essential)
+                {
+                    return Ok(state);
+                }
+                BlockState::of(&states, block_key, &[])
+                    .map_err(|e| format!("Fallback error for {}: {e:?}", planned.block_id))
+            }
         }
     }
 }
@@ -858,8 +873,8 @@ fn prepare_undo_and_filter_blueprint(
                 .block_state(host, pos)
                 .is_some_and(|st| air_keys.contains(&st.block()))
         });
-        retain_complete_doors(&mut bp.blocks);
     }
+    retain_complete_doors(&mut bp.blocks);
 
     let mut previous_blocks = Vec::with_capacity(bp.blocks.len());
     for &[lx, ly, lz] in bp.blocks.keys() {
@@ -1440,8 +1455,22 @@ pub fn execute_build(
             .chunks(MAX_RUNS_PER_BATCH)
             .map(|c| c.to_vec())
             .collect();
-        for c in phase2_runs.chunks(MAX_RUNS_PER_BATCH) {
-            chunks.push_back(c.to_vec());
+        // Keep vertical pairs in the same (x, z) column (such as door lower + upper halves) in one batch.
+        let mut p2_idx = 0;
+        while p2_idx < phase2_runs.len() {
+            let mut end = (p2_idx + MAX_RUNS_PER_BATCH).min(phase2_runs.len());
+            if end < phase2_runs.len() {
+                let split_x = phase2_runs[end - 1].x;
+                let split_z = phase2_runs[end - 1].z;
+                while end < phase2_runs.len()
+                    && phase2_runs[end].x == split_x
+                    && phase2_runs[end].z == split_z
+                {
+                    end += 1;
+                }
+            }
+            chunks.push_back(phase2_runs[p2_idx..end].to_vec());
+            p2_idx = end;
         }
         let first = chunks.pop_front().unwrap_or_default();
         let first_count = first.len();
@@ -2146,16 +2175,28 @@ fn spawn_command_build(
         let dist = (f64::from(w.max(d)) * 0.5) + 4.0;
         let cx = (pos[0] + fx * dist).round() as i32;
         let cz = (pos[2] + fz * dist).round() as i32;
-        let ox = cx - i32::from(w / 2);
-        let oz = cz - i32::from(d / 2);
+        let iw = i32::from(w.clamp(7, 96));
+        let id = i32::from(d.clamp(7, 96));
+        let ox = cx - iw / 2;
+        let oz = cz - id / 2;
         let dim = player
             .dimension(host)
             .map_or_else(|| "minecraft:overworld".to_owned(), |id| id.to_string());
+        let mut sample_cols = Vec::with_capacity(25);
+        for gz in 0..5 {
+            let lz = (gz * (id - 1)) / 4;
+            for gx in 0..5 {
+                let lx = (gx * (iw - 1)) / 4;
+                sample_cols.push((ox + lx, oz + lz));
+            }
+        }
         let mut oy = (pos[1].floor() as i32) - 1;
-        if let Ok(heights) = host.surface_heights(&dim, &[(cx, cz)], Heightmap::MotionBlockingNoLeaves)
-            && let Some(Some(sy)) = heights.first()
-        {
-            oy = sy - 1;
+        if let Ok(heights) = host.surface_heights(&dim, &sample_cols, Heightmap::MotionBlockingNoLeaves) {
+            let mut ys: Vec<i32> = heights.into_iter().flatten().map(|sy| sy - 1).collect();
+            if !ys.is_empty() {
+                ys.sort_unstable();
+                oy = ys[(ys.len() * 35) / 100];
+            }
         }
         ([ox, oy, oz], dim, facing)
     } else {

@@ -384,6 +384,15 @@ pub fn generate_settlement(
         }
     }
 
+    // Anchor plaza center elevation cleanly up front so canal, streets, and gatehouses align vertically.
+    let plaza_y = if is_floating {
+        1
+    } else if req.adapt_terrain {
+        terrain_at_wxz(terrain_offsets, w, cx, cz).clamp(-12, 12)
+    } else {
+        0
+    };
+
     // Compute and relax smooth road heights so slopes never step sharply (>1 vertical block per step).
     let mut road_y_grid = vec![0i32; (w * d) as usize];
     for lz in 0..d {
@@ -394,7 +403,7 @@ pub fn generate_settlement(
             } else if is_road[idx] {
                 let wd = terrain_at_wxz(water_depths, w, lx, lz);
                 let sy = if req.adapt_terrain {
-                    terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 4)
+                    terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-12, 12)
                 } else {
                     0
                 };
@@ -403,7 +412,7 @@ pub fn generate_settlement(
         }
     }
     if !is_floating && req.adapt_terrain {
-        for _pass in 0..3 {
+        for _pass in 0..6 {
             let prev = road_y_grid.clone();
             for lz in 1..(d - 1) {
                 for lx in 1..(w - 1) {
@@ -427,19 +436,67 @@ pub fn generate_settlement(
         }
     }
 
+    // Shared smoothed canal water surface along X so canal water & banks remain flat or step cleanly.
+    let mut canal_water_y = vec![plaza_y; w as usize];
+    if !is_floating && town_mode == 1 && req.adapt_terrain {
+        for lx in 0..w {
+            if (lx - cx).abs() <= road_half + 1 {
+                canal_water_y[lx as usize] = plaza_y;
+            } else {
+                canal_water_y[lx as usize] = terrain_at_wxz(terrain_offsets, w, lx, cz).clamp(-12, 12);
+            }
+        }
+        for _pass in 0..5 {
+            let prev = canal_water_y.clone();
+            for lx in 1..(w - 1) {
+                if (lx - cx).abs() <= road_half + 1 {
+                    canal_water_y[lx as usize] = plaza_y;
+                    continue;
+                }
+                let avg = ((prev[(lx - 1) as usize] + prev[lx as usize] * 2 + prev[(lx + 1) as usize]) as f64 / 4.0)
+                    .round() as i32;
+                canal_water_y[lx as usize] = avg.clamp(prev[lx as usize] - 1, prev[lx as usize] + 1);
+            }
+        }
+        // Keep step transitions spaced at least 2 blocks apart and bounded to <= 1 block per column.
+        for lx in (cx + road_half + 2)..w {
+            let prev_y = canal_water_y[(lx - 1) as usize];
+            canal_water_y[lx as usize] = canal_water_y[lx as usize].clamp(prev_y - 1, prev_y + 1);
+        }
+        for lx in (0..(cx - road_half - 1)).rev() {
+            let next_y = canal_water_y[(lx + 1) as usize];
+            canal_water_y[lx as usize] = canal_water_y[lx as usize].clamp(next_y - 1, next_y + 1);
+        }
+    }
+
     // Grade roads, canals & central plaza smoothly to surrounding terrain.
     for lz in 0..d {
         for lx in 0..w {
             let idx = (lz * w + lx) as usize;
             if is_canal[idx] {
-                let bed_y = if req.adapt_terrain {
-                    terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 2) - 1
+                let surf_y = if req.adapt_terrain {
+                    terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-14, 14)
                 } else {
-                    -1
+                    0
                 };
-                blocks.insert([lx, bed_y, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, bed_y, lz)));
-                blocks.insert([lx, bed_y + 1, lz], PlannedBlock::with_props("minecraft:water", vec![("level", "0")]));
-                for cy in (bed_y + 2)..=(bed_y + 5) {
+                let wd = terrain_at_wxz(water_depths, w, lx, lz);
+                let water_y = if is_floating {
+                    0
+                } else if req.adapt_terrain {
+                    canal_water_y[lx as usize]
+                } else {
+                    0
+                };
+                let bed_y = water_y - 1;
+                let lo_y = (surf_y - wd - 2).clamp(-16, bed_y);
+                for fy in lo_y..=bed_y {
+                    blocks.insert(
+                        [lx, fy, lz],
+                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fy, lz)),
+                    );
+                }
+                blocks.insert([lx, water_y, lz], PlannedBlock::with_props("minecraft:water", vec![("level", "0")]));
+                for cy in (water_y + 1)..=(surf_y.max(water_y) + 5) {
                     blocks.insert([lx, cy, lz], PlannedBlock::simple("minecraft:air"));
                 }
                 continue;
@@ -448,7 +505,7 @@ pub fn generate_settlement(
                 continue;
             }
             let surf_y = if req.adapt_terrain {
-                terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 4)
+                terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-14, 14)
             } else {
                 0
             };
@@ -490,7 +547,7 @@ pub fn generate_settlement(
                 );
             } else {
                 if wd > 0 || road_y > surf_y {
-                    let lo_y = (surf_y - wd).clamp(-10, (road_y - 1).max(-10));
+                    let lo_y = (surf_y - wd - 1).clamp(-16, (road_y - 1).max(-16));
                     for fill_y in lo_y..road_y {
                         blocks.insert(
                             [lx, fill_y, lz],
@@ -503,7 +560,7 @@ pub fn generate_settlement(
                     pave_block_for_style(spec.style, pal, seed, lx, road_y, lz, h, is_border),
                 );
             }
-            for cy in (road_y + 1)..=(road_y + 5) {
+            for cy in (road_y + 1)..=(surf_y.max(road_y) + 5) {
                 blocks.insert([lx, cy, lz], PlannedBlock::simple("minecraft:air"));
             }
         }
@@ -599,20 +656,42 @@ pub fn generate_settlement(
     }
 
     // Central Town Plaza Monument: Canal Stone Bridge (mode 1), Monumental Pillar (mode 2), Market Kiosk (mode 3), or Fountain/Well!
-    let plaza_y = if is_floating {
-        1
-    } else if req.adapt_terrain {
-        terrain_at_wxz(terrain_offsets, w, cx, cz).clamp(-3, 2)
-    } else {
-        0
-    };
+    if !is_floating {
+        for pz in (cz - plaza_r).max(1)..=(cz + plaza_r).min(d - 2) {
+            for px in (cx - plaza_r).max(1)..=(cx + plaza_r).min(w - 2) {
+                let surf = terrain_at_wxz(terrain_offsets, w, px, pz);
+                let lo_y = (surf - 1).clamp(-16, plaza_y - 1);
+                for fy in lo_y..plaza_y {
+                    blocks.insert(
+                        [px, fy, pz],
+                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, px, fy, pz)),
+                    );
+                }
+                for cy in (plaza_y + 1)..=(surf.max(plaza_y) + 5) {
+                    blocks.insert([px, cy, pz], PlannedBlock::simple("minecraft:air"));
+                }
+            }
+        }
+    }
     if town_mode == 1 {
         for lx in 1..(w - 1) {
             if (lx - cx).abs() <= road_half + 1 {
                 continue;
             }
+            let water_y = canal_water_y[lx as usize];
             for &bank_z in &[cz - 2, cz + 2] {
-                blocks.insert([lx, plaza_y + 1, bank_z], PlannedBlock::simple(pal.trim_wall.clone()));
+                let surf = terrain_at_wxz(terrain_offsets, w, lx, bank_z);
+                let bot = (surf - 2).clamp(-16, water_y);
+                for fy in bot..=water_y {
+                    blocks.insert(
+                        [lx, fy, bank_z],
+                        PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fy, bank_z)),
+                    );
+                }
+                blocks.insert([lx, water_y + 1, bank_z], PlannedBlock::simple(pal.trim_wall.clone()));
+                for cy in (water_y + 2)..=(surf.max(water_y) + 5) {
+                    blocks.insert([lx, cy, bank_z], PlannedBlock::simple("minecraft:air"));
+                }
             }
         }
         let bw = ((road_half * 2) + 3).clamp(5, 9) as u16;
@@ -711,6 +790,10 @@ pub fn generate_settlement(
                     let px = sx + dx;
                     let pz = sz + dz;
                     if (0..w).contains(&px) && (0..d).contains(&pz) {
+                        blocks.insert(
+                            [px, plaza_y, pz],
+                            pave_block_for_style(spec.style, pal, seed, px, plaza_y, pz, noise.cell_hash(px, 0, pz), false),
+                        );
                         if dx.abs() == 1 && dz.abs() == 1 {
                             blocks.insert([px, plaza_y + 1, pz], PlannedBlock::simple(pal.fence.clone()));
                             blocks.insert([px, plaza_y + 2, pz], PlannedBlock::simple(pal.fence.clone()));
@@ -866,8 +949,19 @@ pub fn generate_settlement(
         let lot_base_y = if is_floating {
             0
         } else if req.adapt_terrain {
-            terrain_at_wxz(terrain_offsets, w, door_edge_x.clamp(0, w - 1), door_edge_z.clamp(0, d - 1))
-                .clamp(-4, 4)
+            let samples = [
+                (door_edge_x.clamp(0, w - 1), door_edge_z.clamp(0, d - 1)),
+                ((lot.x0 + lw / 2).clamp(0, w - 1), (lot.z0 + ld / 2).clamp(0, d - 1)),
+                (lot.x0.clamp(0, w - 1), lot.z0.clamp(0, d - 1)),
+                ((lot.x0 + lw - 1).clamp(0, w - 1), (lot.z0 + ld - 1).clamp(0, d - 1)),
+                (door_edge_x.clamp(0, w - 1), door_edge_z.clamp(0, d - 1)),
+            ];
+            let mut vals: Vec<i32> = samples
+                .into_iter()
+                .map(|(sx, sz)| terrain_at_wxz(terrain_offsets, w, sx, sz).clamp(-12, 12))
+                .collect();
+            vals.sort_unstable();
+            vals[vals.len() / 2]
         } else {
             0
         };
@@ -950,10 +1044,36 @@ pub fn generate_settlement(
                 && !is_road[(pz * w + px) as usize]
                 && steps < 18
             {
+                let has_lot_stair_or_porch = (prev_y - 4..=prev_y + 2).any(|y| {
+                    blocks.get(&[px, y, pz]).is_some_and(|b| {
+                        b.block_id.ends_with("_stairs") || b.block_id.ends_with("_fence")
+                    })
+                });
+                if has_lot_stair_or_porch {
+                    if let Some(top_y) = (prev_y - 4..=prev_y + 2)
+                        .rev()
+                        .find(|&y| {
+                            blocks.get(&[px, y, pz]).is_some_and(|b| {
+                                b.block_id != "minecraft:air" && !b.block_id.ends_with("_fence")
+                            })
+                        })
+                    {
+                        prev_y = top_y;
+                    }
+                    px += sx_step;
+                    pz += sz_step;
+                    steps += 1;
+                    continue;
+                }
+                let local_surf = if req.adapt_terrain {
+                    terrain_at_wxz(terrain_offsets, w, px, pz).clamp(-14, 14)
+                } else {
+                    0
+                };
                 let target_y = if is_floating {
                     1
                 } else if req.adapt_terrain {
-                    terrain_at_wxz(terrain_offsets, w, px, pz).clamp(-4, 3)
+                    local_surf.clamp(-12, 12)
                 } else {
                     0
                 };
@@ -966,7 +1086,7 @@ pub fn generate_settlement(
                 };
                 if blocks
                     .get(&[px, sy + 1, pz])
-                    .is_none_or(|b| b.block_id == "minecraft:air")
+                    .is_none_or(|b| b.block_id == "minecraft:air" || !b.block_id.ends_with("_door"))
                 {
                     if is_floating {
                         if steps % 2 == 0 {
@@ -974,16 +1094,15 @@ pub fn generate_settlement(
                         }
                         blocks.insert([px, sy, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, px, sy, pz)));
                     } else {
-                        if sy > target_y {
-                            for fy in target_y..sy {
-                                blocks.insert([px, fy, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, px, fy, pz)));
-                            }
+                        let lo_y = (local_surf - 2).clamp(-16, (sy - 1).max(-16));
+                        for fy in lo_y..sy {
+                            blocks.insert([px, fy, pz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, px, fy, pz)));
                         }
                         blocks.insert(
                             [px, sy, pz],
                             pave_block_for_style(spec.style, pal, seed, px, sy, pz, rng.next_f64(), false),
                         );
-                        for cy in (sy + 1)..=(sy + 3) {
+                        for cy in (sy + 1)..=(local_surf.max(sy) + 5) {
                             blocks.insert([px, cy, pz], PlannedBlock::simple("minecraft:air"));
                         }
                     }
@@ -997,6 +1116,9 @@ pub fn generate_settlement(
     }
 
     // Pocket green squares / parks, custom biome trees, hay bales & lakeside timber docks.
+    let is_arid_biome = spec.style == BuildStyle::Desert
+        || spec.biome_tag.contains("desert")
+        || spec.biome_tag.contains("badlands");
     for (pi, &(px0, pz0, pw, pd)) in small_pockets.iter().enumerate() {
         let tx = px0 + pw / 2;
         let tz = pz0 + pd / 2;
@@ -1005,7 +1127,7 @@ pub fn generate_settlement(
         }
         let wd = terrain_at_wxz(water_depths, w, tx, tz);
         let sy = if req.adapt_terrain {
-            terrain_at_wxz(terrain_offsets, w, tx, tz).clamp(-4, 4)
+            terrain_at_wxz(terrain_offsets, w, tx, tz).clamp(-12, 12)
         } else {
             0
         };
@@ -1017,7 +1139,7 @@ pub fn generate_settlement(
                     let wz = tz + dz;
                     if (2..(w - 2)).contains(&wx) && (2..(d - 2)).contains(&wz) {
                         if dx.abs() == 1 && dz.abs() == 1 {
-                            for fy in (sy - wd).clamp(-8, 0)..=1 {
+                            for fy in (sy - wd).clamp(-16, 0)..=1 {
                                 blocks.insert([wx, fy, wz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, wx, fy, wz)));
                             }
                             if dx == -1 && dz == -1 {
@@ -1026,22 +1148,68 @@ pub fn generate_settlement(
                             }
                         }
                         blocks.insert([wx, 1, wz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, wx, 1, wz)));
+                        for cy in 2..=5 {
+                            if blocks.get(&[wx, cy, wz]).is_none() {
+                                blocks.insert([wx, cy, wz], PlannedBlock::simple("minecraft:air"));
+                            }
+                        }
                     }
                 }
             }
-        } else if (1..=4).all(|dy| blocks.get(&[tx, sy + dy, tz]).is_none_or(|b| b.block_id == "minecraft:air")) {
-            build_town_tree(&mut blocks, pal, &spec.biome_tag, seed, tx, sy, tz, pi % 2 == 0);
-            if tx + 2 < px0 + pw {
-                blocks.insert(
-                    [tx + 2, sy + 1, tz],
-                    make_stair(
-                        &pal.pick(MaterialPalette::SLOT_STAIR_BLOCK, seed, tx + 2, sy + 1, tz),
-                        "west",
-                        "bottom",
-                    ),
-                );
-                blocks.insert([tx + 2, sy + 1, tz + 1], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, tx + 2, sy + 1, tz + 1)));
-                blocks.insert([tx + 2, sy + 2, tz + 1], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, tx + 2, sy + 2, tz + 1)));
+        } else {
+            // Clear overburden dunes/hills cleanly over the pocket park pad so trees, benches & fences never get buried.
+            let pk_x0 = (px0 + 1).max(2);
+            let pk_x1 = (px0 + pw - 2).min(w - 3);
+            let pk_z0 = (pz0 + 1).max(2);
+            let pk_z1 = (pz0 + pd - 2).min(d - 3);
+            for pz in pk_z0..=pk_z1 {
+                for px in pk_x0..=pk_x1 {
+                    if is_road[(pz * w + px) as usize] || is_canal[(pz * w + px) as usize] {
+                        continue;
+                    }
+                    let has_structure = (sy..=sy + 6).any(|y| {
+                        blocks.get(&[px, y, pz]).is_some_and(|b| b.block_id != "minecraft:air")
+                    });
+                    if has_structure {
+                        continue;
+                    }
+                    let cell_terr = if req.adapt_terrain {
+                        terrain_at_wxz(terrain_offsets, w, px, pz).clamp(-14, 14)
+                    } else {
+                        0
+                    };
+                    let lo_y = (cell_terr - 1).clamp(-16, sy - 1);
+                    for fy in lo_y..sy {
+                        blocks.insert(
+                            [px, fy, pz],
+                            PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, px, fy, pz)),
+                        );
+                    }
+                    let pad_blk = if is_arid_biome {
+                        pave_block_for_style(spec.style, pal, seed, px, sy, pz, noise.cell_hash(px, 1, pz), false)
+                    } else {
+                        PlannedBlock::simple(if (px + pz) % 3 == 0 { "minecraft:moss_block" } else { "minecraft:grass_block" })
+                    };
+                    blocks.insert([px, sy, pz], pad_blk);
+                    for cy in (sy + 1)..=(cell_terr.max(sy) + 5) {
+                        blocks.insert([px, cy, pz], PlannedBlock::simple("minecraft:air"));
+                    }
+                }
+            }
+            if (1..=4).all(|dy| blocks.get(&[tx, sy + dy, tz]).is_none_or(|b| b.block_id == "minecraft:air")) {
+                build_town_tree(&mut blocks, pal, &spec.biome_tag, seed, tx, sy, tz, pi % 2 == 0);
+                if tx + 2 < px0 + pw {
+                    blocks.insert(
+                        [tx + 2, sy + 1, tz],
+                        make_stair(
+                            &pal.pick(MaterialPalette::SLOT_STAIR_BLOCK, seed, tx + 2, sy + 1, tz),
+                            "west",
+                            "bottom",
+                        ),
+                    );
+                    blocks.insert([tx + 2, sy + 1, tz + 1], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, tx + 2, sy + 1, tz + 1)));
+                    blocks.insert([tx + 2, sy + 2, tz + 1], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_LIGHT, seed, tx + 2, sy + 2, tz + 1)));
+                }
             }
         }
     }
@@ -1064,13 +1232,24 @@ pub fn generate_settlement(
             if (1..=4).any(|y| blocks.get(&[lx, y, lz]).is_some_and(|b| b.block_id != "minecraft:air")) {
                 continue;
             }
-            let base_y = if is_floating {
-                1
-            } else if req.adapt_terrain {
-                terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
+            let surf_y = if req.adapt_terrain {
+                terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-14, 14)
             } else {
                 0
             };
+            let base_y = if is_floating {
+                1
+            } else if req.adapt_terrain {
+                surf_y.clamp(-12, 12)
+            } else {
+                0
+            };
+            if !is_floating {
+                let lo_y = (surf_y - 1).clamp(-16, base_y);
+                for fy in lo_y..=base_y {
+                    blocks.insert([lx, fy, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fy, lz)));
+                }
+            }
             blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_TRIM_WALL, seed, lx, base_y + 1, lz)));
             blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lx, base_y + 2, lz)));
             blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FENCE, seed, lx, base_y + 3, lz)));
@@ -1086,6 +1265,22 @@ pub fn generate_settlement(
         let gate_axis_z = |lz: i32| {
             (lz - cz).abs() <= road_half + 1 || ring_zs.iter().any(|&rz| (lz - rz).abs() <= 1)
         };
+        let rim_base_at = |lx: i32, lz: i32| -> i32 {
+            if !req.adapt_terrain {
+                return 0;
+            }
+            let on_ns = lz <= 1 || lz >= d - 2;
+            let on_ew = lx <= 1 || lx >= w - 2;
+            if (on_ns && gate_axis_x(lx)) || (on_ew && gate_axis_z(lz)) {
+                let rz = if lz <= 1 { 2.min(d - 1) } else if lz >= d - 2 { (d - 3).max(0) } else { lz };
+                let rx = if lx <= 1 { 2.min(w - 1) } else if lx >= w - 2 { (w - 3).max(0) } else { lx };
+                let r_idx = (rz * w + rx) as usize;
+                if is_road[r_idx] {
+                    return road_y_grid[r_idx];
+                }
+            }
+            terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-12, 12)
+        };
 
         if fortified_walls {
             // Walkable outer rampart (`0` & `1` rim around N/S/E/W edges) + crenellations + arched road gatehouses!
@@ -1095,20 +1290,29 @@ pub fn generate_settlement(
                     if dist_edge > 1 {
                         continue;
                     }
-                    if terrain_at_wxz(water_depths, w, lx, lz) > 0 {
+                    let wd = terrain_at_wxz(water_depths, w, lx, lz);
+                    if wd > 0 {
                         continue;
                     }
-                    let base_y = if req.adapt_terrain {
-                        terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
-                    } else {
-                        0
+                    let terr_y = terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-14, 14);
+                    let base_y = rim_base_at(lx, lz);
+                    let skirt_bot = (terr_y - wd - 2).clamp(-16, base_y);
+                    let fill_skirt = |blocks: &mut BTreeMap<[i32; 3], PlannedBlock>, top_incl: i32| {
+                        for fy in skirt_bot..=top_incl {
+                            blocks.insert(
+                                [lx, fy, lz],
+                                PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fy, lz)),
+                            );
+                        }
                     };
+
                     let on_ns_edge = lz <= 1 || lz >= d - 2;
                     let on_ew_edge = lx <= 1 || lx >= w - 2;
                     let in_gate_gap = (on_ns_edge && gate_axis_x(lx)) || (on_ew_edge && gate_axis_z(lz));
                     let is_corner_bastion = (lx <= 2 || lx >= w - 3) && (lz <= 2 || lz >= d - 3);
 
                     if is_corner_bastion {
+                        fill_skirt(&mut blocks, base_y);
                         for dy in 1..=5 {
                             let slot = if dy == 1 {
                                 MaterialPalette::SLOT_FOUNDATION
@@ -1128,7 +1332,19 @@ pub fn generate_settlement(
                     }
 
                     if in_gate_gap {
-                        // Overhead stone/timber gate lintel high above road clearance (`>= 4` blocks).
+                        // Solid paved gateway approach + open arch clearance + overhead lintel aligned with road!
+                        fill_skirt(&mut blocks, base_y - 1);
+                        let is_border = (lx - cx).abs() == road_half + 1
+                            || (lz - cz).abs() == road_half + 1
+                            || ring_xs.iter().any(|&rx| (lx - rx).abs() == 1)
+                            || ring_zs.iter().any(|&rz| (lz - rz).abs() == 1);
+                        blocks.insert(
+                            [lx, base_y, lz],
+                            pave_block_for_style(spec.style, pal, seed, lx, base_y, lz, noise.cell_hash(lx, 0, lz), is_border),
+                        );
+                        for cy in (base_y + 1)..=(terr_y.max(base_y) + 4) {
+                            blocks.insert([lx, cy, lz], PlannedBlock::simple("minecraft:air"));
+                        }
                         if dist_edge == 0 {
                             blocks.insert([lx, base_y + 5, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_BEAM, seed, lx, base_y + 5, lz)));
                             blocks.insert([lx, base_y + 6, lz], make_slab(&pal.pick_slab(MaterialPalette::SLOT_ROOF, seed, lx, base_y + 6, lz), "bottom"));
@@ -1139,6 +1355,7 @@ pub fn generate_settlement(
                     let gate_pier = (on_ns_edge && ((lx - cx).abs() == road_half + 2 || ring_xs.iter().any(|&rx| (lx - rx).abs() == 2)))
                         || (on_ew_edge && ((lz - cz).abs() == road_half + 2 || ring_zs.iter().any(|&rz| (lz - rz).abs() == 2)));
 
+                    fill_skirt(&mut blocks, base_y);
                     if gate_pier {
                         for dy in 1..=5 {
                             blocks.insert([lx, base_y + dy, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_PILLAR, seed, lx, base_y + dy, lz)));
@@ -1164,6 +1381,9 @@ pub fn generate_settlement(
                         blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));
                         blocks.insert([lx, base_y + 2, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_BEAM, seed, lx, base_y + 2, lz)));
                         blocks.insert([lx, base_y + 3, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FLOOR, seed, lx, base_y + 3, lz)));
+                        for cy in (base_y + 4)..=(terr_y.max(base_y) + 5) {
+                            blocks.insert([lx, cy, lz], PlannedBlock::simple("minecraft:air"));
+                        }
                     }
                 }
             }
@@ -1174,20 +1394,32 @@ pub fn generate_settlement(
                     if !on_rim {
                         continue;
                     }
+                    let wd = terrain_at_wxz(water_depths, w, lx, lz);
+                    if wd > 0 {
+                        continue;
+                    }
+                    let terr_y = terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-14, 14);
+                    let base_y = rim_base_at(lx, lz);
                     let in_gate = gate_axis_x(lx) && (lz == 0 || lz == d - 1)
                         || gate_axis_z(lz) && (lx == 0 || lx == w - 1);
                     let is_gate_pier = ((lx - cx).abs() == road_half + 2 && (lz == 0 || lz == d - 1))
                         || ((lz - cz).abs() == road_half + 2 && (lx == 0 || lx == w - 1));
+                    let lo_y = (terr_y - wd - 2).clamp(-16, base_y);
                     if in_gate && !is_gate_pier {
+                        for fy in lo_y..base_y {
+                            blocks.insert([lx, fy, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fy, lz)));
+                        }
+                        blocks.insert(
+                            [lx, base_y, lz],
+                            pave_block_for_style(spec.style, pal, seed, lx, base_y, lz, noise.cell_hash(lx, 0, lz), false),
+                        );
+                        for cy in (base_y + 1)..=(terr_y.max(base_y) + 4) {
+                            blocks.insert([lx, cy, lz], PlannedBlock::simple("minecraft:air"));
+                        }
                         continue;
                     }
-                    let base_y = if req.adapt_terrain {
-                        terrain_at_wxz(terrain_offsets, w, lx, lz).clamp(-4, 3)
-                    } else {
-                        0
-                    };
-                    if terrain_at_wxz(water_depths, w, lx, lz) > 0 {
-                        continue;
+                    for fy in lo_y..=base_y {
+                        blocks.insert([lx, fy, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, fy, lz)));
                     }
                     if is_gate_pier || (lx == 0 || lx == w - 1) && (lz == 0 || lz == d - 1) {
                         blocks.insert([lx, base_y + 1, lz], PlannedBlock::simple(pal.pick(MaterialPalette::SLOT_FOUNDATION, seed, lx, base_y + 1, lz)));

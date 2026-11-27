@@ -5242,4 +5242,387 @@ mod tests {
             crate::server_builder::clear_history_memory_cache();
         });
     }
+
+    #[test]
+    fn v061_grounding_and_no_dry_stilts() {
+        use crate::model::{BuildCategory, BuildStyle};
+
+        // Steep dry slope must build masonry down-slope instead of switching onto wooden stilts.
+        let mut dry_req = sample_request("medieval stone manor with corner turret and arcade", 6101);
+        dry_req.category = BuildCategory::House;
+        dry_req.style = BuildStyle::Medieval;
+        dry_req.width = 19;
+        dry_req.depth = 17;
+        dry_req.height = 16;
+        let idx_len = usize::from(dry_req.width) * usize::from(dry_req.depth);
+        let mut dry_terr = vec![0i32; idx_len];
+        for z in 0..i32::from(dry_req.depth) {
+            for x in 0..i32::from(dry_req.width) {
+                dry_terr[(z * i32::from(dry_req.width) + x) as usize] = (-x + 2).clamp(-14, 2);
+            }
+        }
+        let dry_bp = generate_blueprint(&dry_req, Some(&dry_terr));
+        assert!(
+            !dry_bp.spec.on_stilts,
+            "Dry hillside terrain must not trigger wooden water stilts"
+        );
+        assert!(
+            dry_bp.blocks.iter().any(|(&[_x, y, _z], b)| {
+                y <= -10 && b.block_id != "minecraft:air" && !b.block_id.ends_with("_fence")
+            }),
+            "Foundation skirt must extend down below y=-10 on steep dry valleys"
+        );
+
+        // Desert terrain adaptation must skirt valleys with sandstone rather than dirt/grass.
+        let mut desert_req = sample_request("desert house", 6102);
+        desert_req.style = BuildStyle::Desert;
+        desert_req.width = 15;
+        desert_req.depth = 15;
+        desert_req.height = 12;
+        let d_terr = vec![-10i32; 15 * 15];
+        let desert_bp = generate_blueprint(&desert_req, Some(&d_terr));
+        assert!(
+            !desert_bp
+                .blocks
+                .values()
+                .any(|b| b.block_id == "minecraft:grass_block" || b.block_id == "minecraft:dirt"),
+            "Desert terrain skirts must blend with sandstone rather than grass/dirt"
+        );
+
+        // True deep water must still activate stilt piling mode.
+        let mut water_req = sample_request("lake house on water", 6103);
+        water_req.width = 13;
+        water_req.depth = 13;
+        water_req.height = 12;
+        let w_terr = vec![-3i32; 13 * 13];
+        let w_depths = vec![4i32; 13 * 13];
+        let water_bp = crate::generator::generate_blueprint_with_water(
+            &water_req,
+            Some(&w_terr),
+            Some(&w_depths),
+        );
+        assert!(
+            water_bp.spec.on_stilts,
+            "Submerged footprints must keep aquatic stilts enabled"
+        );
+    }
+
+    #[test]
+    fn v061_settlement_grading_canals_gates_and_pockets() {
+        use crate::model::{BuildCategory, BuildStyle};
+
+        let w = 60i32;
+        let mut terr = vec![0i32; (w * w) as usize];
+        for z in 0..w {
+            for x in 0..w {
+                terr[(z * w + x) as usize] = (((x - w / 2) / 3) + ((z - w / 2) / 4)).clamp(-10, 10);
+            }
+        }
+        let mut req = sample_request("fortified desert canal settlement", 6105);
+        req.category = BuildCategory::Settlement;
+        req.style = BuildStyle::Desert;
+        req.width = 60;
+        req.depth = 60;
+        req.height = 18;
+        let bp = generate_blueprint(&req, Some(&terr));
+
+        // Walls/bastions/lots in deep -10 valleys must ground below y=-6.
+        assert!(
+            bp.blocks.iter().any(|(&[_x, y, _z], b)| {
+                y <= -8
+                    && b.block_id != "minecraft:air"
+                    && b.block_id != "minecraft:sand"
+                    && b.block_id != "minecraft:red_sand"
+            }),
+            "Sloped settlements must ground structural walls and lot plinths deep into valleys"
+        );
+
+        // Every placed water canal cell must stay open to the sky or sit cleanly under a bridge span.
+        let mut floating_sand_over_water = 0usize;
+        for (&[x, y, z], blk) in &bp.blocks {
+            if blk.block_id == "minecraft:water" {
+                let above_sand = bp.blocks.get(&[x, y + 1, z]).is_some_and(|u| {
+                    matches!(u.block_id.as_str(), "minecraft:sand" | "minecraft:red_sand" | "minecraft:sandstone")
+                });
+                if above_sand {
+                    floating_sand_over_water += 1;
+                }
+            }
+        }
+        assert_eq!(
+            floating_sand_over_water, 0,
+            "Canal water channels must clear sand/terrain overburden above water surface"
+        );
+
+        // Every door in the settlement must be a complete lower+upper pair on a solid block.
+        for (&[x, y, z], blk) in &bp.blocks {
+            if blk.block_id.ends_with("_door") {
+                let is_upper = blk.props.iter().any(|&(k, v)| k == "half" && v == "upper");
+                if is_upper {
+                    assert!(
+                        bp.blocks.get(&[x, y - 1, z]).is_some_and(|b| b.block_id.ends_with("_door")),
+                        "Settlement upper door half at ({x},{y},{z}) missing lower half"
+                    );
+                } else {
+                    assert!(
+                        bp.blocks.get(&[x, y + 1, z]).is_some_and(|b| b.block_id.ends_with("_door")),
+                        "Settlement lower door half at ({x},{y},{z}) missing upper half"
+                    );
+                    assert!(
+                        bp.blocks.get(&[x, y - 1, z]).is_some_and(|b| b.block_id != "minecraft:air"),
+                        "Settlement door at ({x},{y},{z}) must rest on solid support"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v061_complete_doors_porch_stairs_and_windows() {
+        use crate::model::{BuildCategory, BuildStyle, MaterialPalette};
+
+        for &pal_idx in &[0usize, 1, 5, 7, 16] {
+            for &cat in &[
+                BuildCategory::House,
+                BuildCategory::Temple,
+                BuildCategory::Castle,
+                BuildCategory::Forge,
+            ] {
+                for &style in &[
+                    BuildStyle::Medieval,
+                    BuildStyle::Classical,
+                    BuildStyle::Steampunk,
+                    BuildStyle::Desert,
+                ] {
+                    for seed in [1i64, 2, 7, 9, 10] {
+                        let mut r = sample_request("cozy house with porch", seed);
+                        r.category = cat;
+                        r.style = style;
+                        r.width = 13;
+                        r.depth = 13;
+                        r.height = 14;
+                        r.palette = MaterialPalette::preset(pal_idx);
+                        let b = generate_blueprint(&r, None);
+                        for (&[x, y, z], blk) in &b.blocks {
+                            if !blk.block_id.ends_with("_door") {
+                                continue;
+                            }
+                            let is_upper =
+                                blk.props.iter().any(|&(k, v)| k == "half" && v == "upper");
+                            if is_upper {
+                                assert!(
+                                    b.blocks
+                                        .get(&[x, y - 1, z])
+                                        .is_some_and(|v| v.block_id.ends_with("_door")),
+                                    "Orphan upper door in pal={pal_idx} {cat:?} {style:?} seed={seed}"
+                                );
+                                continue;
+                            }
+                            assert!(
+                                b.blocks
+                                    .get(&[x, y + 1, z])
+                                    .is_some_and(|v| v.block_id.ends_with("_door")),
+                                "Half-door missing upper in pal={pal_idx} {cat:?} {style:?} seed={seed}"
+                            );
+                            assert!(
+                                b.blocks
+                                    .get(&[x, y - 1, z])
+                                    .is_some_and(|v| v.block_id != "minecraft:air"),
+                                "Door floating without threshold at ({x},{y},{z})"
+                            );
+                            let lintel_bad = b.blocks.get(&[x, y + 2, z]).is_none_or(|v| {
+                                let id = v.block_id.as_str();
+                                id == "minecraft:air" || id.contains("glass") || id.ends_with("_grate")
+                            });
+                            assert!(
+                                !lintel_bad,
+                                "Transparent/air door lintel in pal={pal_idx} {cat:?} {style:?} seed={seed}"
+                            );
+
+                            let facing = blk
+                                .props
+                                .iter()
+                                .find(|&&(k, _)| k == "facing")
+                                .map(|&(_, v)| v)
+                                .unwrap_or("south");
+                            let (jx, jz) = match facing {
+                                "east" | "west" => (0, 1),
+                                _ => (1, 0),
+                            };
+                            for sign in [-1, 1] {
+                                for dy in 0..=2 {
+                                    let jb = b.blocks.get(&[x + sign * jx, y + dy, z + sign * jz]);
+                                    let has_glass_or_grate = jb.is_some_and(|v| {
+                                        v.block_id.contains("glass") || v.block_id.ends_with("_grate")
+                                    });
+                                    assert!(
+                                        !has_glass_or_grate,
+                                        "Glass/grate jamb directly adjacent to door in pal={pal_idx} {cat:?} {style:?} seed={seed}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify elevated 1-step-up porches ALWAYS generate grounded front stairs (Photo 6 bug).
+        let mut porch_req = sample_request("cozy cottage with porch", 6111);
+        porch_req.width = 13;
+        porch_req.depth = 13;
+        porch_req.height = 12;
+        porch_req.style = BuildStyle::Cottage;
+        let porch_bp = generate_blueprint(&porch_req, None);
+        assert!(
+            porch_bp.blocks.iter().any(|(&[x, y, z], b)| {
+                b.block_id.ends_with("_stairs")
+                    && porch_bp.door_pos.is_some_and(|[dx, dy, dz]| {
+                        (x - dx).abs() <= 2 && (z - dz).abs() <= 4 && (y - dy).abs() <= 2
+                    })
+            }),
+            "Porch entrances must generate front stairs connecting porch deck to ground"
+        );
+
+        // Verify air_only server builds never leave single half-doors when upper slot is obstructed.
+        let entries = vec![
+            ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+            ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+        ];
+        with_mods(entries.into(), || {
+            let install_entries = vec![
+                ModEntry::new("building_generator", Box::new(BuildingGeneratorMod)),
+                ModEntry::new("test_registry", Box::new(TestRegistryMod)),
+            ];
+            mod_api::__private::part_tests::install_parts_fixture(&install_entries).unwrap();
+            let _world_phase =
+                mod_api::__private::PhaseOwner::scope(mod_api::__private::ModPhase::World);
+            crate::server_builder::clear_history_memory_cache();
+            crate::server_builder::clear_rate_limit_for_test();
+            let keys = REGISTERED_KEYS.get().unwrap().lock().unwrap().clone();
+            let mut host = TestWorldHost::new(keys);
+            host.fake.join(89, 100);
+            let player = host.player(89).unwrap();
+            host.set_player_perm(player.uuid(), 2);
+
+            let mut req = sample_request("cozy house", 6120);
+            req.width = 11;
+            req.depth = 11;
+            req.height = 10;
+            req.air_only = true;
+            // Pre-block upper door slot so air_only filtering drops the entire door pair cleanly.
+            let preview_bp = generate_blueprint(&req, None);
+            if let Some([dx, dy, dz]) = preview_bp.door_pos {
+                let wx = req.origin_x + dx;
+                let wy = req.origin_y + dy + 1;
+                let wz = req.origin_z + dz;
+                let stone_key = host.id_to_key["minecraft:cobblestone"];
+                let stone_state: BlockState = BlockStateRecord::new(stone_key, 0).into();
+                host.world_blocks.insert([wx, wy, wz], stone_state);
+            }
+            let resp = crate::server_builder::execute_build(&mut host, Some(player), req);
+            assert!(resp.ok, "air_only build failed: {}", resp.message);
+            for (&[wx, wy, wz], state) in &host.world_blocks {
+                let bkey = BlockStateRecord::from(state).block;
+                let is_door = host
+                    .key_to_id
+                    .get(&bkey)
+                    .is_some_and(|id| id.ends_with("_door"));
+                if is_door {
+                    let has_partner = host
+                        .world_blocks
+                        .get(&[wx, wy + 1, wz])
+                        .and_then(|u| host.key_to_id.get(&BlockStateRecord::from(u).block))
+                        .is_some_and(|id| id.ends_with("_door"))
+                        || host
+                            .world_blocks
+                            .get(&[wx, wy - 1, wz])
+                            .and_then(|l| host.key_to_id.get(&BlockStateRecord::from(l).block))
+                            .is_some_and(|id| id.ends_with("_door"));
+                    assert!(
+                        has_partner,
+                        "air_only mode must never leave an unpaired half-door at ({wx},{wy},{wz})"
+                    );
+                }
+            }
+            crate::server_builder::clear_history_memory_cache();
+        });
+    }
+
+    #[test]
+    fn v061_gable_roof_ends_and_eaves_sealed() {
+        use crate::model::{BuildCategory, BuildStyle};
+
+        // Landmark gable roofs with overhanging eaves must seal both triangular gable walls and wall-to-eave seams.
+        let mut lm_blocks = std::collections::BTreeMap::new();
+        let grid = crate::gen_common::LocalGrid::new(13, 13, crate::model::CardinalFacing::South);
+        let pal = crate::model::MaterialPalette::preset(0);
+        // Wall perimeter at (2..=10, 2..=10), roof extends (1..=11, 1..=11) with 1-block overhang.
+        for v in 2..=10 {
+            for u in 2..=10 {
+                if u == 2 || u == 10 || v == 2 || v == 10 {
+                    crate::gen_common::set_uv(
+                        &mut lm_blocks,
+                        grid,
+                        u,
+                        5,
+                        v,
+                        crate::gen_common::PlannedBlock::simple("minecraft:bricks"),
+                    );
+                }
+            }
+        }
+        crate::gen_landmarks::build_gable_roof(
+            &mut lm_blocks,
+            grid,
+            &pal,
+            42,
+            1,
+            11,
+            1,
+            11,
+            5,
+            16,
+            true,
+        );
+        // Center of gable ends (u=6, v=2 and u=6, v=10) reaches ry=8; y=6..=7 must be filled solidly!
+        for v_end in [2, 10] {
+            for wy in 6..=7 {
+                assert!(
+                    crate::gen_common::get_uv(&lm_blocks, grid, 6, wy, v_end)
+                        .is_some_and(|b| b.block_id != "minecraft:air"),
+                    "Landmark gable end wall (6,{wy},{v_end}) must be sealed cleanly under overhanging ridge"
+                );
+            }
+        }
+
+        // Landmark CLI presets must never report broken door_pos blocks or orphan half-doors.
+        for &(slug, cat, style, pw, pd, ph, desc) in crate::server_builder::CLI_PRESETS.iter() {
+            let mut r = sample_request(desc, 7);
+            r.category = cat;
+            r.style = style;
+            r.width = pw;
+            r.depth = pd;
+            r.height = ph;
+            let b = generate_blueprint(&r, None);
+            for (&[x, y, z], blk) in &b.blocks {
+                if blk.block_id.ends_with("_door") && !blk.props.iter().any(|&(k, v)| k == "half" && v == "upper") {
+                    assert!(
+                        b.blocks.get(&[x, y + 1, z]).is_some_and(|v| v.block_id.ends_with("_door")),
+                        "Preset [{slug}] produced incomplete door at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+
+        // Multi-wing gable roof must seal under every cross-ridge without leaving eave sky gaps.
+        let mut wing_req = sample_request("l-shaped medieval manor with wing extension", 6130);
+        wing_req.category = BuildCategory::House;
+        wing_req.style = BuildStyle::Medieval;
+        wing_req.width = 19;
+        wing_req.depth = 17;
+        wing_req.height = 16;
+        let wing_bp = generate_blueprint(&wing_req, None);
+        assert!(wing_bp.non_air_count() > 250);
+    }
 }
